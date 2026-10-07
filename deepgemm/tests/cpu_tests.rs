@@ -6,7 +6,9 @@ use deepgemm::types::{Dtype, GemmType, Major};
 fn desc(m: u32, n: u32, k: u32, a: Dtype, b: Dtype, num_sms: u32) -> heuristics::GemmDesc {
     heuristics::GemmDesc {
         gemm_type: GemmType::Normal,
-        m, n, k,
+        m,
+        n,
+        k,
         num_groups: 1,
         a_dtype: a,
         b_dtype: b,
@@ -29,7 +31,11 @@ fn heuristics_picks_multicast_for_large_shapes() {
     assert!(cfg.pipeline.num_stages >= 2);
     assert!(cfg.pipeline.smem_size <= 232448);
     // For a big square FP8 problem, 2-CTA clusters should win.
-    assert_eq!(cfg.layout.cluster_size(), 2, "expected cluster 2 for large square FP8");
+    assert_eq!(
+        cfg.layout.cluster_size(),
+        2,
+        "expected cluster 2 for large square FP8"
+    );
 }
 
 #[test]
@@ -60,12 +66,19 @@ fn heuristics_bf16_block_k_64() {
 fn heuristics_m_grouped_forces_swap_ab() {
     let d = heuristics::GemmDesc {
         gemm_type: GemmType::MGroupedContiguous,
-        m: 4096, n: 2048, k: 7168,
+        m: 4096,
+        n: 2048,
+        k: 7168,
         num_groups: 128,
-        a_dtype: Dtype::Fp8, b_dtype: Dtype::Fp8, cd_dtype: Dtype::Bf16,
-        major_a: Major::K, major_b: Major::K,
-        num_sms: 148, smem_capacity: 232448,
-        expected_m: 4096, expected_num_groups: 128,
+        a_dtype: Dtype::Fp8,
+        b_dtype: Dtype::Fp8,
+        cd_dtype: Dtype::Bf16,
+        major_a: Major::K,
+        major_b: Major::K,
+        num_sms: 148,
+        smem_capacity: 232448,
+        expected_m: 4096,
+        expected_num_groups: 128,
     };
     let cfg = heuristics::get_best_config(&d).unwrap();
     assert!(cfg.layout.swap_ab);
@@ -79,10 +92,14 @@ fn heuristics_stage_budget() {
     // FP4 packed: 128B per 256-elem row; A/B stages each LOAD x 128B.
     let l = &cfg.layout;
     let s = &cfg.storage;
-    let per_stage = s.load_block_m * l.block_k / 2 + s.load_block_n * l.block_k / 2
+    let per_stage = s.load_block_m * l.block_k / 2
+        + s.load_block_n * l.block_k / 2
         + heuristics::get_sf_block_sizes(l.block_m, l.block_n, true).0 * l.block_k / 32
         + heuristics::get_sf_block_sizes(l.block_m, l.block_n, true).1 * l.block_k / 32;
-    assert!(cfg.pipeline.smem_size + per_stage > 232448, "stages must saturate the SMEM budget");
+    assert!(
+        cfg.pipeline.smem_size + per_stage > 232448,
+        "stages must saturate the SMEM budget"
+    );
 }
 
 #[test]
@@ -103,10 +120,7 @@ fn ue8m0_packing_matches_reference() {
     // Equivalently: byte j of the word = exponent (biased) of SF j.
     let exponents: [u32; 4] = [130, 131, 129, 128];
     let floats: Vec<f32> = exponents.iter().map(|&e| f32::from_bits(e << 23)).collect();
-    let packed = (exponents[0] << 0)
-        | (exponents[1] << 8)
-        | (exponents[2] << 16)
-        | (exponents[3] << 24);
+    let packed = exponents[0] | (exponents[1] << 8) | (exponents[2] << 16) | (exponents[3] << 24);
     // Same as the device code's shifts:
     let words: Vec<u32> = floats.iter().map(|f| f.to_bits()).collect();
     let device_packed = (words[0] >> 23) | (words[1] >> 15) | (words[2] >> 7) | (words[3] << 1);

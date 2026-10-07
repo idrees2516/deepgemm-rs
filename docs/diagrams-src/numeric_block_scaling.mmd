@@ -1,0 +1,23 @@
+flowchart TB
+    subgraph FORMATS["code formats"]
+        FP8["E4M3 · FP8<br/>s eeee mmm (bias 7)<br/>max 448 · min 2^-9"]
+        FP4["E2M1 · FP4<br/>s ee m (bias 1)<br/>grid 0, .5, 1, 1.5, 2, 3, 4, 6"]
+        SF["UE8M0 scale<br/>8-bit pure exponent<br/>value = 2^(code-127)"]
+    end
+    subgraph PACK["SF packing — one int32 word"]
+        direction LR
+        B0["byte0 = sf(k)"]
+        B1["byte1 = sf(k+1)"]
+        B2["byte2 = sf(k+2)"]
+        B3["byte3 = sf(k+3)"]
+        B0 --- B1 --- B2 --- B3
+    end
+    subgraph EQ["block-scaled dot product (granularity g = 32 or 128)"]
+        TERM["D_i,j = Σ_k codeA_i,k · codeB_j,k<br/>· 2^(sfA_i,k/g − 127) · 2^(sfB_j,k/g − 127)"]
+    end
+    FP8 & FP4 --> TERM
+    SF --> PACK --> TERM
+    PACK -. "MN-major: word(k/4, m),<br/>TMA row = 16B = 4 rows" .-> TERM
+    style FORMATS fill:#eef,stroke:#88f
+    style PACK fill:#efe,stroke:#8c8
+    style EQ fill:#fee,stroke:#e99

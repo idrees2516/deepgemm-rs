@@ -5,6 +5,13 @@
 //! `cuFuncSetAttribute` for large dynamic shared memory). Everything goes through
 //! the same dlopen'd `libcuda` that cudarc loads, so no extra linking is needed.
 
+// Driver handles (CUcontext, CUstream, ...) are opaque C pointers by design;
+// this whole module is the unsafe FFI boundary, so the "public function takes
+// a raw pointer" lint does not apply here.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+// Keep `% b == 0` spelling: `is_multiple_of` requires a newer MSRV than 1.75.
+#![allow(clippy::manual_is_multiple_of)]
+
 use cudarc::driver::sys::{self, CUlaunchAttribute, CUlaunchConfig};
 
 #[inline]
@@ -45,15 +52,44 @@ where
     }
 }
 
-/// Ensure `cuInit` has run (idempotent).
+/// Ensure `cuInit` has run (idempotent). Returns a clean error (no panic)
+/// when no CUDA driver is loadable at all — e.g. GPU-less CI/sandboxes —
+/// so callers can degrade to offline mode (`compile-check`).
 pub fn init() -> DgResult<()> {
     static INIT: OnceLock<()> = OnceLock::new();
     if INIT.get().is_none() {
+        if !driver_loadable() {
+            return Err(DgError::Driver(
+                "no CUDA driver (libcuda.so.1) loadable — no GPU present? \
+                 Use `deepgemm-bench compile-check` for offline kernel validation"
+                    .into(),
+            ));
+        }
         let f = opt_fn(&dg_lib().cuInit, "cuInit")?;
         cu(unsafe { f(0) })?;
         let _ = INIT.set(());
     }
     Ok(())
+}
+
+/// True when `libcuda.so.1` (or a sibling soname) can be dlopen'd.
+/// Guarding before the first cudarc call keeps the "library missing" case
+/// an `Err` instead of cudarc's internal panic.
+fn driver_loadable() -> bool {
+    unsafe extern "C" {
+        fn dlopen(filename: *const std::ffi::c_char, flag: i32) -> *mut std::ffi::c_void;
+    }
+    const RTLD_NOW: i32 = 2;
+    for name in ["libcuda.so.1", "libcuda.so", "libcuda64.so.1"] {
+        if let Ok(c) = std::ffi::CString::new(name) {
+            unsafe {
+                if !dlopen(c.as_ptr(), RTLD_NOW).is_null() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 pub fn device_count() -> DgResult<i32> {
@@ -107,7 +143,10 @@ pub fn device_name(dev: sys::CUdevice) -> DgResult<String> {
 pub fn primary_ctx_retain(dev: sys::CUdevice) -> DgResult<Ctx> {
     init()?;
     let mut ctx = std::ptr::null_mut();
-    let f = opt_fn(&dg_lib().cuDevicePrimaryCtxRetain, "cuDevicePrimaryCtxRetain")?;
+    let f = opt_fn(
+        &dg_lib().cuDevicePrimaryCtxRetain,
+        "cuDevicePrimaryCtxRetain",
+    )?;
     cu(unsafe { f(&mut ctx, dev) })?;
     Ok(ctx)
 }
@@ -229,11 +268,17 @@ pub struct LaunchEx {
 /// # Safety
 /// `params` must point to an array of `void*` of length `num_params`, each
 /// pointing to storage matching the kernel's parameter types.
-pub unsafe fn launch_kernel_ex(func: Func, cfg: &LaunchEx, stream: Stream, params: &[*const c_void]) -> DgResult<()> {
+pub unsafe fn launch_kernel_ex(
+    func: Func,
+    cfg: &LaunchEx,
+    stream: Stream,
+    params: &[*const c_void],
+) -> DgResult<()> {
     let mut attrs: [CUlaunchAttribute; 2] = std::mem::zeroed();
     let mut num_attrs = 0u32;
     if let Some((cx, cy, cz)) = cfg.cluster {
-        attrs[num_attrs as usize].id = sys::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+        attrs[num_attrs as usize].id =
+            sys::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
         attrs[num_attrs as usize].value.clusterDim.x = cx;
         attrs[num_attrs as usize].value.clusterDim.y = cy;
         attrs[num_attrs as usize].value.clusterDim.z = cz;
@@ -242,7 +287,9 @@ pub unsafe fn launch_kernel_ex(func: Func, cfg: &LaunchEx, stream: Stream, param
     if cfg.pdl {
         attrs[num_attrs as usize].id =
             sys::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
-        attrs[num_attrs as usize].value.programmaticStreamSerializationAllowed = 1;
+        attrs[num_attrs as usize]
+            .value
+            .programmaticStreamSerializationAllowed = 1;
         num_attrs += 1;
     }
 
@@ -255,11 +302,20 @@ pub unsafe fn launch_kernel_ex(func: Func, cfg: &LaunchEx, stream: Stream, param
         blockDimZ: cfg.block.2,
         sharedMemBytes: cfg.smem,
         hStream: stream,
-        attrs: if num_attrs == 0 { std::ptr::null_mut() } else { attrs.as_mut_ptr() },
+        attrs: if num_attrs == 0 {
+            std::ptr::null_mut()
+        } else {
+            attrs.as_mut_ptr()
+        },
         numAttrs: num_attrs,
     };
     let f = opt_fn(&dg_lib().cuLaunchKernelEx, "cuLaunchKernelEx")?;
-    cu(f(&config, func, params.as_ptr() as *mut *mut c_void, std::ptr::null_mut()))
+    cu(f(
+        &config,
+        func,
+        params.as_ptr() as *mut *mut c_void,
+        std::ptr::null_mut(),
+    ))
 }
 
 /// Encode a tiled tensor map for TMA. Mirrors `cuTensorMapEncodeTiled`.
@@ -300,9 +356,9 @@ pub fn tensor_map_encode_tiled(
 
 // Re-exported enum constants (values are ABI-stable).
 pub use sys::CUtensorMapDataType as TmDtype;
+pub use sys::CUtensorMapFloatOOBfill as TmOobFill;
 pub use sys::CUtensorMapInterleave as TmInterleave;
 pub use sys::CUtensorMapL2promotion as TmL2Promo;
-pub use sys::CUtensorMapFloatOOBfill as TmOobFill;
 pub use sys::CUtensorMapSwizzle as TmSwizzle;
 
 pub fn tm_dtype_uint8() -> TmDtype {

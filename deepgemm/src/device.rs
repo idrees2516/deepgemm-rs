@@ -61,7 +61,8 @@ impl Device {
         let name = sys::device_name(dev)?;
         let cc = sys::device_compute_capability(dev)?;
         let num_sms = sys::device_get_attribute(dev, sys::ATTR_MULTIPROCESSOR_COUNT)? as u32;
-        let smem_capacity = sys::device_get_attribute(dev, sys::ATTR_SHARED_MEMORY_PER_BLOCK_OPTIN)? as u32;
+        let smem_capacity =
+            sys::device_get_attribute(dev, sys::ATTR_SHARED_MEMORY_PER_BLOCK_OPTIN)? as u32;
         let ctx = sys::primary_ctx_retain(dev)?;
         sys::ctx_set_current(ctx)?;
         Ok(Arc::new(Device {
@@ -102,13 +103,12 @@ impl Device {
                 crate::types::Dtype::Bf16 => 875.0,
                 _ => 875.0,
             },
-            (n, _) if n.contains("H100") || n.contains("H800") || n.contains("H200") => {
-                match dtype {
-                    crate::types::Dtype::Fp8 => 1979.0,
-                    crate::types::Dtype::Bf16 => 989.0,
-                    _ => 989.0,
-                }
-            }
+            (n, _) if n.contains("H100") || n.contains("H800") || n.contains("H200") => match dtype
+            {
+                crate::types::Dtype::Fp8 => 1979.0,
+                crate::types::Dtype::Bf16 => 989.0,
+                _ => 989.0,
+            },
             _ => {
                 // Generic estimate: 2048 FMA pipes/SM * 2 ops * clock.
                 match dtype {
@@ -139,7 +139,9 @@ unsafe impl Sync for DevStream {}
 impl DevStream {
     pub fn new(dev: &Device) -> DgResult<DevStream> {
         dev.bind()?;
-        Ok(DevStream { raw: sys::stream_create()? })
+        Ok(DevStream {
+            raw: sys::stream_create()?,
+        })
     }
 
     pub fn raw(&self) -> sys::Stream {
@@ -172,7 +174,10 @@ impl DevBuffer {
         if bytes == 0 {
             return Ok(DevBuffer { ptr: 0, len: 0 });
         }
-        Ok(DevBuffer { ptr: sys::mem_alloc(bytes)?, len: bytes })
+        Ok(DevBuffer {
+            ptr: sys::mem_alloc(bytes)?,
+            len: bytes,
+        })
     }
 
     pub fn alloc_zeros(dev: &Device, bytes: usize) -> DgResult<DevBuffer> {
@@ -190,7 +195,10 @@ impl DevBuffer {
     }
 
     pub fn copy_from_host(&self, dev: &Device, src: &[u8], stream: sys::Stream) -> DgResult<()> {
-        assert!(src.len() <= self.len, "host slice larger than device buffer");
+        assert!(
+            src.len() <= self.len,
+            "host slice larger than device buffer"
+        );
         dev.bind()?;
         if !src.is_empty() {
             sys::memcpy_h2d(self.ptr, src.as_ptr() as *const _, src.len(), stream)?;
@@ -199,7 +207,10 @@ impl DevBuffer {
     }
 
     pub fn copy_to_host(&self, dev: &Device, dst: &mut [u8], stream: sys::Stream) -> DgResult<()> {
-        assert!(dst.len() <= self.len, "host slice larger than device buffer");
+        assert!(
+            dst.len() <= self.len,
+            "host slice larger than device buffer"
+        );
         dev.bind()?;
         if !dst.is_empty() {
             sys::memcpy_d2h(dst.as_mut_ptr() as *mut _, self.ptr, dst.len(), stream)?;
@@ -217,7 +228,11 @@ impl Drop for DevBuffer {
 }
 
 /// Typed view helpers for DevBuffer.
-pub fn alloc_and_upload<T: bytemuck::Pod>(dev: &Device, data: &[T], stream: sys::Stream) -> DgResult<DevBuffer> {
+pub fn alloc_and_upload<T: bytemuck::Pod>(
+    dev: &Device,
+    data: &[T],
+    stream: sys::Stream,
+) -> DgResult<DevBuffer> {
     let bytes = std::mem::size_of_val(data);
     let buf = DevBuffer::alloc(dev, bytes.max(1))?;
     if bytes > 0 {

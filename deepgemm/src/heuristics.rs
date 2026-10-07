@@ -21,7 +21,9 @@ fn env_u32(name: &str) -> Option<u32> {
 }
 
 pub fn print_configs_enabled() -> bool {
-    env::var("DG_PRINT_CONFIGS").map(|v| v == "1" || v == "true").unwrap_or(false)
+    env::var("DG_PRINT_CONFIGS")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false)
 }
 
 /// Pinned overrides from the environment.
@@ -136,7 +138,11 @@ impl GemmDesc {
     }
 
     pub fn smem_pack_factor(&self) -> u32 {
-        if self.is_mxf4_mma() { 2 } else { 1 }
+        if self.is_mxf4_mma() {
+            2
+        } else {
+            1
+        }
     }
 }
 
@@ -151,7 +157,7 @@ fn align_up(a: u32, b: u32) -> u32 {
 fn get_swizzle_mode(inner_dim_elems: u32, elem_size: u32) -> u32 {
     let bytes = inner_dim_elems.saturating_mul(elem_size).min(128);
     match bytes {
-        0 | 1..=16 => 0,
+        0..=16 => 0,
         17..=32 => 32,
         33..=64 => 64,
         _ => 128,
@@ -163,7 +169,10 @@ pub fn get_sf_block_sizes(block_m: u32, block_n: u32, has_sf: bool) -> (u32, u32
     if !has_sf {
         (0, 0)
     } else {
-        (align_up(block_m, 128).max(128), align_up(block_n, 128).max(128))
+        (
+            align_up(block_m, 128).max(128),
+            align_up(block_n, 128).max(128),
+        )
     }
 }
 
@@ -182,13 +191,29 @@ pub fn storage_config(desc: &GemmDesc, layout: &Layout) -> StorageConfig {
 
     let load_block_m = layout.block_m / layout.cluster_n.max(1);
     let load_block_n = layout.block_n / layout.cluster_m.max(1);
-    let store_block_m = if layout.swap_ab { UMMA_STEP_N } else { LAYOUT_AD_M.min(layout.block_m) };
+    let store_block_m = if layout.swap_ab {
+        UMMA_STEP_N
+    } else {
+        LAYOUT_AD_M.min(layout.block_m)
+    };
     let store_block_n = layout.block_n;
 
     // Wire element sizes: FP4 is stored packed (2 logical elements per byte).
-    let a_wire = if desc.a_dtype == Dtype::Fp4 { 1 } else { desc.a_dtype.elem_size() as u32 };
-    let b_wire = if desc.b_dtype == Dtype::Fp4 { 1 } else { desc.b_dtype.elem_size() as u32 };
-    let cd_wire = if desc.cd_dtype == Dtype::Fp4 { 1 } else { desc.cd_dtype.elem_size() as u32 };
+    let a_wire = if desc.a_dtype == Dtype::Fp4 {
+        1
+    } else {
+        desc.a_dtype.elem_size() as u32
+    };
+    let b_wire = if desc.b_dtype == Dtype::Fp4 {
+        1
+    } else {
+        desc.b_dtype.elem_size() as u32
+    };
+    let cd_wire = if desc.cd_dtype == Dtype::Fp4 {
+        1
+    } else {
+        desc.cd_dtype.elem_size() as u32
+    };
     let pack = desc.smem_pack_factor();
 
     let swizzle_a_mode = if desc.major_a == Major::K {
@@ -214,7 +239,12 @@ pub fn storage_config(desc: &GemmDesc, layout: &Layout) -> StorageConfig {
     }
 }
 
-pub fn pipeline_config(desc: &GemmDesc, layout: &Layout, storage: &StorageConfig, has_sf: bool) -> PipelineConfig {
+pub fn pipeline_config(
+    desc: &GemmDesc,
+    layout: &Layout,
+    storage: &StorageConfig,
+    has_sf: bool,
+) -> PipelineConfig {
     let cd_elem = desc.cd_dtype.elem_size() as u32;
     // Swap-AB stores (STORE_BLOCK_M x BLOCK_N) per stage; normal stores
     // (min(128, BLOCK_M) x swizzle_cd bytes).
@@ -229,8 +259,16 @@ pub fn pipeline_config(desc: &GemmDesc, layout: &Layout, storage: &StorageConfig
     let smem_barriers = NUM_MAX_STAGES * 8 * 3 + 2 * 8 * 3 + 8;
     let smem_tmem_ptr = 4;
 
-    let a_wire = if desc.a_dtype == Dtype::Fp4 { 1 } else { desc.a_dtype.elem_size() as u32 };
-    let b_wire = if desc.b_dtype == Dtype::Fp4 { 1 } else { desc.b_dtype.elem_size() as u32 };
+    let a_wire = if desc.a_dtype == Dtype::Fp4 {
+        1
+    } else {
+        desc.a_dtype.elem_size() as u32
+    };
+    let b_wire = if desc.b_dtype == Dtype::Fp4 {
+        1
+    } else {
+        desc.b_dtype.elem_size() as u32
+    };
     let pack = desc.smem_pack_factor();
     let smem_a_per_stage = storage.load_block_m * layout.block_k * a_wire / pack;
     let smem_b_per_stage = storage.load_block_n * layout.block_k * b_wire / pack;
@@ -244,9 +282,11 @@ pub fn pipeline_config(desc: &GemmDesc, layout: &Layout, storage: &StorageConfig
     }
 
     let smem_extra = smem_cd + smem_barriers + smem_tmem_ptr + 1024; // 1024B-align padding slack
-    let smem_per_stage = smem_a_per_stage + smem_b_per_stage + smem_sfa_per_stage + smem_sfb_per_stage;
+    let smem_per_stage =
+        smem_a_per_stage + smem_b_per_stage + smem_sfa_per_stage + smem_sfb_per_stage;
     let budget = desc.smem_capacity.max(SMEM_CAPACITY_FALLBACK);
-    let mut num_stages = ((budget.saturating_sub(smem_extra)) / smem_per_stage.max(1)).min(NUM_MAX_STAGES);
+    let mut num_stages =
+        ((budget.saturating_sub(smem_extra)) / smem_per_stage.max(1)).min(NUM_MAX_STAGES);
     if let Some(pinned) = Overrides::from_env().num_stages {
         num_stages = pinned;
     }
@@ -261,17 +301,24 @@ pub fn pipeline_config(desc: &GemmDesc, layout: &Layout, storage: &StorageConfig
 /// Enumerate layout candidates (port of `SM100ArchSpec::get_layout_candidates`).
 pub fn layout_candidates(desc: &GemmDesc) -> Vec<Layout> {
     let ov = Overrides::from_env();
-    let block_k = ov.block_k.unwrap_or_else(|| block_k_for(desc.a_dtype, desc.is_mxf4_mma()));
+    let block_k = ov
+        .block_k
+        .unwrap_or_else(|| block_k_for(desc.a_dtype, desc.is_mxf4_mma()));
     let has_sf = desc.has_sf();
     let mk_alignment = 128u32; // mk alignment for contiguous layout on SM100 (256 optional upstream)
 
     let mut out = Vec::new();
 
     // M-grouped GEMMs: always swap A/B, block_n = LAYOUT_AD_M, block_m = alignment.
-    if desc.gemm_type == GemmType::MGroupedContiguous || desc.gemm_type == GemmType::MGroupedMasked {
+    if desc.gemm_type == GemmType::MGroupedContiguous || desc.gemm_type == GemmType::MGroupedMasked
+    {
         let block_m = ov.block_m.unwrap_or(mk_alignment).max(128);
         let block_n = ov.block_n.unwrap_or(128);
-        let cluster_n = if ceil_div(desc.n, block_n) % 2 == 0 && desc.num_sms % 2 == 0 { 2 } else { 1 };
+        let cluster_n = if ceil_div(desc.n, block_n) % 2 == 0 && desc.num_sms % 2 == 0 {
+            2
+        } else {
+            1
+        };
         let cluster_n = ov.cluster_n.unwrap_or(cluster_n).min(2);
         let cluster_m = ov.cluster_m.unwrap_or(1);
         out.push(Layout {
@@ -375,7 +422,7 @@ pub fn layout_candidates(desc: &GemmDesc) -> Vec<Layout> {
                         // UMMA padding): align(block_m, 128) rows must fit in
                         // (block_m + block_n) rows of SMEM.
                         if !swap_ab {
-                            let aligned_m = (block_m + 127) / 128 * 128;
+                            let aligned_m = block_m.div_ceil(128) * 128;
                             if aligned_m > block_m + block_n {
                                 continue;
                             }
@@ -393,11 +440,27 @@ pub fn layout_candidates(desc: &GemmDesc) -> Vec<Layout> {
                             continue;
                         }
                         // MN-major operands require swizzle-aligned load blocks.
-                        let a_req = if desc.major_a == Major::Mn { if desc.a_dtype == Dtype::Fp4 { 128 } else { 64 } } else { 8 };
+                        let a_req = if desc.major_a == Major::Mn {
+                            if desc.a_dtype == Dtype::Fp4 {
+                                128
+                            } else {
+                                64
+                            }
+                        } else {
+                            8
+                        };
                         if (block_m / cluster_n.max(1)) % a_req != 0 {
                             continue;
                         }
-                        let b_req = if desc.major_b == Major::Mn { if desc.b_dtype == Dtype::Fp4 { 128 } else { 64 } } else { 8 };
+                        let b_req = if desc.major_b == Major::Mn {
+                            if desc.b_dtype == Dtype::Fp4 {
+                                128
+                            } else {
+                                64
+                            }
+                        } else {
+                            8
+                        };
                         if (block_n / cluster_m.max(1)) % b_req != 0 {
                             continue;
                         }

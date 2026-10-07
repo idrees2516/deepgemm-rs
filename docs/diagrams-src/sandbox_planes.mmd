@@ -1,0 +1,20 @@
+flowchart TB
+    subgraph NOGPU["No-GPU plane (sandbox / CI / laptop)"]
+        CC["deepgemm-bench compile-check<br/>--arch 100a | 103a | 120a"]
+        PTX["NVRTC PTX pass<br/>compute_100a (runtime path)"]
+        SASS["NVRTC CUBIN pass<br/>sm_100a (ptxas SASS)"]
+        GOLD["cargo test (CPU)<br/>golden model: formats,<br/>SF packing, GEMM, MQA"]
+        CC --> PTX & SASS
+        PTX & SASS --> OK["14/14 kernels validated"]
+        GOLD --> OK2["18/18 tests green"]
+    end
+    subgraph GPU["B200 plane (real hardware)"]
+        SMK["smoke (JIT on device)"]
+        E2E["cargo test --features e2e<br/>GPU vs golden bit-exact"]
+        BENCH["bench fp4_nt_native ...<br/>TFLOPS vs peak"]
+        SMK --> E2E --> BENCH
+    end
+    OK -. same kernels .-> SMK
+    OK2 -. same model .-> E2E
+    style NOGPU fill:#efe,stroke:#8c8
+    style GPU fill:#eef,stroke:#88f

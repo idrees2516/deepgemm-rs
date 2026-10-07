@@ -8,23 +8,171 @@
 
 #pragma once
 
+// ===========================================================================
+// CONCEPTS — the Blackwell (SM100) execution model in one page
+// ===========================================================================
+// This prelude is the shared "runtime" of every kernel. The sections below
+// explain each hardware concept the inline PTX below exercises; the same
+// material is rendered as diagrams in docs/concepts.md.
+//
+// ---------------------------------------------------------------------------
+// 1. THE ASYNCHRONOUS DATAFLOW MODEL
+// ---------------------------------------------------------------------------
+// A GEMM on SM100 is a *system of engines*, not a sequence of loads and math:
+//
+//   HBM (global) ──TMA──> SMEM ──tcgen05.mma──> TMEM ──tcgen05.ld──> registers
+//        │                 (staging)      (tensor core,          (epilogue
+//        │                                 async engine)           warps)
+//        └──────────────────── TMA store <────────────────────────────┘
+//
+// Every arrow is asynchronous and overlapped: while the tensor core computes
+// stage s, TMA fetches stage s+1, and the epilogue warps drain stage s-1.
+// The kernel's job is to *schedule* these engines, not to do arithmetic —
+// almost no FMA runs on the CUDA cores in the main loop.
+//
+// ---------------------------------------------------------------------------
+// 2. TMEM — the tensor core's private memory (tcgen05.alloc / .ld / .st)
+// ---------------------------------------------------------------------------
+// Each SM has 256 columns x 128 lanes x 32-bit of "tensor memory" that ONLY
+// the tcgen05 unit writes. The MMA writes D (accumulators) there; a scale-
+// factor path additionally writes the per-block scales into SF columns.
+//
+//    TMEM (one SM, cta_group::1 view):
+//      cols 0..127              cols 128..255
+//    ┌──────────────────────┬──────────────────────┐
+//    │ D (accumulators)     │ optional SF cols      │  row r = lane r of
+//    │ UMMA_M x UMMA_N      │ (SF_BLOCK_K * 32)     │  the 128 "dp" lanes
+//    └──────────────────────┴──────────────────────┘
+//     tcgen05.ld.32x32b: lane i reads row i — a warp sees a 32x32 tile.
+//
+//   * tcgen05.alloc   — claim columns (must be >= 32, power of two, issued by
+//                        ONE warp); .relinquish_alloc_permit lets other CTAs
+//                        in the cluster take over the allocation.
+//   * tcgen05.ld      — move TMEM -> registers (epilogue / math warps read
+//                        D). 32x32b shape: one lane per TMEM row.
+//   * tcgen05.commit  — make the *completion of prior MMAs* visible to an
+//                        mbarrier (the async engine's only sync primitive).
+//
+// The "TMEM overlap trick" (used when SF columns exceed the 512-col budget):
+// beyond 512 total columns, SF columns at (j) alias accumulator columns at
+// (j - 512) — the kernel pipelines around it by never reading a TMEM region
+// while the overlapping region's consumer still owns it.
+//
+// ---------------------------------------------------------------------------
+// 3. TMA — descriptor-driven bulk async copy (cp.async.bulk.tensor.*)
+// ---------------------------------------------------------------------------
+// TMA copies WHOLE TILES between global and shared memory with one
+// instruction, honoring a swizzle pattern baked into the descriptor:
+//
+//   global tensor [outer, inner]          SMEM tile [BLOCK_OUTER, atom*...]
+//   ┌────────────────────┐   TMA box   ┌─────┬─────┬─────┐  XOR swizzle:
+//   │ ████ tile          │ ──────────> │ A0  │ A1  │ A2  │  atom = 128B
+//   │                    │             └─────┴─────┴─────┘  (row r, byte c)
+//   └────────────────────┘                                lands at
+//   The descriptor (cuTensorMapEncodeTiled, built host-side in tma.rs and      (r ^ (c/16)) — banks never
+//   passed BY VALUE as __grid_constant__) encodes: dtype, box shape,           collide for 16B accesses.
+//   strides, and the swizzle atom (16B/32B/64B/128B).
+//
+//   * `.mbarrier::complete_tx::bytes` — TMA arrival feeds the consumer
+//     barrier with the *byte count* (expect_tx); the barrier flips when both
+//     the expected bytes AND the arrival count are satisfied.
+//   * `.multicast::cluster` — one TMA can deliver the same tile to BOTH CTAs
+//     of a cluster (each counts its own expect_tx).
+//   * `.L2::cache_hint` — a 64-bit access-policy descriptor (register "l"
+//     operand); kEvictNormalHint keeps streaming tiles from thrashing L2.
+//
+// ---------------------------------------------------------------------------
+// 4. MBARRIER — the pipeline primitive (init / arrive / expect_tx / wait)
+// ---------------------------------------------------------------------------
+// An mbarrier is a 64-bit SMEM word carrying a phase bit. Producers arrive
+// (optionally with a transaction-byte expectation), consumers spin on
+// `try_wait.parity` until the phase flips:
+//
+//   producer (warp 0)                    consumer (epilogue warps)
+//   ───────────────────                  ─────────────────────────
+//   mbarrier.arrive.expect_tx(_, bar,    wait(bar, parity=0)
+//          TX_BYTES)                     ... flips when bytes arrive
+//   tma_load(...) -> SMEM               tcgen05.ld / tma_store
+//   (TMA hardware: complete_tx)          wait(bar, parity=1)  // next epoch
+//
+//   * Parity alternates 0/1 per reuse of the same stage slot, so a
+//     multi-stage ring needs only ONE phase bit per barrier — the classic
+//     double (N-stage) buffer:
+//        time ──>  [P: fill s0][P: fill s1][P: fill s2]...
+//                  [C: drain s0]        [C: drain s1] ...
+//   * `arrive.cluster` (mapa) signals a barrier living in ANOTHER CTA — used
+//     by the leader-CTA MMA scheme and 2-SM TMA.
+//
+// ---------------------------------------------------------------------------
+// 5. WARP SPECIALIZATION — who does what (GEMM kernel, 256 threads)
+// ---------------------------------------------------------------------------
+//   CTA (256 threads) ─ cluster pair with the buddy CTA (cta_group::2 MMA)
+//   ┌────────────────────────────────────────────────────────────────────┐
+//   │ warp 0   TMA producer: for each k-block, issue A/B/SF tile loads    │
+//   │ warp 1   MMA issuer: elect_one; builds per-stage descriptors,       │
+//   │          fires tcgen05.mma (leader CTA only in 2-SM mode) + UTCCP   │
+//   │ warps 2,3 SF transposers: rearrange SF bytes in SMEM so UTCCP's     │
+//   │          32x128b warp quads hit the right TMEM lanes                 │
+//   │ warps 4..7 epilogue: tcgen05.ld accumulators -> SMEM (swizzle-      │
+//   │          staged) -> TMA store to global; bf16 pack on the way       │
+//   └────────────────────────────────────────────────────────────────────┘
+//   setmaxnreg.inc/dec rebalances the physical register file between
+//   specialized (few) and math (many) warps — the epilogue warps donate
+//   registers to the producer path at zero cost.
+//
+// ---------------------------------------------------------------------------
+// 6. NUMERIC FORMATS & BLOCK SCALING (OCP MX, DeepSeek recipe)
+// ---------------------------------------------------------------------------
+//   E4M3 (FP8): sign|4-bit exp (bias 7)|3-bit mant  — max 448, min 2^-9
+//   E2M1 (FP4): sign|2-bit exp (bias 1)|1-bit mant  — grid {0,.5,1,1.5,2,3,4,6}
+//   UE8M0 (SF) : pure 8-bit exponent, value = 2^(code-127), code 0 reserved
+//
+//   Block scaling: for element (i, k) with granularity g (32 for MX, 128 for
+//   the DeepSeek FP8 recipe):
+//       contribution = code(i,k) * 2^(sfA(i, k/g) - 127) * code(j,k) * 2^(sfB(j, k/g) - 127)
+//   The MMA hardware (kind::mxf8f6f4 / kind::mxf4) applies the *linear*
+//   code product; the power-of-two scales ride a SEPARATE SF path:
+//   SF words are packed 4-per-int32 in K order (byte j = k*4+j of the
+//   group's row), laid out MN-contiguous so a 16B TMA row = 16 rows.
+//   UTCCP (tcgen05.cp.32x128b.warpx4) transposes them into TMEM SF columns.
+//
+// ---------------------------------------------------------------------------
+// 7. PERSISTENT KERNEL + L2-BLOCK SWIZZLE SCHEDULING
+// ---------------------------------------------------------------------------
+// The grid is fixed at num_SMs blocks (one wave forever); each CTA loops
+// over output tiles. Tile visit order is "swizzled" in groups of
+// kNum1DBlocksPerGroup so that concurrent CTAs work on the same rows-band —
+// their A-tile TMA loads coalesce in L2 (shared across the group), while B
+// tiles multicast. Programmatic dependent launch (griddepcontrol.wait /
+// launch_dependents) lets back-to-back kernels overlap prologue/epilogue.
+// ===========================================================================
+
 #define DG_DEVICE __device__ __forceinline__
 #define DG_GLOBAL __global__
 #define DG_STATIC_ASSERT(cond, msg) static_assert(cond, msg)
 
-typedef unsigned char uint8_t_dg;
-typedef unsigned short uint16_t_dg;
-typedef unsigned int uint32_t_dg;
-typedef unsigned long long uint64_t_dg;
+// Fixed-width integer types: NVRTC compiles with *no* implicit headers
+// (no stdint.h), so the standard names must be provided here. Safe against
+// redefinition because these translation units are zero-include by design.
+// (This was a real bug caught by the sandbox `compile-check`: without these,
+// every kernel fails to JIT — NVRTC does not know `uint32_t` etc.)
+typedef unsigned char uint8_t;
+typedef unsigned short uint16_t;
+typedef unsigned int uint32_t;
+typedef unsigned long long uint64_t;
+typedef signed char int8_t;
+typedef short int16_t;
+typedef int int32_t;
+typedef long long int64_t;
 // Use the compiler's built-in vector types (predefined by NVRTC).
-// uint4/int4/float2 are available without headers in NVRTC.
+// uint4/int4/float2/float4 are available without headers in NVRTC.
 
 namespace dg {
 
-DG_DEVICE uint32_t ceil_div_u32(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
-DG_DEVICE uint32_t align_u32(uint32_t a, uint32_t b) { return ceil_div_u32(a, b) * b; }
-DG_DEVICE uint32_t dg_min(uint32_t a, uint32_t b) { return a < b ? a : b; }
-DG_DEVICE uint32_t dg_max(uint32_t a, uint32_t b) { return a > b ? a : b; }
+constexpr DG_DEVICE uint32_t ceil_div_u32(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
+constexpr DG_DEVICE uint32_t align_u32(uint32_t a, uint32_t b) { return ceil_div_u32(a, b) * b; }
+constexpr DG_DEVICE uint32_t dg_min(uint32_t a, uint32_t b) { return a < b ? a : b; }
+constexpr DG_DEVICE uint32_t dg_max(uint32_t a, uint32_t b) { return a > b ? a : b; }
 template <typename T> DG_DEVICE void dg_swap(T& a, T& b) { T t = a; a = b; b = t; }
 
 DG_DEVICE uint32_t get_lane_idx() { return threadIdx.x & 31; }
@@ -48,9 +196,15 @@ DG_DEVICE bool elect_one_sync() {
 }
 
 DG_DEVICE uint32_t cvta_shared_to_u32(const void* ptr) {
-    uint32_t addr;
-    asm volatile("cvta.to.shared.u32 %0, %1;" : "=r"(addr) : "l"(ptr));
-    return addr;
+    // Convert generic -> shared. The PTX form must be .u64 on both operands
+    // (a generic pointer is 64-bit; mixing a .b64 source with a .u32 opcode
+    // is rejected by ptxas with "Arguments mismatch"). The shared window
+    // occupies the low 32 bits, so truncating afterwards is exact.
+    // (Upstream uses the __cvta_generic_to_shared builtin; this is the
+    // equivalent zero-include inline-asm form.)
+    uint64_t addr64;
+    asm volatile("cvta.to.shared.u64 %0, %1;" : "=l"(addr64) : "l"(ptr));
+    return static_cast<uint32_t>(addr64);
 }
 
 DG_DEVICE void named_barrier_sync(uint32_t num_threads, uint32_t id) {
@@ -322,15 +476,27 @@ DG_DEVICE uint32_t cvt_e4m3x2_f32(float lo, float hi) {
     asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;" : "=h"(r) : "f"(lo), "f"(hi));
     return r;
 }
+// RN (ties-to-even) + satfinite-to-6 onto the E2M1 grid {0,.5,1,1.5,2,3,4,6}.
+// Matches cvt.rn.satfinite.e2m1x2.f32 bit-exactly (cross-checked against the
+// CPU golden model). Implemented in integer/float compares instead of the
+// hardware cvt: the .b8 destination of that instruction cannot be packed into
+// a .b32 with a single-element `mov {t}` (ptxas rejects the form), and this
+// path sits in the memory-bound quant kernel, so ALU cost is immaterial.
+DG_DEVICE uint32_t e2m1_code(float v) {
+    if (v <= 0.25f) return 0u;   // tie at 0.25  -> 0     (even code)
+    if (v <  0.75f) return 1u;   // (.25, .75)   -> 0.5
+    if (v <= 1.25f) return 2u;   // tie at 0.75 / 1.25 -> 1.0
+    if (v <  1.75f) return 3u;   // (1.25, 1.75) -> 1.5
+    if (v <= 2.5f)  return 4u;   // ties at 1.75 / 2.5  -> 2.0
+    if (v <  3.5f)  return 5u;   // (2.5, 3.5)   -> 3.0
+    if (v <= 5.0f)  return 6u;   // ties at 3.5 / 5.0   -> 4.0
+    return 7u;                   // (5, inf)     -> 6   (satfinite)
+}
 DG_DEVICE uint32_t cvt_e2m1x2_f32(float lo, float hi) {
-    // Two f32 -> packed e2m1x2 nibble pair, returned in a u8 (as u32).
-    uint32_t r;
-    asm volatile(
-        "{\n\t.reg .b8 t;\n\t"
-        "cvt.rn.satfinite.e2m1x2.f32 t, %2, %1;\n\t"
-        "mov.b32 %0, {t};\n\t}"
-        : "=r"(r) : "f"(lo), "f"(hi));
-    return r & 0xffu;
+    // Two f32 -> packed e2m1x2 nibble pair (low nibble = lo), as u32 byte.
+    const uint32_t c0 = e2m1_code(lo < 0.0f ? -lo : lo) | (lo < 0.0f ? 8u : 0u);
+    const uint32_t c1 = e2m1_code(hi < 0.0f ? -hi : hi) | (hi < 0.0f ? 8u : 0u);
+    return c0 | (c1 << 4);
 }
 // f16 (raw bits) -> f32
 DG_DEVICE float f32_from_f16(uint32_t h) {
@@ -591,12 +757,28 @@ DG_DEVICE void tmem_load_32dp32b_x32(uint32_t addr, uint32_t* v) {
                    "=r"(v[24]), "=r"(v[25]), "=r"(v[26]), "=r"(v[27]), "=r"(v[28]), "=r"(v[29]), "=r"(v[30]), "=r"(v[31])
                  : "r"(addr));
 }
+// Float overloads (upstream passes `float accum[...]` arrays through
+// `reinterpret_cast<uint32_t*>`; these overloads keep kernel code natural).
+DG_DEVICE void tmem_load_32dp32b_x4(uint32_t addr, float& v0, float& v1, float& v2, float& v3) {
+    tmem_load_32dp32b_x4(addr, reinterpret_cast<uint32_t&>(v0), reinterpret_cast<uint32_t&>(v1),
+                         reinterpret_cast<uint32_t&>(v2), reinterpret_cast<uint32_t&>(v3));
+}
+DG_DEVICE void tmem_load_32dp32b_x8(uint32_t addr, float& v0, float& v1, float& v2, float& v3,
+                                    float& v4, float& v5, float& v6, float& v7) {
+    tmem_load_32dp32b_x8(addr, reinterpret_cast<uint32_t&>(v0), reinterpret_cast<uint32_t&>(v1),
+                         reinterpret_cast<uint32_t&>(v2), reinterpret_cast<uint32_t&>(v3),
+                         reinterpret_cast<uint32_t&>(v4), reinterpret_cast<uint32_t&>(v5),
+                         reinterpret_cast<uint32_t&>(v6), reinterpret_cast<uint32_t&>(v7));
+}
 DG_DEVICE void tmem_load_32dp32b_x16(uint32_t addr, uint32_t* v) {
     asm volatile("tcgen05.ld.sync.aligned.32x32b.x16.b32 "
                  "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
                  : "=r"(v[0]), "=r"(v[1]), "=r"(v[2]), "=r"(v[3]), "=r"(v[4]), "=r"(v[5]), "=r"(v[6]), "=r"(v[7]),
                    "=r"(v[8]), "=r"(v[9]), "=r"(v[10]), "=r"(v[11]), "=r"(v[12]), "=r"(v[13]), "=r"(v[14]), "=r"(v[15])
                  : "r"(addr));
+}
+DG_DEVICE void tmem_load_32dp32b_x16(uint32_t addr, float* v) {
+    tmem_load_32dp32b_x16(addr, reinterpret_cast<uint32_t*>(v));
 }
 // 16x256b: two rows per lane; satisfies the STSM layout for the swap-AB epilogue.
 DG_DEVICE void tmem_load_16dp256b_x1(uint32_t addr, uint32_t& v0, uint32_t& v1, uint32_t& v2, uint32_t& v3) {
@@ -649,11 +831,15 @@ DG_DEVICE void tmem_relinquish_2sm() {
 }
 
 // Register reallocation for warp-specialized kernels.
-DG_DEVICE void setmaxnreg_dec(uint32_t n) {
-    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" :: "n"(n));
+// PTX `"n"` operands must be compile-time immediates, so the register count
+// is a template parameter (call sites pass constexpr values).
+template <uint32_t N>
+DG_DEVICE void setmaxnreg_dec() {
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" :: "n"(N));
 }
-DG_DEVICE void setmaxnreg_inc(uint32_t n) {
-    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" :: "n"(n));
+template <uint32_t N>
+DG_DEVICE void setmaxnreg_inc() {
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" :: "n"(N));
 }
 
 // ---------------------------------------------------------------------------
@@ -671,7 +857,7 @@ DG_DEVICE bool gemm_type_is_k_grouped(GemmType t) { return false; }  // not port
 
 template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t kNumMulticast, bool kIsMulticastOnA,
           uint32_t kNumSMs>
-DG_DEVICE uint32_t get_num_1d_blocks_per_group() {
+constexpr DG_DEVICE uint32_t get_num_1d_blocks_per_group() {
     uint32_t num_best = 0, min_usage = 0xffffffffu;
     #pragma unroll
     for (uint32_t i = 0; i < 2; ++i) {
@@ -792,7 +978,7 @@ struct Scheduler {
 
 // Aligned TMEM column count (port of utils::get_num_aligned_tmem_cols).
 template <uint32_t kNumCols>
-DG_DEVICE uint32_t get_num_aligned_tmem_cols() {
+constexpr DG_DEVICE uint32_t get_num_aligned_tmem_cols() {
     DG_STATIC_ASSERT(kNumCols <= 512, "Too many tensor memory columns");
     if (kNumCols <= 32) return 32;
     if (kNumCols <= 64) return 64;
@@ -816,9 +1002,12 @@ DG_DEVICE uint32_t inner_block_atom_size() {
 // UMMA majors, cache hints, and descriptor builders (mma/sm100.cuh port)
 // ---------------------------------------------------------------------------
 enum : uint32_t { MAJOR_K = 0, MAJOR_MN = 1 };
-constexpr uint32_t kEvictNormalHint = 0x1000000000000000ull;
+// 64-bit cache-hint descriptor for `.L2::cache_hint` ("l" register operand).
+// 0x10...0 = access_property::normal (upstream DeepGEMM / CUDA access-policy
+// encoding). Must stay uint64_t — a uint32_t silently truncates to 0 (no hint).
+constexpr uint64_t kEvictNormalHint = 0x1000000000000000ull;
 
-DG_DEVICE uint32_t get_atom_base(UmmaLayoutType layout_type) {
+constexpr DG_DEVICE uint32_t get_atom_base(UmmaLayoutType layout_type) {
     return layout_type == UmmaLayoutType::SWIZZLE_128B_BASE32B ? 32u : 16u;
 }
 

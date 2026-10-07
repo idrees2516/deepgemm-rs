@@ -4,6 +4,17 @@
 
 Everything is JIT-compiled at runtime with NVRTC (the same model as upstream DeepGEMM's DeepJIT): there is no CUDA build step, no `nvcc`, and no toolkit needed to *build* — kernels are compiled on first use, per shape-config, and cached on disk (`~/.cache/deepgemm-rs`).
 
+Because NVRTC is a pure compiler and the numeric semantics are mirrored by a CPU golden model, **the whole project runs — and is validated — in two planes**: a GPU-less sandbox (compile + math tests) and the B200 itself (correctness + TFLOPS). See [docs/concepts.md](docs/concepts.md) for the full concept guide with diagrams.
+
+```text
+   GPU-less plane (CI / laptop / this sandbox)          B200 plane
+  ┌─────────────────────────────┐            ┌─────────────────────────────┐
+  │ compile-check  (PTX+SASS)   │            │ smoke (on-device JIT)       │
+  │ cargo test    (golden math) │── same ──▶│ cargo test --features e2e   │
+  └─────────────────────────────┘  kernels  │ bench ... (TFLOPS vs peak) │
+                              └─ and model ┘┴────────────────────────────┘
+```
+
 ## What's implemented
 
 | Operator | Kernel path | Notes |
@@ -31,14 +42,49 @@ The heuristics are a line-by-line port of upstream `SM100ArchSpec` (block-size e
 
 ## Requirements
 
-- NVIDIA Blackwell datacenter GPU (B200 / GB200; SM100a). (Hopper SM90 kernels are not yet wired in — the API returns a clear error.)
-- CUDA **driver** 12.8+ (for `tcgen05` + `16U4` TMA data types) with `libnvrtc`.
-- Rust 1.75+.
+- **For running on a GPU**: NVIDIA Blackwell datacenter GPU (B200 / GB200; SM100a), CUDA **driver** 12.8+ (for `tcgen05` + `16U4` TMA data types) with `libnvrtc`, Rust 1.75+.
+- **For the GPU-less plane** (compile-check + tests): no GPU, no driver — just `libnvrtc.so.12`, e.g. `pip install nvidia-cuda-nvrtc-cu12` (CUDA 12.8+).
 
 The CUDA libraries are loaded at runtime (dlopen); make sure the loader can find them:
 
 ```bash
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/nvvm/lib64:$LD_LIBRARY_PATH
+# or, without any CUDA install:
+#   pip install nvidia-cuda-nvrtc-cu12   # then either set LD_LIBRARY_PATH to its
+#   lib dir, or DG_NVRTC_PATH=/path/to/libnvrtc.so.12 — the binaries probe
+#   pip wheel locations automatically.
+```
+
+## Running without a GPU (sandbox / CI / laptop)
+
+Two mechanisms, both used by this project's own development sandbox:
+
+**1. Offline kernel validation — `compile-check`.** NVRTC never touches the
+GPU, so every kernel variant is compiled to **PTX** (`compute_100a` — the
+exact runtime JIT path) *and* to **SASS** (`sm_100a`, full ptxas backend via
+`nvrtcGetCUBIN`). If it compiles here, it compiles on the B200:
+
+```bash
+pip install nvidia-cuda-nvrtc-cu12
+cargo run -p deepgemm-bench --release -- compile-check            # sm_100a
+#   --arch 103a   # B300
+#   --arch 120a   # SM120 (RTX 50-class)
+cargo run -p deepgemm-bench --release -- smoke   # on a GPU-less machine this
+                                                 # auto-falls back to compile-check
+```
+
+Current status: **14/14 variants, PTX + SASS, in ~4s** (covers every TU and
+code path: mxf4 / mxf8f6f4 / f16 MMAs, UTCCP SF paths, swap-AB, m-grouped
+contiguous+masked, batched, MQA in FP8 and FP4, quant/transform_sf).
+
+**2. CPU golden model — `cargo test`.** `deepgemm/src/golden.rs` reimplements
+the numeric semantics bit-exactly (E4M3/E2M1/UE8M0, RNE quantization, SF
+packing, block-scaled GEMM, MQA logits). 18 tests run anywhere; on a B200 the
+e2e feature additionally cross-checks the *hardware* against the same model
+(including a byte-exact `transform_sf` comparison).
+
+```bash
+cargo test --workspace        # golden + heuristics tests, no GPU needed
 ```
 
 ## Build & smoke test (no GPU code compiled at build time)
@@ -47,15 +93,17 @@ export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/nvvm/lib64:$LD_LIBR
 cargo build --release
 cargo run -p deepgemm-bench --release -- list
 cargo run -p deepgemm-bench --release -- smoke   # JIT-compiles every kernel variant for this GPU
+                                               # (falls back to offline compile-check without a driver)
 ```
 
-## Correctness tests (run on the B200)
+## Correctness tests
 
 ```bash
-cargo test -p deepgemm --features e2e --release -- --nocapture
+cargo test --workspace                      # CPU plane: golden model + heuristics (no GPU)
+cargo test -p deepgemm --features e2e --release -- --nocapture   # B200 plane: GPU vs golden
 ```
 
-Covers: quant/transform_sf round-trips, `fp8_gemm_nt` (gran 32 & 128), **native `fp4_gemm_nt`**, `bf16_gemm_nt`, m-grouped contiguous & masked, and `mqa_logits` — each against a CPU dequantize-and-matmul reference.
+Covers: quant/transform_sf round-trips, `fp8_gemm_nt` (gran 32 & 128), **native `fp4_gemm_nt`**, `bf16_gemm_nt`, m-grouped contiguous & masked, `mqa_logits` — each against the bit-exact CPU golden model (`src/golden.rs`), plus a byte-exact `transform_sf` GPU-vs-model comparison.
 
 ## Benchmarks (TFLOPS + % of peak)
 
@@ -119,21 +167,32 @@ fp4_gemm_nt(&dev, &stream, &a, &b, &mut out, false)?;
 ## Project layout
 
 ```
+docs/
+  concepts.md      concept guide (this repo's "textbook") with diagrams
+  diagrams-src/    Mermaid sources   ── regen: python3 scripts/gen_diagrams.py
+  img/             rendered SVG diagrams
 deepgemm/            the library crate
   src/
     sys.rs           thin checked wrappers over the CUDA driver (via cudarc's dlopen'd libcuda)
     device.rs        device context, streams, buffers
+    golden.rs        bit-exact CPU golden model (formats, SF packing, GEMM, MQA)
     jit.rs           NVRTC compile + disk cache + cuLaunchKernelEx (cluster/PDL)
+                   + offline compile-check (PTX & SASS, no GPU)
     tma.rs           cuTensorMapEncodeTiled builders (A/B/SF/CD, 2D/3D, swizzles, 16U4)
     heuristics.rs    port of upstream SM100 config search + DG_* overrides
     api.rs           public GEMM / MQA / transform / quant entry points
     types.rs         dtypes, majors, operand/output descriptors
   kernels/           NVRTC CUDA C++ (zero #includes; all exotic ops are inline PTX)
+                   each file opens with a concept tutorial (pipelines, warp maps,
+                   barrier topology, SF packing diagrams)
     prelude.h        barriers, TMA, UMMA/tcgen05 descriptors & ops, scheduler, conversions
     gemm_sm100.cu    the unified FP8/FP4/BF16 GEMM + epilogues (swap-AB & normal)
     layout_quant.cu  transform_sf, MX quantization, dequant
     mqa_logits_sm100.cu  MLA lightning-indexer scoring
-deepgemm-bench/      benchmark CLI
+  tests/
+    golden_tests.rs  CPU-plane tests (run anywhere)
+    e2e_gpu.rs       B200-plane tests (feature e2e; GPU vs golden, bit-exact SF check)
+deepgemm-bench/      benchmark CLI (bench / smoke / compile-check / list)
 ```
 
 ## Relation to upstream / not-yet-ported

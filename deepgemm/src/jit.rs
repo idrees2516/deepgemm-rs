@@ -2,6 +2,11 @@
 //! memory and on disk), loads modules, and launches via `cuLaunchKernelEx`
 //! with cluster dims / dynamic smem / optional PDL.
 
+// Launch plumbing hands raw driver handles (CUfunction/CUstream) into the
+// FFI boundary; and `% b == 0` is kept for MSRV 1.75 compatibility.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(clippy::manual_is_multiple_of)]
+
 use crate::device::Device;
 use crate::error::{DgError, DgResult};
 use crate::sys;
@@ -31,7 +36,12 @@ struct JitState {
 
 fn state() -> &'static Mutex<JitState> {
     static S: OnceLock<Mutex<JitState>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(JitState { modules: HashMap::new(), kernels: HashMap::new() }))
+    S.get_or_init(|| {
+        Mutex::new(JitState {
+            modules: HashMap::new(),
+            kernels: HashMap::new(),
+        })
+    })
 }
 
 fn cache_dir() -> Option<PathBuf> {
@@ -80,14 +90,13 @@ fn compile_ptx_nocache(source: &str, arch: &str) -> DgResult<String> {
         b"--std=c++17".to_vec(),
     ];
     unsafe {
-        nvrtc_result::compile_program(prog, &options)
-            .map_err(|e| {
-                let log = nvrtc_result::get_program_log(prog)
-                    .map(|l| l.iter().map(|&c| c as u8).collect::<Vec<u8>>())
-                    .map(|l| String::from_utf8_lossy(&l).into_owned())
-                    .unwrap_or_default();
-                DgError::Nvrtc(format!("NVRTC compile ({arch}): {e:?}\n{log}"))
-            })?;
+        nvrtc_result::compile_program(prog, &options).map_err(|e| {
+            let log = nvrtc_result::get_program_log(prog)
+                .map(|l| l.iter().map(|&c| c as u8).collect::<Vec<u8>>())
+                .map(|l| String::from_utf8_lossy(&l).into_owned())
+                .unwrap_or_default();
+            DgError::Nvrtc(format!("NVRTC compile ({arch}): {e:?}\n{log}"))
+        })?;
         let ptx = nvrtc_result::get_ptx(prog)
             .map_err(|e| DgError::Nvrtc(format!("NVRTC get_ptx: {e:?}")))?;
         let _ = nvrtc_result::destroy_program(prog);
@@ -103,7 +112,13 @@ fn compile_ptx_nocache(source: &str, arch: &str) -> DgResult<String> {
 /// Get (or compile+load) a kernel. `kernel_src` is the kernel translation
 /// unit (see [`kernel_src`]); `body` is the instantiation wrapper appended
 /// after it. `signature` uniquely names the compiled variant.
-pub fn get_kernel(dev: &Device, kernel_src: &str, tag: &str, signature: &str, body: &str) -> DgResult<sys::Func> {
+pub fn get_kernel(
+    dev: &Device,
+    kernel_src: &str,
+    tag: &str,
+    signature: &str,
+    body: &str,
+) -> DgResult<sys::Func> {
     let cache_key = format!("{tag}/{signature}");
     {
         let st = state().lock().unwrap();
@@ -135,6 +150,211 @@ pub fn smoke_compile(dev: &Device, kernel_src: &str, tag: &str, body: &str) -> D
 }
 
 // ---------------------------------------------------------------------------
+// Offline (GPU-less) compile checks
+//
+// NVRTC is a pure compiler: `nvrtcCompileProgram` + `nvrtcGetPTX` (and even
+// `nvrtcGetCUBIN`, which runs the built-in ptxas backend) never touch the
+// driver or a device. That means the *entire* kernel suite can be validated
+// on a machine without a GPU — a CI sandbox, a laptop, an H100 box — as long
+// as libnvrtc can be loaded. This is the "run it in this sandbox through
+// anyway" path:
+//
+//   PTX  pass: -arch=compute_100a  — exactly what the runtime JIT does
+//              (identical option string), so a green check here means the
+//              on-device `smoke` will also compile.
+//   CUBIN pass: -arch=sm_100a      — additionally runs the SASS backend,
+//              catching instruction-level issues (register pressure is
+//              still a runtime property, but encoding/selector bugs are
+//              caught here).
+// ---------------------------------------------------------------------------
+
+/// Result of one offline compile check.
+#[derive(Debug, Clone)]
+pub struct CompileCheckResult {
+    /// Size of the generated PTX text, bytes.
+    pub ptx_len: usize,
+    /// Size of the generated CUBIN (SASS), bytes, when the NVRTC build
+    /// supports `nvrtcGetCUBIN` (CUDA >= 11.8) — `None` otherwise.
+    pub cubin_len: Option<usize>,
+}
+
+/// Make `libnvrtc.so.12` loadable *without* a CUDA installation:
+/// 1. If the plain dlopen already works (LD_LIBRARY_PATH, system CUDA),
+///    nothing to do — cudarc's `sys::lib()` will find it.
+/// 2. Otherwise probe common locations and `dlopen(..., RTLD_GLOBAL)` the
+///    absolute path; glibc then resolves later by-soname lookups to the
+///    already-loaded object.
+/// 3. `DG_NVRTC_PATH` may point at a directory (or exact .so) to use.
+pub fn ensure_nvrtc() -> DgResult<()> {
+    // Fast path: does by-name dlopen already succeed?
+    if probe_dlopen(None) {
+        return Ok(());
+    }
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(p) = std::env::var_os("DG_NVRTC_PATH") {
+        let p = PathBuf::from(p);
+        if p.is_dir() {
+            candidates.push(p.join("libnvrtc.so.12").to_string_lossy().into_owned());
+            candidates.push(p.join("libnvrtc.so").to_string_lossy().into_owned());
+        } else {
+            candidates.push(p.to_string_lossy().into_owned());
+        }
+    }
+    // venv roots (VIRTUAL_ENV, ~/.venv): walk lib/python*/site-packages.
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let venvs: Vec<PathBuf> = std::env::var_os("VIRTUAL_ENV")
+        .map(PathBuf::from)
+        .into_iter()
+        .collect();
+    for v in venvs {
+        push_pip_libnvrtc(&v, &mut candidates);
+    }
+    push_pip_libnvrtc(&home.join(".venv"), &mut candidates);
+    push_pip_libnvrtc(&home.join("miniconda3"), &mut candidates);
+    // System CUDA installs.
+    candidates.push("/usr/local/cuda/lib64/libnvrtc.so.12".into());
+    candidates.push("/usr/lib/x86_64-linux-gnu/libnvrtc.so.12".into());
+    for c in &candidates {
+        if probe_dlopen(Some(c)) {
+            return Ok(());
+        }
+    }
+    // Also try without any hint — maybe it appeared meanwhile.
+    if probe_dlopen(None) {
+        return Ok(());
+    }
+    Err(DgError::Nvrtc(
+        "libnvrtc.so.12 not loadable. Install it (e.g. `pip install nvidia-cuda-nvrtc-cu12`), \
+         then either set LD_LIBRARY_PATH to its lib dir or DG_NVRTC_PATH to the .so path"
+            .into(),
+    ))
+}
+
+/// Append `lib/pythonX/site-packages/nvidia/cuda_nvrtc/lib/libnvrtc.so.12`
+/// candidates for a venv/conda root, if present.
+fn push_pip_libnvrtc(root: &std::path::Path, out: &mut Vec<String>) {
+    let lib = root.join("lib");
+    let Ok(entries) = std::fs::read_dir(&lib) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let sp = e
+            .path()
+            .join("site-packages/nvidia/cuda_nvrtc/lib/libnvrtc.so.12");
+        if sp.is_file() {
+            out.push(sp.to_string_lossy().into_owned());
+        }
+    }
+}
+
+/// dlopen probe. `None` = by soname only.
+fn probe_dlopen(path: Option<&str>) -> bool {
+    unsafe extern "C" {
+        fn dlopen(filename: *const std::ffi::c_char, flag: i32) -> *mut std::ffi::c_void;
+    }
+    const RTLD_NOW: i32 = 2;
+    const RTLD_GLOBAL: i32 = 0x100;
+    let c = match path {
+        Some(p) => match std::ffi::CString::new(p) {
+            Ok(c) => c,
+            Err(_) => return false,
+        },
+        None => std::ffi::CString::new("libnvrtc.so.12").unwrap(),
+    };
+    unsafe { !dlopen(c.as_ptr(), RTLD_NOW | RTLD_GLOBAL).is_null() }
+}
+
+/// Offline-compile one kernel variant for `arch` (e.g. "100a"):
+/// PTX (compute_ arch, the runtime path) + CUBIN (sm_ arch, SASS backend).
+pub fn compile_check_kernel(
+    source_tu: &str,
+    body: &str,
+    arch: &str,
+    tag: &str,
+) -> DgResult<CompileCheckResult> {
+    ensure_nvrtc()?;
+    let source = format!("{PRELUDE}\n{source_tu}\n{body}");
+    let ptx = compile_ptx_cached(&source, arch, tag)?;
+    let cubin_len = compile_cubin(&source, arch, tag).ok().map(|v| v.len());
+    Ok(CompileCheckResult {
+        ptx_len: ptx.len(),
+        cubin_len,
+    })
+}
+
+/// Compile to CUBIN (SASS) via `--gpu-architecture=sm_<arch>`.
+/// Uses `nvrtcGetCUBIN`/`nvrtcGetCUBINSize` from the raw binding layer.
+fn compile_cubin(source: &str, arch: &str, tag: &str) -> DgResult<Vec<u8>> {
+    let key = format!("{:016x}", fnv1a(&format!("{source}\x00sm{arch}\x00{tag}")));
+    if let Some(dir) = cache_dir() {
+        let path = dir.join(format!("{key}.{arch}.cubin"));
+        if let Ok(c) = std::fs::read(&path) {
+            return Ok(c);
+        }
+        match compile_cubin_nocache(source, arch) {
+            Ok(c) => {
+                let _ = std::fs::write(&path, &c);
+                Ok(c)
+            }
+            Err(e) => Err(e),
+        }
+    } else {
+        compile_cubin_nocache(source, arch)
+    }
+}
+
+fn compile_cubin_nocache(source: &str, arch: &str) -> DgResult<Vec<u8>> {
+    let prog = nvrtc_result::create_program(source, None)
+        .map_err(|e| DgError::Nvrtc(format!("NVRTC create: {e:?}")))?;
+    let options: Vec<Vec<u8>> = vec![
+        format!("--gpu-architecture=sm_{arch}").into_bytes(),
+        b"--std=c++17".to_vec(),
+    ];
+    unsafe {
+        nvrtc_result::compile_program(prog, &options).map_err(|e| {
+            let log = nvrtc_result::get_program_log(prog)
+                .map(|l| l.iter().map(|&c| c as u8).collect::<Vec<u8>>())
+                .map(|l| String::from_utf8_lossy(&l).into_owned())
+                .unwrap_or_default();
+            DgError::Nvrtc(format!("NVRTC cubin ({arch}): {e:?}\n{log}"))
+        })?;
+        let lib = cudarc::nvrtc::sys::lib();
+        use cudarc::nvrtc::sys::nvrtcResult;
+        let mut size = 0usize;
+        let r = lib.nvrtcGetCUBINSize(prog, &mut size);
+        if r != nvrtcResult::NVRTC_SUCCESS {
+            let _ = nvrtc_result::destroy_program(prog);
+            return Err(DgError::Nvrtc(format!(
+                "nvrtcGetCUBINSize({arch}) -> {r:?}"
+            )));
+        }
+        let mut buf = vec![0u8; size.max(1)];
+        let r2 = lib.nvrtcGetCUBIN(prog, buf.as_mut_ptr() as *mut std::ffi::c_char);
+        let _ = nvrtc_result::destroy_program(prog);
+        if r2 != nvrtcResult::NVRTC_SUCCESS {
+            return Err(DgError::Nvrtc(format!("nvrtcGetCUBIN({arch}) -> {r2:?}")));
+        }
+        buf.truncate(size);
+        Ok(buf)
+    }
+}
+
+/// NVRTC runtime version as "(major, minor)", for diagnostics.
+pub fn nvrtc_version() -> DgResult<(i32, i32)> {
+    ensure_nvrtc()?;
+    unsafe {
+        let lib = cudarc::nvrtc::sys::lib();
+        use cudarc::nvrtc::sys::nvrtcResult;
+        let (mut maj, mut min) = (0i32, 0i32);
+        let r = lib.nvrtcVersion(&mut maj, &mut min);
+        if r != nvrtcResult::NVRTC_SUCCESS {
+            return Err(DgError::Nvrtc(format!("nvrtcVersion -> {r:?}")));
+        }
+        Ok((maj, min))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Launch plumbing
 // ---------------------------------------------------------------------------
 
@@ -146,7 +366,10 @@ pub struct Args {
 
 impl Args {
     pub fn new() -> Args {
-        Args { raw: Vec::new(), ptrs: Vec::new() }
+        Args {
+            raw: Vec::new(),
+            ptrs: Vec::new(),
+        }
     }
 
     pub fn u32(mut self, v: u32) -> Self {
@@ -177,9 +400,8 @@ impl Args {
     }
     /// TMA descriptor passed by value (128 bytes, 64-byte aligned).
     pub fn tensormap(mut self, m: &sys::TensorMap) -> Self {
-        let bytes = unsafe {
-            std::slice::from_raw_parts(m as *const sys::TensorMap as *const u8, 128)
-        };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(m as *const sys::TensorMap as *const u8, 128) };
         self.raw.push(bytes.to_vec());
         self
     }
@@ -189,6 +411,12 @@ impl Args {
             self.ptrs.push(r.as_ptr() as *const _);
         }
         self.ptrs
+    }
+}
+
+impl Default for Args {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -202,7 +430,11 @@ pub fn launch(
 ) -> DgResult<()> {
     dev.bind()?;
     if cfg.smem > 48 * 1024 {
-        sys::func_set_attribute(func, sys::FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES, cfg.smem as i32)?;
+        sys::func_set_attribute(
+            func,
+            sys::FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            cfg.smem as i32,
+        )?;
     }
     let params = args.finish();
     unsafe { sys::launch_kernel_ex(func, cfg, stream, &params) }

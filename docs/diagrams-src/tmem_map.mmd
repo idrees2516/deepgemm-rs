@@ -1,0 +1,20 @@
+flowchart TB
+    subgraph TM["TMEM — 512 columns x 128 lanes x 32-bit (per SM)"]
+        direction LR
+        subgraph D["accumulator columns (tcgen05.mma writes)"]
+            DA["0 .. UMMA_N-1<br/>(or swapped for swapAB)"]
+        end
+        subgraph S["SF columns (UTCCP writes)"]
+            SA["SF_BLOCK_K · 32 cols"]
+        end
+        OV["overlap zone: cols ≥ 512 alias<br/>accum − 512 (guarded by tmem barriers)"]
+    end
+    MMA["tcgen05.mma → D region"]
+    UTC["tcgen05.cp UTCCP → SF region"]
+    LD32["tcgen05.ld.32x32b<br/>lane i reads row i"]
+    MMA --> D
+    UTC --> S
+    LD32 --> D
+    LD32 --> S
+    style TM fill:#f7f7ff,stroke:#99a
+    style OV fill:#fdd,stroke:#d77

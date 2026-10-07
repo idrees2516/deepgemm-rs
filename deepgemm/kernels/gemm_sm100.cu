@@ -4,6 +4,43 @@
 // `epilogue/sm100_store_cd{,_swap_ab}.cuh`, adapted to a single self-contained
 // NVRTC translation unit (compiled with prelude.h prepended).
 //
+// ===========================================================================
+// PIPELINE — how one output tile flows through the engines
+// ===========================================================================
+// Per k-block iteration (stage s = k_idx % kNumStages), three engines run
+// concurrently on DIFFERENT stages:
+//
+//   k:      0        1        2        3        4        5     ...
+//          ┌────────┬────────┬────────┬────────┬────────┬────────┐
+//   TMA  : │load s0 │load s1 │load s2 │load s3 │  ... (SF tiles first:
+//   (w0)  │ A+B+SF │        │        │        │        │  SF is expected at
+//          └────────┴────────┴────────┴────────┴────────┴────────┘ the MMA issue
+//   MMA  :          │mma(s0) │mma(s1) │mma(s2) │   ... (w1 waits full[s],
+//   (w1)  :          │+UTCCP  │        │        │        │  leader CTA only;
+//          └────────┴────────┴────────┴────────┴────────┴────────┘ tcgen05.commit
+//   EPI  :                   │drain s0│drain s1│  ... (w4..7 wait empty[s],
+//   (w4-7):                   │TMEM->SM│->TMA   │        │  release TMEM col)
+//          └────────────────────────────────────────────────────────┘
+//
+// Barrier topology per stage s (phase = (k_idx / kNumStages) & 1):
+//   full[s]    : TMA completion (byte-count) -> MMA issuer + SF transposers
+//   empty[s]   : epilogue drained the PREVIOUS use of this SMEM slot ->
+//                TMA producer may overwrite it
+//   tmem_empty : epilogue finished the TMEM region -> next MMA may write it
+//   (2-CTA cluster: buddy CTA's barriers are arrived via mapa when needed;
+//    the leader CTA issues the joint MMA for both, with umma_arrive
+//    committing to each CTA's tmem barrier.)
+//
+// Swapped-AB mode (m-grouped): the MMA computes (B^T A)^T instead — operand
+// roles exchange (BLOCK_M becomes the UMMA_N axis), which lets tiny per-expert
+// M hit full UMMA_M=128 tiles through the N side. The epilogue then reads
+// TMEM with the 16x256b layout and STSMs into SMEM transposed.
+//
+// Numeric path (see prelude.h §6): tcgen05.mma kind::mxf8f6f4 (FP8) or
+// kind::mxf4 (packed FP4, BLOCK_K=256 = 64 UMMA_K steps of 4 nibbles) with
+// SFs flowing SMEM -> (warp transpose) -> UTCCP -> TMEM SF columns.
+// ===========================================================================
+//
 // Warp specialization (256 threads = 128 non-epilogue + 128 epilogue):
 //   warp 0          : TMA load producer (elect_one)
 //   warp 1          : MMA issue (leader CTA only, elect_one) + SF UTCCP

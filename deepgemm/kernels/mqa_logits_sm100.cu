@@ -7,12 +7,44 @@
 //   logits[i, j - k_start_i] = sum_h w[i, h] * relu(<q[i, h, :], kv[j, :]>)
 // with MXFP8 or MXFP4 (packed E2M1) Q/KV and UE8M0 block scales.
 //
+// ===========================================================================
+// STRUCTURE — one kernel, four cooperating warp classes
+// ===========================================================================
 // Thread layout (kNumSpecializedThreads=128 + kNumMathThreads=256):
-//   warps  0..7 : math warpgroups (2 WGs), one TMEM stage each
-//   warp  8     : KV producer (TMA)
-//   warp  9     : SF producer (Q + weights + KV SF TMAs)
-//   warp 10     : SF transposer + UTCCP into TMEM
-//   warp 11     : MMA issue (MXF8F6F4 / MXF4)
+//
+//   lane axis (threads) ──────────────────────────────────────────────────>
+//   0                128                256               384
+//   ├─────────────────┬─────────────────────┬───────────────────────────────┤
+//   │ math WG 0       │ math WG 1           │  warp 8  9 10 11 (specialized)
+//   │ (drain TMEM,    │ (drain TMEM,        │   │   │  │  └ MMA issue (w11)
+//   │  weighted ReLU, │  weighted ReLU,     │   │   │  └ SF transpose+UTCCP (w10)
+//   │  scatter store) │  scatter store)     │   │   └ SF/Q/W TMA producer (w9)
+//   └─────────────────┴─────────────────────┴───┴────┴─ KV TMA producer (w8)
+//
+// Register economics: specialized warps run setmaxnreg.dec to 56 registers
+// (they only push descriptors); the freed registers are granted to the math
+// warpgroups via setmaxnreg.inc — more live accumulators per math thread,
+// fewer TMEM round trips.
+//
+// RingPipeline staging (Q, KV, SF, TMEM each have their own stage rings):
+//   producer: stage = ring.advance()  (returns {stage, phase})
+//             ... fill smem[stage] ...
+//             full_barrier[stage].arrive()
+//   consumer: {stage, phase} = ring.advance()  (upstream pre-advance
+//             semantics: a fresh ring's first advance returns stage 0
+//             phase 0 without consuming, then waits on parity)
+//             full_barrier[stage].wait(phase)
+//   KV stages are reused across Q blocks (the same KV span serves many
+//   tokens), so the KV ring is the deepest; Q weights arrive piggy-backed
+//   on the SF producer to keep one TMA issue stream.
+//
+// The MMA: Q is [BLOCK_Q * heads, head_dim] (UMMA_N aligned to 8), KV is
+// [SPLIT_KV, head_dim]; the MMA computes all (token, kv) logits for one
+// stage into TMEM; math warps then read them with tcgen05.ld.32x32b
+// (lane = token slot), apply w * relu(.) per head pair in bf16x2 FMA, and
+// scatter-store each token's row into the global logits buffer.
+// ===========================================================================
+// ===========================================================================
 
 namespace dg {
 
@@ -251,7 +283,7 @@ mqa_logits_sm100_impl(uint32_t num_q_tokens, uint32_t num_kv_tokens, uint32_t lo
 
     if (warp_idx == kSpecWarpStart) {
         // KV data producer
-        setmaxnreg_dec(kNumSpecializedRegisters);
+        setmaxnreg_dec<kNumSpecializedRegisters>();
         MQALogitsScheduler<BLOCK_Q, SPLIT_KV, kNumSMs> sched = make_sched;
         MQALogitsTask task;
         while (sched.next_q_block(task)) {
@@ -267,7 +299,7 @@ mqa_logits_sm100_impl(uint32_t num_q_tokens, uint32_t num_kv_tokens, uint32_t lo
         }
     } else if (warp_idx == kSpecWarpStart + 1) {
         // Q + weights + KV SF producer
-        setmaxnreg_dec(kNumSpecializedRegisters);
+        setmaxnreg_dec<kNumSpecializedRegisters>();
         MQALogitsScheduler<BLOCK_Q, SPLIT_KV, kNumSMs> sched = make_sched;
         MQALogitsTask task;
         while (sched.next_q_block(task)) {
@@ -307,7 +339,7 @@ mqa_logits_sm100_impl(uint32_t num_q_tokens, uint32_t num_kv_tokens, uint32_t lo
         }
     } else if (warp_idx == kSpecWarpStart + 2) {
         // SF transpose + UTCCP
-        setmaxnreg_dec(kNumSpecializedRegisters);
+        setmaxnreg_dec<kNumSpecializedRegisters>();
 
         auto utccp_required_smem_warp_transpose = [&](uint32_t* smem_ptr) {
             uint32_t values[4];
@@ -375,7 +407,7 @@ mqa_logits_sm100_impl(uint32_t num_q_tokens, uint32_t num_kv_tokens, uint32_t lo
         }
     } else if (warp_idx == kSpecWarpStart + 3) {
         // MMA issue: A = KV (128 rows per math WG), B = Q.
-        setmaxnreg_dec(kNumSpecializedRegisters);
+        setmaxnreg_dec<kNumSpecializedRegisters>();
         const uint32_t tmem_base = ld_shared_vol_u32(&smem->tmem_ptr_in_smem);
         if (elect_one_sync()) {
             constexpr uint32_t kNumUMMAK = kHeadDim / UMMA_K;
@@ -445,7 +477,7 @@ mqa_logits_sm100_impl(uint32_t num_q_tokens, uint32_t num_kv_tokens, uint32_t lo
         __syncwarp();
     } else if (warp_idx < kSpecWarpStart) {
         // Math warpgroups: reduce weighted ReLU logits and scatter-store.
-        setmaxnreg_inc(kNumMathRegisters);
+        setmaxnreg_inc<kNumMathRegisters>();
         MQALogitsScheduler<BLOCK_Q, SPLIT_KV, kNumSMs> sched = make_sched;
         uint32_t seq_k_start[BLOCK_Q];
         uint32_t seq_k_end[BLOCK_Q];

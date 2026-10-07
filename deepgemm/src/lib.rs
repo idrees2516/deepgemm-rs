@@ -25,9 +25,14 @@
 //! // ... allocate operands, call fp8_gemm_nt / fp4_gemm_nt / ...
 //! ```
 
+// FFI-adjacent lints: raw driver handles cross the boundary by design, and
+// `% b == 0` is kept instead of `is_multiple_of` (MSRV 1.75).
+#![allow(clippy::manual_is_multiple_of)]
+
 pub mod api;
 pub mod device;
 pub mod error;
+pub mod golden;
 pub mod heuristics;
 pub mod jit;
 pub mod sys;
@@ -38,5 +43,6 @@ pub mod prelude {
     pub use crate::api::*;
     pub use crate::device::{alloc_and_upload, download, Arch, DevBuffer, DevStream, Device};
     pub use crate::error::{DgError, DgResult};
+    pub use crate::golden;
     pub use crate::types::{Dtype, GemmType, Major, Operand, Output, SfGran, SfTensor};
 }

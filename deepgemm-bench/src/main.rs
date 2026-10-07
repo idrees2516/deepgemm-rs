@@ -10,15 +10,28 @@
 //! cargo run -p deepgemm-bench --release -- list      # list benchmarks
 //! ```
 //!
+//! **Without a GPU** (sandbox / CI / laptop): NVRTC is a pure compiler, so
+//! the full kernel suite can still be validated offline — PTX *and* SASS:
+//! ```text
+//! pip install nvidia-cuda-nvrtc-cu12
+//! cargo run -p deepgemm-bench --release -- compile-check --arch 100a
+//! ```
+//! If libnvrtc is not on the default loader path, the binary probes pip
+//! wheel locations automatically, or set `DG_NVRTC_PATH=/path/to/libnvrtc.so.12`.
+//!
 //! Tiling overrides (tune on real hardware, then hard-code into heuristics):
 //! `DG_BLOCK_M`, `DG_BLOCK_N`, `DG_BLOCK_K`, `DG_CLUSTER_M`, `DG_CLUSTER_N`,
 //! `DG_SWAP_AB`, `DG_NUM_STAGES`, `DG_PRINT_CONFIGS=1`.
 
 use clap::{Parser, Subcommand};
+use deepgemm::jit::{self, kernel_src};
 use deepgemm::prelude::*;
 
 #[derive(Parser)]
-#[command(name = "deepgemm-bench", about = "DeepGEMM-RS benchmarks (TFLOPS, % of peak)")]
+#[command(
+    name = "deepgemm-bench",
+    about = "DeepGEMM-RS benchmarks (TFLOPS, % of peak)"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -30,6 +43,13 @@ enum Cmd {
     List,
     /// JIT-compile every kernel variant for this GPU (fast correctness gate).
     Smoke,
+    /// Offline-compile every kernel variant WITHOUT a GPU (PTX + SASS via NVRTC).
+    /// Needs only libnvrtc (e.g. `pip install nvidia-cuda-nvrtc-cu12`).
+    CompileCheck {
+        /// Target arch: 100a (B200), 103a (B300), 120a (SM120). [default: 100a]
+        #[arg(long)]
+        arch: Option<String>,
+    },
     /// Run a benchmark.
     Bench {
         name: String,
@@ -68,20 +88,36 @@ fn host_bf16_bits(v: f32) -> u16 {
     (((bits + rounding) >> 16) as u16) & 0x7fff | ((bits >> 31) as u16) << 15
 }
 
-fn make_sf(dev: &Device, stream: &DevStream, m: u32, k: u32, gran: SfGran, seed: u32) -> DgResult<SfTensor> {
+fn make_sf(
+    dev: &Device,
+    stream: &DevStream,
+    m: u32,
+    k: u32,
+    gran: SfGran,
+    seed: u32,
+) -> DgResult<SfTensor> {
     // Deterministic power-of-two scales (UE8M0-compatible).
     let sf_k = (k / gran.k()) as usize;
-    let mut scales = vec![0f32; (m as usize) * sf_k];
-    for i in 0..scales.len() {
-        let e = -3 + ((i.wrapping_mul(2654435761) ^ seed as usize) % 7) as i32;
-        scales[i] = (2f32).powi(e);
-    }
+    let scales: Vec<f32> = (0..(m as usize) * sf_k)
+        .map(|i| {
+            let e = -3 + ((i.wrapping_mul(2654435761) ^ seed as usize) % 7) as i32;
+            (2f32).powi(e)
+        })
+        .collect();
     transform_sf(dev, stream, &scales, m, gran)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_gemm_bench(
-    dev: &Device, stream: &DevStream, name: &str,
-    m: u32, n: u32, k: u32, groups: u32, iters: u32, warmup: u32,
+    dev: &Device,
+    stream: &DevStream,
+    name: &str,
+    m: u32,
+    n: u32,
+    k: u32,
+    groups: u32,
+    iters: u32,
+    warmup: u32,
 ) -> DgResult<()> {
     let (a_dt, b_dt, gran) = match name {
         "fp4_nt_native" | "fp4_m_grouped_contiguous" => (Dtype::Fp4, Dtype::Fp4, SfGran::G32),
@@ -92,25 +128,54 @@ fn run_gemm_bench(
 
     // Data: random-ish bytes (valid fp8/fp4 codes; performance does not depend
     // on values for these dtypes).
-    let elem_bytes_a = if a_dt == Dtype::Fp4 { (m * k / 2) as usize } else { (m * k) as usize };
+    let elem_bytes_a = if a_dt == Dtype::Fp4 {
+        (m * k / 2) as usize
+    } else {
+        (m * k) as usize
+    };
     let a_data = DevBuffer::alloc_zeros(dev, elem_bytes_a.max(16))?;
-    let elem_bytes_b = if b_dt == Dtype::Fp4 { (n * k / 2) as usize } else { (n * k) as usize } * groups as usize;
+    let elem_bytes_b = if b_dt == Dtype::Fp4 {
+        (n * k / 2) as usize
+    } else {
+        (n * k) as usize
+    } * groups as usize;
     let b_data = DevBuffer::alloc_zeros(dev, elem_bytes_b.max(16))?;
     let sf_a = make_sf(dev, stream, m, k, gran, 1)?;
     let sf_b = make_sf(dev, stream, n, k, gran, 2)?;
 
     let a = Operand {
-        dtype: a_dt, major: Major::K, rows: m, k,
-        outer_stride: k, sf: Some(sf_a), data: a_data,
+        dtype: a_dt,
+        major: Major::K,
+        rows: m,
+        k,
+        outer_stride: k,
+        sf: Some(sf_a),
+        data: a_data,
     };
     let b = Operand {
-        dtype: b_dt, major: Major::K, rows: n, k,
-        outer_stride: k, sf: Some(sf_b), data: b_data,
+        dtype: b_dt,
+        major: Major::K,
+        rows: n,
+        k,
+        outer_stride: k,
+        sf: Some(sf_b),
+        data: b_data,
     };
 
-    let cd_bytes = (m * n * 2) as usize * if name.contains("grouped") || name.contains("bmm") { groups as usize } else { 1 };
+    let cd_bytes = (m * n * 2) as usize
+        * if name.contains("grouped") || name.contains("bmm") {
+            groups as usize
+        } else {
+            1
+        };
     let out_data = DevBuffer::alloc_zeros(dev, cd_bytes.max(16))?;
-    let mut out = Output { dtype: Dtype::Bf16, rows: m, cols: n, stride: n, data: out_data };
+    let mut out = Output {
+        dtype: Dtype::Bf16,
+        rows: m,
+        cols: n,
+        stride: n,
+        data: out_data,
+    };
 
     let run_once = |out: &mut Output| -> DgResult<()> {
         match name {
@@ -126,8 +191,12 @@ fn run_gemm_bench(
                 }
                 let m_idx = alloc_and_upload(dev, &m_indices, stream.raw())?;
                 let a2 = Operand {
-                    dtype: a_dt, major: Major::K, rows: m_aligned, k,
-                    outer_stride: k, sf: Some(make_sf(dev, stream, m_aligned, k, gran, 1)?),
+                    dtype: a_dt,
+                    major: Major::K,
+                    rows: m_aligned,
+                    k,
+                    outer_stride: k,
+                    sf: Some(make_sf(dev, stream, m_aligned, k, gran, 1)?),
                     data: DevBuffer::alloc_zeros(dev, elem_bytes_a.max(16))?,
                 };
                 m_grouped_gemm_nt_contiguous(dev, stream, &a2, &b, out, &m_idx, groups)
@@ -154,7 +223,11 @@ fn run_gemm_bench(
     stream.sync()?;
     let elapsed = t0.elapsed().as_secs_f64();
 
-    let group_mult = if name.contains("grouped") || name.contains("bmm") { groups as f64 } else { 1.0 };
+    let group_mult = if name.contains("grouped") || name.contains("bmm") {
+        groups as f64
+    } else {
+        1.0
+    };
     let flops = 2.0 * m as f64 * n as f64 * k as f64 * group_mult;
     let tflops = flops / elapsed / (iters as f64) / 1e12;
     let peak = dev.peak_tflops(a_dt);
@@ -165,6 +238,7 @@ fn run_gemm_bench(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_mqa_bench(dev: &Device, stream: &DevStream, iters: u32, warmup: u32) -> DgResult<()> {
     let num_tokens = 4096u32;
     let num_kv = 8192u32;
@@ -178,12 +252,28 @@ fn run_mqa_bench(dev: &Device, stream: &DevStream, iters: u32, warmup: u32) -> D
     let q_sf = make_sf(dev, stream, q_rows, head_dim, kv_gran, 3)?;
     let kv_sf = make_sf(dev, stream, num_kv, head_dim, kv_gran, 4)?;
 
-    let q = Operand { dtype: Dtype::Fp8, major: Major::K, rows: q_rows, k: head_dim,
-                      outer_stride: head_dim, sf: None, data: q_data };
-    let kv = Operand { dtype: Dtype::Fp8, major: Major::K, rows: num_kv, k: head_dim,
-                       outer_stride: head_dim, sf: None, data: kv_data };
+    let q = Operand {
+        dtype: Dtype::Fp8,
+        major: Major::K,
+        rows: q_rows,
+        k: head_dim,
+        outer_stride: head_dim,
+        sf: None,
+        data: q_data,
+    };
+    let kv = Operand {
+        dtype: Dtype::Fp8,
+        major: Major::K,
+        rows: num_kv,
+        k: head_dim,
+        outer_stride: head_dim,
+        sf: None,
+        data: kv_data,
+    };
 
-    let weights: Vec<u16> = (0..num_tokens * heads).map(|i| host_bf16_bits((0.5 + (i % 7) as f32 * 0.1) as f32)).collect();
+    let weights: Vec<u16> = (0..num_tokens * heads)
+        .map(|i| host_bf16_bits(0.5 + (i % 7) as f32 * 0.1))
+        .collect();
     let weights = alloc_and_upload(dev, &weights, stream.raw())?;
     let k_start = vec![0u32; num_tokens as usize];
     let k_end = vec![num_kv; num_tokens as usize];
@@ -192,8 +282,23 @@ fn run_mqa_bench(dev: &Device, stream: &DevStream, iters: u32, warmup: u32) -> D
     let mut logits = DevBuffer::alloc_zeros(dev, (num_tokens * num_kv * 2) as usize)?;
 
     let mut run_once = || -> DgResult<()> {
-        mqa_logits(dev, stream, &q, &q_sf, &kv, &kv_sf, &weights, &ks, &ke,
-                   num_tokens, num_kv, heads, head_dim, &mut logits, num_kv)
+        mqa_logits(
+            dev,
+            stream,
+            &q,
+            &q_sf,
+            &kv,
+            &kv_sf,
+            &weights,
+            &ks,
+            &ke,
+            num_tokens,
+            num_kv,
+            heads,
+            head_dim,
+            &mut logits,
+            num_kv,
+        )
     };
 
     for _ in 0..warmup {
@@ -215,52 +320,208 @@ fn run_mqa_bench(dev: &Device, stream: &DevStream, iters: u32, warmup: u32) -> D
 }
 
 fn smoke(dev: &Device) -> DgResult<()> {
-    use deepgemm::jit::{self, kernel_src};
-    println!("Smoke-compiling kernel variants for {} (arch {})...", dev.name, dev.arch.nvrtc_arch());
-    let variants: Vec<(&str, &str, String)> = vec![
-        ("transform_sf k=16", kernel_src::LAYOUT_QUANT, format!(
-            r#"extern "C" __global__ void __dg_kernel(const float* sf, unsigned* out, unsigned mn) {{ dg::transform_sf_impl<128, 64, 16, 16>(sf, out, mn); }}"#)),
-        ("transform_sf k=4", kernel_src::LAYOUT_QUANT, format!(
-            r#"extern "C" __global__ void __dg_kernel(const float* sf, unsigned* out, unsigned mn) {{ dg::transform_sf_impl<128, 64, 4, 16>(sf, out, mn); }}"#)),
-        ("quant fp8 g32", kernel_src::LAYOUT_QUANT, format!(
-            r#"extern "C" __global__ void __dg_kernel(const float* x, unsigned m, unsigned k, unsigned char* d, unsigned* sf) {{ dg::quant_mx_impl<256, 32, 0>(x, m, k, d, sf); }}"#)),
-        ("quant fp8 g128", kernel_src::LAYOUT_QUANT, format!(
-            r#"extern "C" __global__ void __dg_kernel(const float* x, unsigned m, unsigned k, unsigned char* d, unsigned* sf) {{ dg::quant_mx_impl<256, 128, 0>(x, m, k, d, sf); }}"#)),
-        ("quant fp4 g32", kernel_src::LAYOUT_QUANT, format!(
-            r#"extern "C" __global__ void __dg_kernel(const float* x, unsigned m, unsigned k, unsigned char* d, unsigned* sf) {{ dg::quant_mx_impl<256, 32, 1>(x, m, k, d, sf); }}"#)),
-        ("dequant fp8 g32", kernel_src::LAYOUT_QUANT, format!(
-            r#"extern "C" __global__ void __dg_kernel(const unsigned char* d, const unsigned* sf, unsigned m, unsigned k, unsigned t, float* o) {{ dg::dequant_mx_impl<0, 32>(d, sf, m, k, t, o); }}"#)),
-        ("dequant fp4 g32", kernel_src::LAYOUT_QUANT, format!(
-            r#"extern "C" __global__ void __dg_kernel(const unsigned char* d, const unsigned* sf, unsigned m, unsigned k, unsigned t, float* o) {{ dg::dequant_mx_impl<1, 32>(d, sf, m, k, t, o); }}"#)),
-        ("gemm fp8 nt m128 n256 k128 c2", kernel_src::GEMM_SM100, gemm_wrapper(0, 0, 32, 32, 1, 0, 0, 0, 1, 1, 128, 256, 128, 128, 128, 128, 12, 2, 0, 0, 0, 2, 148)),
-        ("gemm fp4 nt m128 n256 k256 c2", kernel_src::GEMM_SM100, gemm_wrapper(0, 0, 32, 32, 1, 1, 5, 5, 1, 1, 128, 256, 256, 128, 128, 256, 8, 2, 0, 0, 0, 2, 148)),
-        ("gemm bf16 nt m128 n128 k64 c1", kernel_src::GEMM_SM100, gemm_wrapper(0, 0, 32, 32, 0, 0, 1, 1, 2, 2, 128, 128, 64, 128, 128, 128, 20, 1, 0, 0, 0, 2, 148)),
-        ("gemm fp8 swapab masked c2", kernel_src::GEMM_SM100, gemm_wrapper(0, 0, 32, 32, 1, 0, 0, 0, 1, 1, 128, 128, 128, 128, 128, 128, 12, 2, 1, 1, 2, 0, 148)),
-        ("gemm fp8 batched c2", kernel_src::GEMM_SM100, gemm_wrapper(0, 0, 32, 32, 1, 0, 0, 0, 1, 1, 128, 128, 128, 128, 128, 128, 12, 2, 0, 0, 4, 0, 148)),
-        ("mqa fp8 h64 d128", kernel_src::MQA_LOGITS, mqa_wrapper(64, 128, 2, 256, 128, 2, 2, 2, 256, 148, 0)),
-        ("mqa fp4 h64 d128", kernel_src::MQA_LOGITS, mqa_wrapper(64, 128, 2, 256, 128, 2, 2, 2, 256, 148, 1)),
-    ];
+    println!(
+        "Smoke-compiling kernel variants for {} (arch {})...",
+        dev.name,
+        dev.arch.nvrtc_arch()
+    );
     let mut n_ok = 0;
+    let variants = kernel_variants();
     for (name, src, body) in &variants {
         match jit::smoke_compile(dev, src, "smoke", body) {
-            Ok(()) => { println!("  [ok] {name}"); n_ok += 1; }
+            Ok(()) => {
+                println!("  [ok] {name}");
+                n_ok += 1;
+            }
             Err(e) => println!("  [FAIL] {name}: {e}"),
         }
     }
     println!("{n_ok}/{} variants compiled.", variants.len());
-    if n_ok != variants.len() { Err(DgError::Nvrtc("smoke compile failures".into())) } else { Ok(()) }
+    if n_ok != variants.len() {
+        Err(DgError::Nvrtc("smoke compile failures".into()))
+    } else {
+        Ok(())
+    }
+}
+
+/// Offline variant of `smoke`: NVRTC compiles PTX (compute_XXXa, the exact
+/// runtime path) and CUBIN (sm_XXXa, full SASS backend) with no GPU/driver.
+fn compile_check(arch_arg: Option<String>) -> DgResult<()> {
+    let arch = arch_arg
+        .or_else(|| std::env::var("DG_ARCH").ok())
+        .unwrap_or_else(|| "100a".into());
+    match arch.as_str() {
+        "100a" | "103a" | "120a" => {}
+        "90a" => {
+            return Err(DgError::InvalidArg(
+                "arch 90a (Hopper): the kernel suite is tcgen05-based and requires SM100+; \
+                 use 100a / 103a / 120a"
+                    .into(),
+            ));
+        }
+        other => {
+            return Err(DgError::InvalidArg(format!(
+                "unknown arch {other:?}; use 100a / 103a / 120a"
+            )));
+        }
+    }
+    jit::ensure_nvrtc()?;
+    let ver = jit::nvrtc_version().unwrap_or((0, 0));
+    println!(
+        "Offline compile-check (no GPU): arch sm_{arch}, NVRTC {}.{}",
+        ver.0, ver.1
+    );
+    println!("  PTX  pass: --gpu-architecture=compute_{arch} (the runtime JIT path)");
+    println!("  CUBIN pass: --gpu-architecture=sm_{arch} (full SASS backend)");
+    let t0 = std::time::Instant::now();
+    let variants = kernel_variants();
+    let mut n_ok = 0;
+    for (name, src, body) in &variants {
+        match jit::compile_check_kernel(src, body, &arch, "compile-check") {
+            Ok(r) => {
+                let cub = r
+                    .cubin_len
+                    .map(|l| format!("sass {l:>6} B"))
+                    .unwrap_or("sass n/a".into());
+                println!("  [ok]   {name:<32} ptx {:>7} B  {cub}", r.ptx_len);
+                n_ok += 1;
+            }
+            Err(e) => println!("  [FAIL] {name}: {e}"),
+        }
+    }
+    println!(
+        "{n_ok}/{} variants compiled PTX+SASS in {:.1}s (no GPU present).",
+        variants.len(),
+        t0.elapsed().as_secs_f64()
+    );
+    if n_ok != variants.len() {
+        Err(DgError::Nvrtc("compile-check failures".into()))
+    } else {
+        Ok(())
+    }
+}
+
+/// Single source of truth for the representative kernel-variant list shared
+/// by `smoke` (on-device JIT) and `compile-check` (offline NVRTC).
+/// Covers every translation unit and every code path: mxf4 / mxf8f6f4 / f16
+/// MMAs, SF/UTCCP paths, swap-AB, m-grouped (contiguous+masked), batched,
+/// MQA logits in FP8 and FP4, quant/dequant/transform_sf.
+fn kernel_variants() -> Vec<(&'static str, &'static str, String)> {
+    vec![
+        (
+            "transform_sf k=16",
+            kernel_src::LAYOUT_QUANT,
+            r#"extern "C" __global__ void __dg_kernel(const float* sf, unsigned* out, unsigned mn) { dg::transform_sf_impl<128, 64, 16, 16>(sf, out, mn); }"#.to_string(),
+        ),
+        (
+            "transform_sf k=4",
+            kernel_src::LAYOUT_QUANT,
+            r#"extern "C" __global__ void __dg_kernel(const float* sf, unsigned* out, unsigned mn) { dg::transform_sf_impl<128, 64, 4, 16>(sf, out, mn); }"#.to_string(),
+        ),
+        (
+            "quant fp8 g32",
+            kernel_src::LAYOUT_QUANT,
+            r#"extern "C" __global__ void __dg_kernel(const float* x, unsigned m, unsigned k, unsigned char* d, unsigned* sf) { dg::quant_mx_impl<256, 32, 0>(x, m, k, d, sf); }"#.to_string(),
+        ),
+        (
+            "quant fp8 g128",
+            kernel_src::LAYOUT_QUANT,
+            r#"extern "C" __global__ void __dg_kernel(const float* x, unsigned m, unsigned k, unsigned char* d, unsigned* sf) { dg::quant_mx_impl<256, 128, 0>(x, m, k, d, sf); }"#.to_string(),
+        ),
+        (
+            "quant fp4 g32",
+            kernel_src::LAYOUT_QUANT,
+            r#"extern "C" __global__ void __dg_kernel(const float* x, unsigned m, unsigned k, unsigned char* d, unsigned* sf) { dg::quant_mx_impl<256, 32, 1>(x, m, k, d, sf); }"#.to_string(),
+        ),
+        (
+            "dequant fp8 g32",
+            kernel_src::LAYOUT_QUANT,
+            r#"extern "C" __global__ void __dg_kernel(const unsigned char* d, const unsigned* sf, unsigned m, unsigned k, unsigned t, float* o) { dg::dequant_mx_impl<0, 32>(d, sf, m, k, t, o); }"#.to_string(),
+        ),
+        (
+            "dequant fp4 g32",
+            kernel_src::LAYOUT_QUANT,
+            r#"extern "C" __global__ void __dg_kernel(const unsigned char* d, const unsigned* sf, unsigned m, unsigned k, unsigned t, float* o) { dg::dequant_mx_impl<1, 32>(d, sf, m, k, t, o); }"#.to_string(),
+        ),
+        (
+            "gemm fp8 nt m128 n256 k128 c2",
+            kernel_src::GEMM_SM100,
+            gemm_wrapper(
+                0, 0, 32, 32, 1, 0, 0, 0, 1, 1, 128, 256, 128, 128, 128, 128, 12, 2, 0, 0, 0, 0,
+                148,
+            ),
+        ),
+        (
+            "gemm fp4 nt m128 n256 k256 c2",
+            kernel_src::GEMM_SM100,
+            gemm_wrapper(
+                0, 0, 32, 32, 1, 1, 5, 5, 1, 1, 128, 256, 256, 128, 128, 256, 8, 2, 0, 0, 0, 0, 148,
+            ),
+        ),
+        (
+            "gemm bf16 nt m128 n128 k64 c1",
+            kernel_src::GEMM_SM100,
+            gemm_wrapper(
+                0, 0, 32, 32, 0, 0, 1, 1, 2, 2, 128, 128, 64, 128, 128, 128, 20, 1, 0, 0, 0, 0, 148,
+            ),
+        ),
+        (
+            "gemm fp8 swapab masked c2",
+            kernel_src::GEMM_SM100,
+            gemm_wrapper(
+                0, 0, 32, 32, 1, 0, 0, 0, 1, 1, 128, 128, 128, 128, 128, 128, 12, 2, 1, 1, 2, 0,
+                148,
+            ),
+        ),
+        (
+            "gemm fp8 batched c2",
+            kernel_src::GEMM_SM100,
+            gemm_wrapper(
+                0, 0, 32, 32, 1, 0, 0, 0, 1, 1, 128, 128, 128, 128, 128, 128, 12, 2, 0, 0, 4, 0,
+                148,
+            ),
+        ),
+        (
+            "mqa fp8 h64 d128",
+            kernel_src::MQA_LOGITS,
+            mqa_wrapper(64, 128, 2, 256, 128, 2, 2, 2, 256, 148, 0),
+        ),
+        (
+            "mqa fp4 h64 d128",
+            kernel_src::MQA_LOGITS,
+            mqa_wrapper(64, 128, 2, 256, 128, 2, 2, 2, 256, 148, 1),
+        ),
+    ]
 }
 
 #[allow(clippy::too_many_arguments)]
 fn gemm_wrapper(
-    major_a: u32, major_b: u32, gran_a: u32, gran_b: u32, has_sf: u32, is_mxf4: u32,
-    fmt_a: u32, fmt_b: u32, storage_a: u32, storage_b: u32,
-    block_m: u32, block_n: u32, block_k: u32,
-    swz_a: u32, swz_b: u32, swz_cd: u32,
-    stages: u32, cluster: u32, mc_on_a: u32,
-    swap_ab: u32, gemm_type: u32, cd_float: u32, num_sms: u32,
+    major_a: u32,
+    major_b: u32,
+    gran_a: u32,
+    gran_b: u32,
+    has_sf: u32,
+    is_mxf4: u32,
+    fmt_a: u32,
+    fmt_b: u32,
+    storage_a: u32,
+    storage_b: u32,
+    block_m: u32,
+    block_n: u32,
+    block_k: u32,
+    swz_a: u32,
+    swz_b: u32,
+    swz_cd: u32,
+    stages: u32,
+    cluster: u32,
+    mc_on_a: u32,
+    swap_ab: u32,
+    gemm_type: u32,
+    cd_float: u32,
+    num_sms: u32,
 ) -> String {
-    format!(r#"extern "C" __global__ void __dg_kernel(
+    format!(
+        r#"extern "C" __global__ void __dg_kernel(
     int* grouped_layout, unsigned num_groups, unsigned m, unsigned n, unsigned k,
     const __grid_constant__ dg::TmaMap tma_a, const __grid_constant__ dg::TmaMap tma_b,
     const __grid_constant__ dg::TmaMap tma_sfa, const __grid_constant__ dg::TmaMap tma_sfb,
@@ -270,14 +531,26 @@ fn gemm_wrapper(
         {block_m}, {block_n}, {block_k}, {swz_a}, {swz_b}, {swz_cd},
         {stages}, 2, {cluster}, {mc_on_a}, {swap_ab}, (dg::GemmType){gemm_type}, 0, {cd_float}, 2, {num_sms}>
         (grouped_layout, num_groups, m, n, k, tma_a, tma_b, tma_sfa, tma_sfb, tma_cd);
-}}"#)
+}}"#
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn mqa_wrapper(heads: u32, head_dim: u32, block_q: u32, split_kv: u32, umma_n: u32,
-               q_stages: u32, kv_stages: u32, tmem_stages: u32,
-               math_threads: u32, num_sms: u32, is_fp4: u32) -> String {
-    format!(r#"extern "C" __global__ void __dg_kernel(
+fn mqa_wrapper(
+    heads: u32,
+    head_dim: u32,
+    block_q: u32,
+    split_kv: u32,
+    umma_n: u32,
+    q_stages: u32,
+    kv_stages: u32,
+    tmem_stages: u32,
+    math_threads: u32,
+    num_sms: u32,
+    is_fp4: u32,
+) -> String {
+    format!(
+        r#"extern "C" __global__ void __dg_kernel(
     unsigned nq, unsigned nkv, unsigned stride, const unsigned* ks, const unsigned* ke, unsigned short* logits,
     const __grid_constant__ dg::TmaMap tma_q, const __grid_constant__ dg::TmaMap tma_sfq,
     const __grid_constant__ dg::TmaMap tma_kv, const __grid_constant__ dg::TmaMap tma_sfkv,
@@ -285,34 +558,86 @@ fn mqa_wrapper(heads: u32, head_dim: u32, block_q: u32, split_kv: u32, umma_n: u
     dg::mqa_logits_sm100_impl<{heads}, {head_dim}, {block_q}, {split_kv}, {umma_n},
         {q_stages}, {kv_stages}, {tmem_stages}, 128, {math_threads}, {num_sms}, {is_fp4}>
         (nq, nkv, stride, ks, ke, logits, tma_q, tma_sfq, tma_kv, tma_sfkv, tma_w);
-}}"#)
+}}"#
+    )
 }
 
 fn main() {
     let cli = Cli::parse();
+    // Commands that never need a GPU run first; everything else requires a
+    // device (falling back to offline mode for `smoke` when no driver is
+    // present, so CI/sandboxes can still gate on kernel compilability).
     let dev = match Device::new(0) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Failed to init CUDA device 0: {e}");
-            eprintln!("Ensure the CUDA driver is available (e.g. LD_LIBRARY_PATH includes your CUDA lib dir).");
-            std::process::exit(1);
-        }
+        Ok(d) => Some(d),
+        Err(e) => match &cli.cmd {
+            Cmd::List | Cmd::CompileCheck { .. } => None,
+            Cmd::Smoke => {
+                eprintln!(
+                    "note: no CUDA driver/device ({e}); falling back to offline compile-check"
+                );
+                None
+            }
+            Cmd::Bench { .. } => {
+                eprintln!("Failed to init CUDA device 0: {e}");
+                eprintln!("Ensure the CUDA driver is available (e.g. LD_LIBRARY_PATH includes your CUDA lib dir).");
+                eprintln!("(No GPU? `compile-check` validates all kernels offline via NVRTC.)");
+                std::process::exit(1);
+            }
+        },
     };
-    let stream = DevStream::new(&dev).expect("stream");
-    eprintln!("Device: {} ({:?}), {} SMs, CC {}.{}", dev.name, dev.arch, dev.num_sms, dev.cc.0, dev.cc.1);
-    if !matches!(dev.arch, crate::Arch::Sm100) {
-        eprintln!("warning: kernels target SM100 (B200); this GPU is {:?}", dev.arch);
-    }
 
-    let result = match cli.cmd {
-        Cmd::List => {
+    let result = match (&cli.cmd, &dev) {
+        (Cmd::List, _) => {
             for b in BENCHES {
                 println!("{b}");
             }
             Ok(())
         }
-        Cmd::Smoke => smoke(&dev),
-        Cmd::Bench { name, m, n, k, groups, iters, warmup } => {
+        (Cmd::CompileCheck { arch }, None) => compile_check(arch.clone()),
+        (Cmd::CompileCheck { arch }, Some(d)) => {
+            // On a real GPU: default to the device's own arch.
+            let a = arch
+                .clone()
+                .or_else(|| Some(d.arch.nvrtc_arch().to_string()));
+            compile_check(a)
+        }
+        (Cmd::Smoke, Some(d)) => {
+            eprintln!(
+                "Device: {} ({:?}), {} SMs, CC {}.{}",
+                d.name, d.arch, d.num_sms, d.cc.0, d.cc.1
+            );
+            if !matches!(d.arch, Arch::Sm100) {
+                eprintln!(
+                    "warning: kernels target SM100 (B200); this GPU is {:?}",
+                    d.arch
+                );
+            }
+            smoke(d)
+        }
+        (Cmd::Smoke, None) => compile_check(None),
+        (
+            Cmd::Bench {
+                name,
+                m,
+                n,
+                k,
+                groups,
+                iters,
+                warmup,
+            },
+            Some(d),
+        ) => {
+            let stream = DevStream::new(d).expect("stream");
+            eprintln!(
+                "Device: {} ({:?}), {} SMs, CC {}.{}",
+                d.name, d.arch, d.num_sms, d.cc.0, d.cc.1
+            );
+            if !matches!(d.arch, Arch::Sm100) {
+                eprintln!(
+                    "warning: kernels target SM100 (B200); this GPU is {:?}",
+                    d.arch
+                );
+            }
             if !BENCHES.contains(&name.as_str()) {
                 eprintln!("unknown bench '{name}'. Available:");
                 for b in BENCHES {
@@ -321,11 +646,12 @@ fn main() {
                 std::process::exit(2);
             }
             if name == "mqa_logits_fp8" {
-                run_mqa_bench(&dev, &stream, iters, warmup)
+                run_mqa_bench(d, &stream, *iters, *warmup)
             } else {
-                run_gemm_bench(&dev, &stream, &name, m, n, k, groups, iters, warmup)
+                run_gemm_bench(d, &stream, name, *m, *n, *k, *groups, *iters, *warmup)
             }
         }
+        (Cmd::Bench { .. }, None) => unreachable!("device init already handled"),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");

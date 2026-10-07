@@ -1,4 +1,36 @@
 //! TMA descriptor construction (port of upstream `runtime_utils.hpp`).
+//!
+//! # What a TMA descriptor is
+//!
+//! `cuTensorMapEncodeTiled` bakes a *copy program* into a 128-byte struct
+//! that the kernel passes by value (`__grid_constant__ dg::TmaMap`). One
+//! `cp.async.bulk.tensor.*` instruction then moves a whole tile, enforcing:
+//!
+//! * **Box shape** — `[smem_inner, smem_outer]` elements per copy; we split
+//!   the inner extent into *swizzle atoms* so the SMEM tile matches the MMA
+//!   descriptor's layout expectations (see `get_atom_base` in the kernels).
+//! * **Global strides** — the outer (non-contiguous) dimension stride in
+//!   *bytes*, which is how grouped/batched tensors stack experts without
+//!   copying: the "3D" maps simply add a batch index coordinate.
+//! * **Swizzle atom** — 16B/32B/64B/128B; the SMEM tile is stored so that
+//!   16B accesses never bank-conflict (row XOR with atom/16). FP4 MXF4
+//!   requires 128B; unpacked FP4 uses `16U4_ALIGN16B` (gmem inner multiple
+//!   of 128 nibbles = 64B) vs packed `16U4_ALIGN8B` (SMEM inner = swizzle*2).
+//! * **Dtype code** — UINT8 for FP8 (raw bytes), 16U4 pair for FP4,
+//!   BF16/FP32 for the f16 path. The *data* is always moved as raw bits;
+//!   the dtype only shapes the box arithmetic.
+//!
+//! # Map flavors used by the GEMM
+//!
+//! | map   | tensor        | dims (inner→outer)          | notes                |
+//! |-------|---------------|-----------------------------|----------------------|
+//! | ab    | A or B        | K (or MN) x rows            | 2D; 3D for batched   |
+//! | sf    | scale factors | packed-K rows x TMA-align MN| int32 words, no swz  |
+//! | cd    | output D      | swizzle atom x store rows   | TMA store path       |
+//! | mqa_* | Q/KV/SF/W     | special headDim packings    | see mqa_logits       |
+//!
+//! All "SF" maps share one invariant with [`crate::golden`]: the packed word
+//! at `(k/4, m)` carries bytes for k, k+1, k+2, k+3 in little-endian order.
 
 use crate::device::{DevBuffer, Device};
 use crate::error::{DgError, DgResult};
@@ -106,8 +138,18 @@ pub fn make_tma_ab(
         Major::K => outer_stride,
         Major::Mn => outer_stride,
     };
-    make_tma_2d(dev, dtype, fp4_unpacked_smem, buf.ptr, gmem_inner, gmem_outer,
-                smem_inner, smem_outer, outer_stride, swizzle_mode)
+    make_tma_2d(
+        dev,
+        dtype,
+        fp4_unpacked_smem,
+        buf.ptr,
+        gmem_inner,
+        gmem_outer,
+        smem_inner,
+        smem_outer,
+        outer_stride,
+        swizzle_mode,
+    )
 }
 
 /// Batched A/B map: 3D (inner, outer, batch).
@@ -126,12 +168,20 @@ pub fn make_tma_ab_3d(
     swizzle_mode: u32,
     fp4_unpacked_smem: bool,
 ) -> DgResult<sys::TensorMap> {
-    let elem_wire = if dtype == Dtype::Fp4 { 1 } else { dtype.elem_size() as u32 };
+    let elem_wire = if dtype == Dtype::Fp4 {
+        1
+    } else {
+        dtype.elem_size() as u32
+    };
     let (inner, outer, _smem_inner, smem_outer) = match major {
         Major::K => (k, rows, block_k, load_block_mn),
         Major::Mn => (rows, k, load_block_mn, block_k),
     };
-    let s0 = if swizzle_mode != 0 { swizzle_mode / elem_wire } else { inner };
+    let s0 = if swizzle_mode != 0 {
+        swizzle_mode / elem_wire
+    } else {
+        inner
+    };
     let mut s0 = s0;
     if dtype == Dtype::Fp4 && !fp4_unpacked_smem && swizzle_mode != 0 {
         s0 = swizzle_mode * 2;
@@ -172,8 +222,18 @@ pub fn make_tma_cd(
     num_groups: u32,
     swizzle_mode: u32,
 ) -> DgResult<sys::TensorMap> {
-    make_tma_2d(dev, dtype, false, buf.ptr, cols, rows * num_groups,
-                store_block_n, store_block_m, row_stride, swizzle_mode)
+    make_tma_2d(
+        dev,
+        dtype,
+        false,
+        buf.ptr,
+        cols,
+        rows * num_groups,
+        store_block_n,
+        store_block_m,
+        row_stride,
+        swizzle_mode,
+    )
 }
 
 /// Batched C/D map: 3D [n, m, batch].
@@ -214,22 +274,38 @@ pub fn make_tma_cd_3d(
 pub fn make_tma_sf(
     dev: &Device,
     buf: &DevBuffer,
-    rows: u32,          // logical MN (or per-group MN)
-    k: u32,             // logical K
-    gran_k: u32,        // SF granularity (32 or 128)
-    block_mn: u32,      // SMEM box along MN (SF_BLOCK_M/N)
-    sf_block_k: u32,    // SMEM box along packed K rows
+    rows: u32,       // logical MN (or per-group MN)
+    k: u32,          // logical K
+    gran_k: u32,     // SF granularity (32 or 128)
+    block_mn: u32,   // SMEM box along MN (SF_BLOCK_M/N)
+    sf_block_k: u32, // SMEM box along packed K rows
     num_groups: u32,
     packed_row_stride: u32, // 0 => compact TMA-aligned layout
 ) -> DgResult<sys::TensorMap> {
     let tma_aligned = tma_aligned_size(rows, 4);
     let packed_rows = ceil_div(k, gran_k * 4);
-    let outer_stride = if packed_row_stride == 0 { tma_aligned } else { packed_row_stride };
+    let outer_stride = if packed_row_stride == 0 {
+        tma_aligned
+    } else {
+        packed_row_stride
+    };
     if outer_stride < tma_aligned {
-        return Err(DgError::InvalidArg("SF row stride smaller than TMA-aligned MN".into()));
+        return Err(DgError::InvalidArg(
+            "SF row stride smaller than TMA-aligned MN".into(),
+        ));
     }
-    make_tma_2d(dev, Dtype::F32, false, buf.ptr, tma_aligned, packed_rows * num_groups,
-                block_mn, sf_block_k.max(1), outer_stride, 0)
+    make_tma_2d(
+        dev,
+        Dtype::F32,
+        false,
+        buf.ptr,
+        tma_aligned,
+        packed_rows * num_groups,
+        block_mn,
+        sf_block_k.max(1),
+        outer_stride,
+        0,
+    )
 }
 
 /// Weights map for MQA logits: bf16 [heads, tokens] (inner = heads).
@@ -239,8 +315,18 @@ pub fn make_tma_mqa_weights(
     num_heads: u32,
     num_tokens: u32,
 ) -> DgResult<sys::TensorMap> {
-    make_tma_2d(dev, Dtype::Bf16, false, buf.ptr, num_heads, num_tokens,
-                num_heads, 1, num_heads, 0)
+    make_tma_2d(
+        dev,
+        Dtype::Bf16,
+        false,
+        buf.ptr,
+        num_heads,
+        num_tokens,
+        num_heads,
+        1,
+        num_heads,
+        0,
+    )
 }
 
 /// Q / KV data map for MQA logits: [head_dim, rows] (inner = K).
@@ -257,8 +343,9 @@ pub fn make_tma_mqa_qk(
 ) -> DgResult<sys::TensorMap> {
     let pack = if is_packed_fp4 { 2 } else { 1 };
     let swizzle = (head_dim / pack).min(128);
-    make_tma_2d(dev, dtype, false, buf.ptr, head_dim, rows,
-                head_dim, load_rows, head_dim, swizzle)
+    make_tma_2d(
+        dev, dtype, false, buf.ptr, head_dim, rows, head_dim, load_rows, head_dim, swizzle,
+    )
 }
 
 /// Q / KV SF map for MQA logits: int32 [rows, 1] packed.
@@ -269,6 +356,16 @@ pub fn make_tma_mqa_sf(
     load_rows: u32,
 ) -> DgResult<sys::TensorMap> {
     let tma_aligned = tma_aligned_size(rows, 4);
-    make_tma_2d(dev, Dtype::F32, false, buf.ptr, tma_aligned, 1,
-                load_rows, 1, tma_aligned, 0)
+    make_tma_2d(
+        dev,
+        Dtype::F32,
+        false,
+        buf.ptr,
+        tma_aligned,
+        1,
+        load_rows,
+        1,
+        tma_aligned,
+        0,
+    )
 }

@@ -1,0 +1,30 @@
+flowchart TB
+    subgraph HOST["Rust host (deepgemm crate)"]
+        API["api.rs<br/>gemm_nt · m_grouped · mqa_logits<br/>transform_sf · quant_mx"]
+        HEUR["heuristics.rs<br/>SM100 tiling search<br/>(block/cluster/stages)"]
+        TMA["tma.rs<br/>cuTensorMapEncodeTiled<br/>A/B/SF/CD descriptors"]
+        JIT["jit.rs<br/>NVRTC runtime compile<br/>PTX ⇄ SASS cache"]
+        SYS["sys.rs<br/>cuLaunchKernelEx<br/>cluster + PDL + 48KB+ smem"]
+        API --> HEUR --> TMA
+        API --> JIT
+        API --> SYS
+        TMA --> SYS
+    end
+    subgraph DEV["Device (B200, SM100a)"]
+        subgraph CTAX["one CTA of a persistent, L2-swizzled grid"]
+            TMAE["TMA engine<br/>cp.async.bulk.tensor"]
+            SMEM[("SMEM stages<br/>swizzled tiles + SF")]
+            MMA["tcgen05.mma<br/>kind::mxf4 / mxf8f6f4 / f16"]
+            TMEM[("TMEM<br/>accum + SF cols")]
+            TC05LD["tcgen05.ld / UTCCP"]
+            EPI["epilogue warps<br/>bf16 pack + TMA store"]
+            TMAE --> SMEM --> MMA --> TMEM --> TC05LD --> EPI
+        end
+        HBM[("HBM2e")]
+        HBM <--> TMAE
+        EPI --> HBM
+    end
+    SYS -->|launch + descriptors| CTAX
+    JIT -->|module load| CTAX
+    style HOST fill:#eef,stroke:#88f
+    style DEV fill:#efe,stroke:#8c8

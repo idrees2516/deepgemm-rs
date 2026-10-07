@@ -1,0 +1,17 @@
+flowchart LR
+    subgraph CTA["CTA (256 threads) — cluster-paired, cta_group::2 MMA"]
+        direction TB
+        W0["warp 0 — TMA producer<br/>elect_one · descriptors by value"]
+        W1["warp 1 — MMA issuer (leader CTA)<br/>per-stage desc table + shfl<br/>dynamic UMMA-N (swapAB)"]
+        W23["warps 2,3 — SF transposers<br/>4x32 SMEM shuffle for UTCCP"]
+        W47["warps 4..7 — epilogue<br/>tcgen05.ld → SMEM swizzle → TMA store"]
+        REG["setmaxnreg<br/>specialized 56 ↔ math 224"]
+        W0 -- "full[s]" --> W1
+        W0 -- "full[s]" --> W23
+        W23 -- "UTCCP TMEM SF" --> W1
+        W1 -- "tmem_empty (commit)" --> W47
+        W47 -- "empty[s]" --> W0
+        REG -.- W0 & W1 & W47
+    end
+    style CTA fill:#fff8ee,stroke:#e9a13b
+    style REG fill:#fdd,stroke:#d77

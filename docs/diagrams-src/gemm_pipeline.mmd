@@ -1,0 +1,21 @@
+sequenceDiagram
+    participant W0 as warp 0 (TMA)
+    participant SM as SMEM stage s
+    participant W1 as warp 1 (MMA)
+    participant TC as tensor core
+    participant TM as TMEM
+    participant W4 as warps 4-7 (epilogue)
+    Note over W0,W4: k-block loop, stage s = k %% numStages, phase = (k/stages) & 1
+    W0->>W0: wait empty[s] (phase)
+    W0->>SM: mbarrier.arrive.expect_tx(full[s], TX)
+    W0->>W0: tma_load A/B/SF (multicast, L2 hint)
+    SM-->>W1: full[s] flips (bytes arrived)
+    W1->>TC: tcgen05.mma(s) (+ UTCCP SF)
+    W1->>W1: tcgen05.commit → tmem barrier
+    TC-->>TM: D accumulators written
+    TM-->>W4: tmem_empty[s] (phase)
+    W4->>TM: tcgen05.ld.32x32b
+    W4->>SM: swizzled staging (XOR banks)
+    W4->>W4: bf16 pack · fence
+    W4->>W0: empty[s].arrive (slot reusable)
+    W4->>W4: tma_store → HBM (+ PDL launch_dependents)

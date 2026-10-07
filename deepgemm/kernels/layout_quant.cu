@@ -1,6 +1,36 @@
 // DeepGEMM-RS: scale-factor transforms, activation quantization, and dequant.
 // Port of upstream `impls/smxx_layout.cuh` (transpose_and_pack_fp32_into_ue8m0)
 // plus the per-token-group MX quantization needed to prepare GEMM inputs.
+//
+// ===========================================================================
+// SF PACKING — the layout every consumer (TMA, UTCCP, golden model) agrees on
+// ===========================================================================
+// transform_sf turns row-major f32 scales [mn, sf_k] into the "MN-major"
+// packed form the tensor core SF path consumes:
+//
+//   input  (logical):  sf[m][k]        m = 0..mn-1 (rows), k = 0..sf_k-1
+//   output (packed) :  word[k/4][m] as u32[ceil(sf_k/4)][align(mn, 4)]:
+//
+//        word(k, m) = UE8M0(k+0) | UE8M0(k+1) << 8 | UE8M0(k+2) << 16
+//                    | UE8M0(k+3) << 24          with UE8M0(x) = bits 23..30
+//                    of the f32 scale (an exact power of two), so the byte is
+//                    the biased exponent.
+//
+//   Why MN-contiguous? A TMA row is 16B = 4 int32 = 4 consecutive m rows of
+//   the SAME k group — exactly the granularity the mma SF descriptor wants,
+//   and it makes `align(mn, 4)` the row padding. The quant kernel merges its
+//   bytes into the same words with one atomicOr per group, so both producers
+//   (transform_sf and quant_mx) emit bit-identical buffers — asserted by the
+//   e2e test `transform_sf_bit_exact_vs_golden`.
+//
+// quant_mx (activations): per group of `gran` elements (32 or 128),
+//   amax -> UE8M0 exponent via the upstream bit-trick:
+//     rounded_exp = (bits(amax) + 0x7FFFFF - kQuantMaxMantissa) >> 23
+//   where the +0x7FFFFF rounds amax UP to the next power of two when its
+//   fraction exceeds 0.5 (so amax=7 -> 8 -> scale 2; amax=500 -> 512).
+//   Then each element is scaled by 2^-exp and RNE'd onto the E4M3 (or E2M1)
+//   grid. Floors: fp8 105 (amax 1e-4), fp4 1 (max(amax, 6*2^-126)).
+// ===========================================================================
 
 namespace dg {
 

@@ -1,8 +1,14 @@
 //! GPU end-to-end tests (run on a B200/SM100 GPU):
 //! `LD_LIBRARY_PATH=... cargo test -p deepgemm --features e2e --release -- --nocapture`
+//!
+//! All CPU-side references come from `deepgemm::golden` — the same bit-exact
+//! model that the GPU-less tests (`golden_tests.rs`) exercise — so a semantic
+//! disagreement between the hardware path and the model is caught on whichever
+//! plane runs first.
 
 #![cfg(feature = "e2e")]
 
+use deepgemm::golden;
 use deepgemm::prelude::*;
 
 fn test_dev() -> (std::sync::Arc<Device>, DevStream) {
@@ -11,111 +17,43 @@ fn test_dev() -> (std::sync::Arc<Device>, DevStream) {
     (dev, stream)
 }
 
+/// Host quantization via the golden model; returns (data bytes, f32 scales
+/// per [row, k/gran] slot) — scales as powers of two, ready for `transform_sf`.
 fn quantize_host(x: &[f32], k: u32, gran: u32, fp4: bool) -> (Vec<u8>, Vec<f32>) {
-    // Host MX quantization reference (matches the GPU quant kernel).
-    let n = x.len() as u32 / k;
-    let mut data = vec![0u8; if fp4 { (x.len() / 2) as usize } else { x.len() }];
-    let mut sfs = Vec::new();
-    let sf_exp_of = |amax: f32| -> u32 {
-        // Port of math::get_ue8m0_sf_exp.
-        let (mant_mask, qmax_mant, qmax_exp, min_exp) = if fp4 {
-            ((1u32 << 23) - 1, 0x40u32 << 16, 2u32, 1u32)
-        } else {
-            ((1u32 << 23) - 1, 0x60u32 << 16, 8u32, 105u32)
-        };
-        let bits = amax.to_bits();
-        let rounded = (bits.wrapping_add(mant_mask - qmax_mant)) >> 23;
-        rounded.max(min_exp + qmax_exp) - qmax_exp
+    let dtype = if fp4 { Dtype::Fp4 } else { Dtype::Fp8 };
+    let g = if gran >= 128 {
+        SfGran::G128
+    } else {
+        SfGran::G32
     };
-    for row in 0..n {
-        for g in 0..k / gran {
-            let base = (row * k + g * gran) as usize;
-            let mut amax = 0f32;
-            for i in 0..gran as usize {
-                amax = amax.max(x[base + i].abs());
-            }
-            amax = amax.max(1e-30);
-            let exp = sf_exp_of(amax);
-            let inv = f32::from_bits((254 - exp) << 23);
-            sfs.push(f32::from_bits((127 + exp) << 23)); // 2^exp
-            for i in 0..gran as usize {
-                let v = x[base + i] * inv;
-                let idx = base + i;
-                if fp4 {
-                    let byte = idx / 2;
-                    let nib = e2m1_quantize(v);
-                    if idx % 2 == 0 {
-                        data[byte] = nib;
-                    } else {
-                        data[byte] |= nib << 4;
-                    }
-                } else {
-                    data[idx] = e4m3_quantize(v);
-                }
-            }
+    let m = (x.len() as u32) / k;
+    let q = golden::quant_mx_host(x, m, k, dtype, g);
+    // Reconstruct the row-major f32 scale list from the packed golden words
+    // (identical to what the golden model itself consumes).
+    let num_slots = (k / g.k()) as usize;
+    let mut sfs = Vec::with_capacity(m as usize * num_slots);
+    for r in 0..m as usize {
+        for gi in 0..num_slots {
+            let w = q.sf[(gi / 4) * q.sf_cols as usize + r];
+            let exp = ((w >> (8 * (gi % 4))) & 0xff) as u8;
+            sfs.push(golden::ue8m0_decode(exp));
         }
     }
-    (data, sfs)
+    (q.data, sfs)
 }
 
-fn e4m3_quantize(v: f32) -> u8 {
-    // Round-to-nearest-even saturating E4M3 via f32 bits.
-    let clamped = v.clamp(-448.0, 448.0);
-    // bf16-style rounding on the 4-bit mantissa boundary.
-    let bits = clamped.to_bits();
-    let mant_mask = (1u32 << 23) - 1;
-    let _ = mant_mask;
-    // Simple approach: use the exponent/mantissa split.
-    let sign = (bits >> 31) as u8;
-    let abs = clamped.abs();
-    let e = if abs == 0.0 { 0 } else { ((abs.log2().floor() as i32) + 1).clamp(0, 15) as u32 };
-    let m = if e == 0 {
-        (abs / 2f32.powi(-6) ).round() as u32 // subnormal: mantissa * 2^-6
-    } else {
-        let frac = abs / 2f32.powi(e as i32 - 7);
-        ((frac - 1.0) * 8.0).round().clamp(0.0, 7.0) as u32
-    };
-    (sign << 7) | (e << 3) as u8 | m as u8
-}
-
-fn e2m1_quantize(v: f32) -> u8 {
-    const LUT: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-    let a = v.abs();
-    let mut best = 0u8;
-    let mut best_err = f32::INFINITY;
-    for (i, &c) in LUT.iter().enumerate() {
-        let err = (a - c).abs();
-        if err < best_err {
-            best_err = err;
-            best = i as u8;
-        }
-    }
-    if v < 0.0 { 0x8 | best } else { best }
-}
-
-fn e4m3_dequant(b: u8) -> f32 {
-    let sign = if b & 0x80 != 0 { -1f32 } else { 1f32 };
-    let e = ((b >> 3) & 0xf) as i32;
-    let m = (b & 7) as f32;
-    let v = if e == 0 {
-        m * 2f32.powi(-6)
-    } else {
-        (1.0 + m / 8.0) * 2f32.powi(e - 7)
-    };
-    sign * v
-}
-
-fn e2m1_dequant(n: u8) -> f32 {
-    const LUT: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-    let v = LUT[(n & 7) as usize];
-    if n & 8 != 0 { -v } else { v }
+/// bf16 raw-bits -> f32 (exact; bf16 ⊂ f32).
+fn bf16_to_f32(h: u16) -> f32 {
+    f32::from_bits(((h as u32) << 16) & 0xffff0000)
 }
 
 fn rand_data(n: usize, seed: u64) -> Vec<f32> {
     let mut x = 0x12345678u64.wrapping_add(seed);
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let f = ((x >> 40) as i32 as f32) / (1u32 << 22) as f32 - 1.0;
         out.push(f);
     }
@@ -128,7 +66,11 @@ fn e2e_quant_dequant_roundtrip() {
     let (m, k) = (64u32, 512u32);
     let x = rand_data((m * k) as usize, 7);
 
-    for (dtype, gran) in [(Dtype::Fp8, SfGran::G32), (Dtype::Fp8, SfGran::G128), (Dtype::Fp4, SfGran::G32)] {
+    for (dtype, gran) in [
+        (Dtype::Fp8, SfGran::G32),
+        (Dtype::Fp8, SfGran::G128),
+        (Dtype::Fp4, SfGran::G32),
+    ] {
         let fp4 = dtype == Dtype::Fp4;
         let (data_dev, sf_dev) = quant_mx(&dev, &stream, &x, m, k, dtype, gran).expect("quant");
         // Verify SF exponents against the host reference.
@@ -149,7 +91,10 @@ fn e2e_quant_dequant_roundtrip() {
         // tolerance band around the input.
         let got_data: Vec<u8> = download(&dev, &data_dev, stream.raw()).unwrap();
         for i in 0..host_data.len() {
-            assert_eq!(got_data[i], host_data[i], "quant data mismatch at {i} for {dtype:?}");
+            assert_eq!(
+                got_data[i], host_data[i],
+                "quant data mismatch at {i} for {dtype:?}"
+            );
         }
     }
 }
@@ -169,12 +114,32 @@ fn e2e_fp8_gemm_nt() {
         let sfa = transform_sf(&dev, &stream, &a_sf_h, m, gran).unwrap();
         let sfb = transform_sf(&dev, &stream, &b_sf_h, n, gran).unwrap();
 
-        let a = Operand { dtype: Dtype::Fp8, major: Major::K, rows: m, k, outer_stride: k,
-                          sf: Some(sfa), data: a_dev };
-        let b = Operand { dtype: Dtype::Fp8, major: Major::K, rows: n, k, outer_stride: k,
-                          sf: Some(sfb), data: b_dev };
+        let a = Operand {
+            dtype: Dtype::Fp8,
+            major: Major::K,
+            rows: m,
+            k,
+            outer_stride: k,
+            sf: Some(sfa),
+            data: a_dev,
+        };
+        let b = Operand {
+            dtype: Dtype::Fp8,
+            major: Major::K,
+            rows: n,
+            k,
+            outer_stride: k,
+            sf: Some(sfb),
+            data: b_dev,
+        };
         let out_data = DevBuffer::alloc_zeros(&dev, (m * n * 2) as usize).unwrap();
-        let mut out = Output { dtype: Dtype::Bf16, rows: m, cols: n, stride: n, data: out_data };
+        let mut out = Output {
+            dtype: Dtype::Bf16,
+            rows: m,
+            cols: n,
+            stride: n,
+            data: out_data,
+        };
 
         fp8_gemm_nt(&dev, &stream, &a, &b, &mut out, false).expect("gemm");
 
@@ -185,10 +150,14 @@ fn e2e_fp8_gemm_nt() {
             for c in 0..n as usize {
                 let mut acc = 0f64;
                 for i in 0..k as usize {
-                    let sa = a_sf_h[r * (k as usize / gran.k() as usize) + i / gran.k() as usize] as f64;
-                    let sb = b_sf_h[c * (k as usize / gran.k() as usize) + i / gran.k() as usize] as f64;
-                    acc += e4m3_dequant(a_data[r * k as usize + i]) as f64 * sa
-                         * e4m3_dequant(b_data[c * k as usize + i]) as f64 * sb;
+                    let sa =
+                        a_sf_h[r * (k as usize / gran.k() as usize) + i / gran.k() as usize] as f64;
+                    let sb =
+                        b_sf_h[c * (k as usize / gran.k() as usize) + i / gran.k() as usize] as f64;
+                    acc += golden::e4m3_decode(a_data[r * k as usize + i]) as f64
+                        * sa
+                        * golden::e4m3_decode(b_data[c * k as usize + i]) as f64
+                        * sb;
                 }
                 let ref_v = acc as f32;
                 let bits = got[r * n as usize + c];
@@ -199,14 +168,17 @@ fn e2e_fp8_gemm_nt() {
                 }
             }
         }
-        assert!(max_rel_err < 0.06, "fp8 nt gran {gran:?} rel err {max_rel_err}");
+        assert!(
+            max_rel_err < 0.06,
+            "fp8 nt gran {gran:?} rel err {max_rel_err}"
+        );
     }
 }
 
 #[test]
 fn e2e_fp4_gemm_nt_native() {
     let (dev, stream) = test_dev();
-    let (m, n, k) = (256u32, 256u32, 512u32); // K must be a multiple of 256 for MXF4
+    let (m, n, _k) = (256u32, 256u32, 512u32); // K must be a multiple of 256 for MXF4
     let k = 512;
     let xa = rand_data((m * k) as usize, 3);
     let xb = rand_data((n * k) as usize, 4);
@@ -218,12 +190,32 @@ fn e2e_fp4_gemm_nt_native() {
     let sfa = transform_sf(&dev, &stream, &a_sf_h, m, SfGran::G32).unwrap();
     let sfb = transform_sf(&dev, &stream, &b_sf_h, n, SfGran::G32).unwrap();
 
-    let a = Operand { dtype: Dtype::Fp4, major: Major::K, rows: m, k, outer_stride: k,
-                      sf: Some(sfa), data: a_dev };
-    let b = Operand { dtype: Dtype::Fp4, major: Major::K, rows: n, k, outer_stride: k,
-                      sf: Some(sfb), data: b_dev };
+    let a = Operand {
+        dtype: Dtype::Fp4,
+        major: Major::K,
+        rows: m,
+        k,
+        outer_stride: k,
+        sf: Some(sfa),
+        data: a_dev,
+    };
+    let b = Operand {
+        dtype: Dtype::Fp4,
+        major: Major::K,
+        rows: n,
+        k,
+        outer_stride: k,
+        sf: Some(sfb),
+        data: b_dev,
+    };
     let out_data = DevBuffer::alloc_zeros(&dev, (m * n * 2) as usize).unwrap();
-    let mut out = Output { dtype: Dtype::Bf16, rows: m, cols: n, stride: n, data: out_data };
+    let mut out = Output {
+        dtype: Dtype::Bf16,
+        rows: m,
+        cols: n,
+        stride: n,
+        data: out_data,
+    };
 
     fp4_gemm_nt(&dev, &stream, &a, &b, &mut out, false).expect("fp4 gemm");
 
@@ -235,8 +227,12 @@ fn e2e_fp4_gemm_nt_native() {
             for i in 0..k as usize {
                 let sa = a_sf_h[r * (k as usize / 32) + i / 32] as f64;
                 let sb = b_sf_h[c * (k as usize / 32) + i / 32] as f64;
-                let av = e2m1_dequant(a_data[(r * k as usize + i) / 2] >> (4 * ((r * k as usize + i) % 2)) & 0xf);
-                let bv = e2m1_dequant(b_data[(c * k as usize + i) / 2] >> (4 * ((c * k as usize + i) % 2)) & 0xf);
+                let av = golden::e2m1_decode(
+                    a_data[(r * k as usize + i) / 2] >> (4 * ((r * k as usize + i) % 2)) & 0xf,
+                );
+                let bv = golden::e2m1_decode(
+                    b_data[(c * k as usize + i) / 2] >> (4 * ((c * k as usize + i) % 2)) & 0xf,
+                );
                 acc += av as f64 * sa * bv as f64 * sb;
             }
             let ref_v = acc as f32;
@@ -259,25 +255,40 @@ fn e2e_bf16_gemm_nt() {
     let xa = rand_data((m * k) as usize, 5);
     let xb = rand_data((n * k) as usize, 6);
 
-    let host_bf16 = |v: f32| -> u16 {
-        let bits = v.to_bits();
-        let lsb = (bits >> 16) & 1;
-        let rounding = 0x7fff + lsb;
-        (((bits + rounding) >> 16) as u16) & 0x7fff | ((bits >> 31) as u16) << 15
-    };
-    let bf16_f = |h: u16| f32::from_bits(((h as u32) << 16) & 0xffff0000);
+    let host_bf16 = |v: f32| golden::f32_to_bf16_bits(v);
+    let bf16_f = |h: u16| bf16_to_f32(h);
 
     let a_h: Vec<u16> = xa.iter().map(|&v| host_bf16(v)).collect();
     let b_h: Vec<u16> = xb.iter().map(|&v| host_bf16(v)).collect();
     let a_dev = alloc_and_upload(&dev, &a_h, stream.raw()).unwrap();
     let b_dev = alloc_and_upload(&dev, &b_h, stream.raw()).unwrap();
 
-    let a = Operand { dtype: Dtype::Bf16, major: Major::K, rows: m, k, outer_stride: k,
-                      sf: None, data: a_dev };
-    let b = Operand { dtype: Dtype::Bf16, major: Major::K, rows: n, k, outer_stride: k,
-                      sf: None, data: b_dev };
+    let a = Operand {
+        dtype: Dtype::Bf16,
+        major: Major::K,
+        rows: m,
+        k,
+        outer_stride: k,
+        sf: None,
+        data: a_dev,
+    };
+    let b = Operand {
+        dtype: Dtype::Bf16,
+        major: Major::K,
+        rows: n,
+        k,
+        outer_stride: k,
+        sf: None,
+        data: b_dev,
+    };
     let out_data = DevBuffer::alloc_zeros(&dev, (m * n * 2) as usize).unwrap();
-    let mut out = Output { dtype: Dtype::Bf16, rows: m, cols: n, stride: n, data: out_data };
+    let mut out = Output {
+        dtype: Dtype::Bf16,
+        rows: m,
+        cols: n,
+        stride: n,
+        data: out_data,
+    };
 
     bf16_gemm_nt(&dev, &stream, &a, &b, &mut out, false).expect("bf16 gemm");
 
@@ -287,7 +298,8 @@ fn e2e_bf16_gemm_nt() {
         for c in 0..n as usize {
             let mut acc = 0f64;
             for i in 0..k as usize {
-                acc += bf16_f(a_h[r * k as usize + i]) as f64 * bf16_f(b_h[c * k as usize + i]) as f64;
+                acc +=
+                    bf16_f(a_h[r * k as usize + i]) as f64 * bf16_f(b_h[c * k as usize + i]) as f64;
             }
             let v = bf16_f(got[r * n as usize + c]);
             max_err = max_err.max((v - acc as f32).abs());
@@ -315,12 +327,32 @@ fn e2e_m_grouped_masked() {
     let sfa = transform_sf(&dev, &stream, &a_sf_h, groups * m, SfGran::G32).unwrap();
     let sfb = transform_sf(&dev, &stream, &b_sf_h, groups * n, SfGran::G32).unwrap();
 
-    let a = Operand { dtype: Dtype::Fp8, major: Major::K, rows: m, k, outer_stride: k,
-                      sf: Some(sfa), data: a_dev };
-    let b = Operand { dtype: Dtype::Fp8, major: Major::K, rows: n, k, outer_stride: k,
-                      sf: Some(sfb), data: b_dev };
+    let a = Operand {
+        dtype: Dtype::Fp8,
+        major: Major::K,
+        rows: m,
+        k,
+        outer_stride: k,
+        sf: Some(sfa),
+        data: a_dev,
+    };
+    let b = Operand {
+        dtype: Dtype::Fp8,
+        major: Major::K,
+        rows: n,
+        k,
+        outer_stride: k,
+        sf: Some(sfb),
+        data: b_dev,
+    };
     let out_data = DevBuffer::alloc_zeros(&dev, (groups * m * n * 2) as usize).unwrap();
-    let mut out = Output { dtype: Dtype::Bf16, rows: m, cols: n, stride: n, data: out_data };
+    let mut out = Output {
+        dtype: Dtype::Bf16,
+        rows: m,
+        cols: n,
+        stride: n,
+        data: out_data,
+    };
 
     let masked = vec![m; groups as usize];
     let masked_buf = alloc_and_upload(&dev, &masked, stream.raw()).unwrap();
@@ -335,8 +367,11 @@ fn e2e_m_grouped_masked() {
                 for i in 0..k as usize {
                     let sa = a_sf_h[(g * m as usize + r) * (k as usize / 32) + i / 32] as f64;
                     let sb = b_sf_h[(g * n as usize + c) * (k as usize / 32) + i / 32] as f64;
-                    acc += e4m3_dequant(a_data[(g * m as usize + r) * k as usize + i]) as f64 * sa
-                         * e4m3_dequant(b_data[(g * n as usize + c) * k as usize + i]) as f64 * sb;
+                    acc += golden::e4m3_decode(a_data[(g * m as usize + r) * k as usize + i])
+                        as f64
+                        * sa
+                        * golden::e4m3_decode(b_data[(g * n as usize + c) * k as usize + i]) as f64
+                        * sb;
                 }
                 let ref_v = acc as f32;
                 let bits = got[(g * m as usize + r) * n as usize + c];
@@ -368,12 +403,32 @@ fn e2e_m_grouped_contiguous() {
     let sfa = transform_sf(&dev, &stream, &a_sf_h, m, SfGran::G32).unwrap();
     let sfb = transform_sf(&dev, &stream, &b_sf_h, groups * n, SfGran::G32).unwrap();
 
-    let a = Operand { dtype: Dtype::Fp8, major: Major::K, rows: m, k, outer_stride: k,
-                      sf: Some(sfa), data: a_dev };
-    let b = Operand { dtype: Dtype::Fp8, major: Major::K, rows: n, k, outer_stride: k,
-                      sf: Some(sfb), data: b_dev };
+    let a = Operand {
+        dtype: Dtype::Fp8,
+        major: Major::K,
+        rows: m,
+        k,
+        outer_stride: k,
+        sf: Some(sfa),
+        data: a_dev,
+    };
+    let b = Operand {
+        dtype: Dtype::Fp8,
+        major: Major::K,
+        rows: n,
+        k,
+        outer_stride: k,
+        sf: Some(sfb),
+        data: b_dev,
+    };
     let out_data = DevBuffer::alloc_zeros(&dev, (m * n * 2) as usize).unwrap();
-    let mut out = Output { dtype: Dtype::Bf16, rows: m, cols: n, stride: n, data: out_data };
+    let mut out = Output {
+        dtype: Dtype::Bf16,
+        rows: m,
+        cols: n,
+        stride: n,
+        data: out_data,
+    };
 
     let mut m_indices = Vec::new();
     for g in 0..groups {
@@ -395,8 +450,10 @@ fn e2e_m_grouped_contiguous() {
             for i in 0..k as usize {
                 let sa = a_sf_h[r * (k as usize / 32) + i / 32] as f64;
                 let sb = b_sf_h[(g * n as usize + c) * (k as usize / 32) + i / 32] as f64;
-                acc += e4m3_dequant(a_data[r * k as usize + i]) as f64 * sa
-                     * e4m3_dequant(b_data[(g * n as usize + c) * k as usize + i]) as f64 * sb;
+                acc += golden::e4m3_decode(a_data[r * k as usize + i]) as f64
+                    * sa
+                    * golden::e4m3_decode(b_data[(g * n as usize + c) * k as usize + i]) as f64
+                    * sb;
             }
             let ref_v = acc as f32;
             let bits = got[r * n as usize + c];
@@ -427,12 +484,7 @@ fn e2e_mqa_logits() {
     let q_sf = transform_sf(&dev, &stream, &q_sf_h, q_rows, SfGran::G32).unwrap();
     let kv_sf = transform_sf(&dev, &stream, &kv_sf_h, num_kv, SfGran::G32).unwrap();
 
-    let host_bf16 = |v: f32| -> u16 {
-        let bits = v.to_bits();
-        let lsb = (bits >> 16) & 1;
-        let rounding = 0x7fff + lsb;
-        (((bits + rounding) >> 16) as u16) & 0x7fff | ((bits >> 31) as u16) << 15
-    };
+    let host_bf16 = |v: f32| golden::f32_to_bf16_bits(v);
     let weights: Vec<u16> = (0..num_tokens * heads)
         .map(|i| host_bf16(0.25 + (i % 5) as f32 * 0.1))
         .collect();
@@ -442,17 +494,47 @@ fn e2e_mqa_logits() {
     let ks_dev = alloc_and_upload(&dev, &ks, stream.raw()).unwrap();
     let ke_dev = alloc_and_upload(&dev, &ke, stream.raw()).unwrap();
 
-    let q = Operand { dtype: Dtype::Fp8, major: Major::K, rows: q_rows, k: head_dim,
-                      outer_stride: head_dim, sf: None, data: q_dev };
-    let kv = Operand { dtype: Dtype::Fp8, major: Major::K, rows: num_kv, k: head_dim,
-                       outer_stride: head_dim, sf: None, data: kv_dev };
+    let q = Operand {
+        dtype: Dtype::Fp8,
+        major: Major::K,
+        rows: q_rows,
+        k: head_dim,
+        outer_stride: head_dim,
+        sf: None,
+        data: q_dev,
+    };
+    let kv = Operand {
+        dtype: Dtype::Fp8,
+        major: Major::K,
+        rows: num_kv,
+        k: head_dim,
+        outer_stride: head_dim,
+        sf: None,
+        data: kv_dev,
+    };
     let mut logits = DevBuffer::alloc_zeros(&dev, (num_tokens * num_kv * 2) as usize).unwrap();
 
-    mqa_logits(&dev, &stream, &q, &q_sf, &kv, &kv_sf, &w_dev, &ks_dev, &ke_dev,
-               num_tokens, num_kv, heads, head_dim, &mut logits, num_kv).expect("mqa");
+    mqa_logits(
+        &dev,
+        &stream,
+        &q,
+        &q_sf,
+        &kv,
+        &kv_sf,
+        &w_dev,
+        &ks_dev,
+        &ke_dev,
+        num_tokens,
+        num_kv,
+        heads,
+        head_dim,
+        &mut logits,
+        num_kv,
+    )
+    .expect("mqa");
 
     let got: Vec<u16> = download(&dev, &logits, stream.raw()).unwrap();
-    let bf = |h: u16| f32::from_bits(((h as u32) << 16) & 0xffff0000);
+    let bf = |h: u16| bf16_to_f32(h);
     let mut max_err = 0f32;
     for t in 0..num_tokens as usize {
         for j in 0..num_kv as usize {
@@ -460,10 +542,15 @@ fn e2e_mqa_logits() {
             for h in 0..heads as usize {
                 let mut dot = 0f64;
                 for d in 0..head_dim as usize {
-                    let sq = q_sf_h[(t * heads as usize + h) * (head_dim as usize / 32) + d / 32] as f64;
+                    let sq =
+                        q_sf_h[(t * heads as usize + h) * (head_dim as usize / 32) + d / 32] as f64;
                     let skv = kv_sf_h[j * (head_dim as usize / 32) + d / 32] as f64;
-                    dot += e4m3_dequant(q_data[(t * heads as usize + h) * head_dim as usize + d]) as f64 * sq
-                         * e4m3_dequant(kv_data[j * head_dim as usize + d]) as f64 * skv;
+                    dot += golden::e4m3_decode(
+                        q_data[(t * heads as usize + h) * head_dim as usize + d],
+                    ) as f64
+                        * sq
+                        * golden::e4m3_decode(kv_data[j * head_dim as usize + d]) as f64
+                        * skv;
                 }
                 acc += bf(weights[t * heads as usize + h]) as f64 * dot.max(0.0);
             }
@@ -473,4 +560,48 @@ fn e2e_mqa_logits() {
     }
     // BF16 accumulation tolerance.
     assert!(max_err < 1.5, "mqa abs err {max_err}");
+}
+
+#[test]
+fn e2e_transform_sf_bit_exact_vs_golden() {
+    // The GPU transform_sf kernel must produce byte-identical packed words to
+    // the CPU golden model — the strongest possible cross-check of the layout
+    // path that the tcgen05 SF/UTCCP machinery consumes.
+    let (dev, stream) = test_dev();
+    for (mn, sf_k) in [
+        (33u32, 7u32),
+        (64u32, 16u32),
+        (128u32, 4u32),
+        (257u32, 32u32),
+    ] {
+        let mut rng = 0x9E3779B97F4A7C15u64;
+        let mut next = move || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((rng >> 33) as i32 % 21) - 10
+        };
+        let sf: Vec<f32> = (0..mn * sf_k).map(|_| (2.0f32).powi(next())).collect();
+        let got = transform_sf(&dev, &stream, &sf, mn, SfGran::G32).expect("transform");
+        let got_words: Vec<u32> = download(&dev, &got.buf, stream.raw()).unwrap();
+        let want = golden::transform_sf_host(&sf, mn, SfGran::G32);
+        assert_eq!(
+            got_words.len(),
+            want.len(),
+            "length mismatch (mn={mn}, sf_k={sf_k})"
+        );
+        let mut bad = 0usize;
+        for (i, (g, w)) in got_words.iter().zip(want.iter()).enumerate() {
+            if g != w {
+                if bad < 5 {
+                    eprintln!("  word {i}: gpu {g:#010x} golden {w:#010x} (mn={mn} sf_k={sf_k})");
+                }
+                bad += 1;
+            }
+        }
+        assert_eq!(
+            bad, 0,
+            "transform_sf: {bad} words differ from golden (mn={mn}, sf_k={sf_k})"
+        );
+    }
 }
