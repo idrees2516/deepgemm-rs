@@ -1,0 +1,16 @@
+[package]
+name = "deepgemm"
+description = "Rust port of DeepGEMM: high-performance FP8/FP4/BF16 GEMM and MLA inference kernels for NVIDIA SM90/SM100 (Blackwell native MXFP4)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cudarc = { version = "0.14", default-features = false, features = ["driver", "nvrtc", "cublas", "cublaslt", "cuda-12080"] }
+bytemuck = { version = "1", features = ["derive"] }
+
+[features]
+default = []
+e2e = []
+
+[dev-dependencies]

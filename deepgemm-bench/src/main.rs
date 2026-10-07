@@ -1,0 +1,334 @@
+//! Benchmark CLI for deepgemm-rs.
+//!
+//! Usage examples (on a B200 with CUDA 12.8+):
+//! ```text
+//! export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+//! cargo run -p deepgemm-bench --release -- bench fp4_nt_native --m 8192 --n 8192 --k 7168
+//! cargo run -p deepgemm-bench --release -- bench fp8_nt --m 8192 --n 4096 --k 7168
+//! cargo run -p deepgemm-bench --release -- bench fp8_m_grouped_contiguous --groups 128
+//! cargo run -p deepgemm-bench --release -- smoke     # JIT-compile all kernels
+//! cargo run -p deepgemm-bench --release -- list      # list benchmarks
+//! ```
+//!
+//! Tiling overrides (tune on real hardware, then hard-code into heuristics):
+//! `DG_BLOCK_M`, `DG_BLOCK_N`, `DG_BLOCK_K`, `DG_CLUSTER_M`, `DG_CLUSTER_N`,
+//! `DG_SWAP_AB`, `DG_NUM_STAGES`, `DG_PRINT_CONFIGS=1`.
+
+use clap::{Parser, Subcommand};
+use deepgemm::prelude::*;
+
+#[derive(Parser)]
+#[command(name = "deepgemm-bench", about = "DeepGEMM-RS benchmarks (TFLOPS, % of peak)")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// List available benchmarks.
+    List,
+    /// JIT-compile every kernel variant for this GPU (fast correctness gate).
+    Smoke,
+    /// Run a benchmark.
+    Bench {
+        name: String,
+        #[arg(long, default_value = "8192")]
+        m: u32,
+        #[arg(long, default_value = "8192")]
+        n: u32,
+        #[arg(long, default_value = "7168")]
+        k: u32,
+        #[arg(long, default_value = "128")]
+        groups: u32,
+        #[arg(long, default_value = "20")]
+        iters: u32,
+        #[arg(long, default_value = "5")]
+        warmup: u32,
+    },
+}
+
+const BENCHES: &[&str] = &[
+    "fp4_nt_native",
+    "fp8_nt",
+    "fp8_nt_g128",
+    "bf16_nt",
+    "fp8_m_grouped_contiguous",
+    "fp8_m_grouped_masked",
+    "fp4_m_grouped_contiguous",
+    "fp8_bmm",
+    "mqa_logits_fp8",
+];
+
+fn host_bf16_bits(v: f32) -> u16 {
+    // Round-to-nearest-even f32 -> bf16.
+    let bits = v.to_bits();
+    let lsb = (bits >> 16) & 1;
+    let rounding = 0x7fff + lsb;
+    (((bits + rounding) >> 16) as u16) & 0x7fff | ((bits >> 31) as u16) << 15
+}
+
+fn make_sf(dev: &Device, stream: &DevStream, m: u32, k: u32, gran: SfGran, seed: u32) -> DgResult<SfTensor> {
+    // Deterministic power-of-two scales (UE8M0-compatible).
+    let sf_k = (k / gran.k()) as usize;
+    let mut scales = vec![0f32; (m as usize) * sf_k];
+    for i in 0..scales.len() {
+        let e = -3 + ((i.wrapping_mul(2654435761) ^ seed as usize) % 7) as i32;
+        scales[i] = (2f32).powi(e);
+    }
+    transform_sf(dev, stream, &scales, m, gran)
+}
+
+fn run_gemm_bench(
+    dev: &Device, stream: &DevStream, name: &str,
+    m: u32, n: u32, k: u32, groups: u32, iters: u32, warmup: u32,
+) -> DgResult<()> {
+    let (a_dt, b_dt, gran) = match name {
+        "fp4_nt_native" | "fp4_m_grouped_contiguous" => (Dtype::Fp4, Dtype::Fp4, SfGran::G32),
+        "bf16_nt" => (Dtype::Bf16, Dtype::Bf16, SfGran::G32),
+        "fp8_nt_g128" => (Dtype::Fp8, Dtype::Fp8, SfGran::G128),
+        _ => (Dtype::Fp8, Dtype::Fp8, SfGran::G32),
+    };
+
+    // Data: random-ish bytes (valid fp8/fp4 codes; performance does not depend
+    // on values for these dtypes).
+    let elem_bytes_a = if a_dt == Dtype::Fp4 { (m * k / 2) as usize } else { (m * k) as usize };
+    let a_data = DevBuffer::alloc_zeros(dev, elem_bytes_a.max(16))?;
+    let elem_bytes_b = if b_dt == Dtype::Fp4 { (n * k / 2) as usize } else { (n * k) as usize } * groups as usize;
+    let b_data = DevBuffer::alloc_zeros(dev, elem_bytes_b.max(16))?;
+    let sf_a = make_sf(dev, stream, m, k, gran, 1)?;
+    let sf_b = make_sf(dev, stream, n, k, gran, 2)?;
+
+    let a = Operand {
+        dtype: a_dt, major: Major::K, rows: m, k,
+        outer_stride: k, sf: Some(sf_a), data: a_data,
+    };
+    let b = Operand {
+        dtype: b_dt, major: Major::K, rows: n, k,
+        outer_stride: k, sf: Some(sf_b), data: b_data,
+    };
+
+    let cd_bytes = (m * n * 2) as usize * if name.contains("grouped") || name.contains("bmm") { groups as usize } else { 1 };
+    let out_data = DevBuffer::alloc_zeros(dev, cd_bytes.max(16))?;
+    let mut out = Output { dtype: Dtype::Bf16, rows: m, cols: n, stride: n, data: out_data };
+
+    let run_once = |out: &mut Output| -> DgResult<()> {
+        match name {
+            "fp8_nt" | "fp4_nt_native" | "fp8_nt_g128" | "bf16_nt" => {
+                gemm_nt(dev, stream, &a, &b, out, false)
+            }
+            "fp8_m_grouped_contiguous" | "fp4_m_grouped_contiguous" => {
+                let alignment = 128;
+                let m_aligned = m.div_ceil(alignment) * alignment;
+                let mut m_indices = vec![0i32; (m_aligned / alignment) as usize];
+                for (i, v) in m_indices.iter_mut().enumerate() {
+                    *v = (i as i32 % groups as i32).max(0);
+                }
+                let m_idx = alloc_and_upload(dev, &m_indices, stream.raw())?;
+                let a2 = Operand {
+                    dtype: a_dt, major: Major::K, rows: m_aligned, k,
+                    outer_stride: k, sf: Some(make_sf(dev, stream, m_aligned, k, gran, 1)?),
+                    data: DevBuffer::alloc_zeros(dev, elem_bytes_a.max(16))?,
+                };
+                m_grouped_gemm_nt_contiguous(dev, stream, &a2, &b, out, &m_idx, groups)
+            }
+            "fp8_m_grouped_masked" => {
+                let masked = vec![m / groups; groups as usize];
+                let masked_buf = alloc_and_upload(dev, &masked, stream.raw())?;
+                m_grouped_gemm_nt_masked(dev, stream, &a, &b, out, &masked_buf, groups, m)
+            }
+            "fp8_bmm" => fp8_bmm(dev, stream, &a, &b, out, groups, false),
+            _ => Err(DgError::InvalidArg(format!("unknown bench {name}"))),
+        }
+    };
+
+    // Warmup + timed.
+    for _ in 0..warmup {
+        run_once(&mut out)?;
+    }
+    stream.sync()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        run_once(&mut out)?;
+    }
+    stream.sync()?;
+    let elapsed = t0.elapsed().as_secs_f64();
+
+    let group_mult = if name.contains("grouped") || name.contains("bmm") { groups as f64 } else { 1.0 };
+    let flops = 2.0 * m as f64 * n as f64 * k as f64 * group_mult;
+    let tflops = flops / elapsed / (iters as f64) / 1e12;
+    let peak = dev.peak_tflops(a_dt);
+    println!(
+        "{name:<28} m={m:<6} n={n:<6} k={k:<6} groups={groups:<4} | {tflops:8.1} TFLOPS  ({:5.1}% of {peak:.0} TF peak)  {elapsed:.3}s/{iters} iters",
+        100.0 * tflops / peak
+    );
+    Ok(())
+}
+
+fn run_mqa_bench(dev: &Device, stream: &DevStream, iters: u32, warmup: u32) -> DgResult<()> {
+    let num_tokens = 4096u32;
+    let num_kv = 8192u32;
+    let heads = 64u32;
+    let head_dim = 128u32;
+    let q_rows = num_tokens * heads;
+    let kv_gran = SfGran::G32;
+
+    let q_data = DevBuffer::alloc_zeros(dev, (q_rows * head_dim) as usize)?;
+    let kv_data = DevBuffer::alloc_zeros(dev, (num_kv * head_dim) as usize)?;
+    let q_sf = make_sf(dev, stream, q_rows, head_dim, kv_gran, 3)?;
+    let kv_sf = make_sf(dev, stream, num_kv, head_dim, kv_gran, 4)?;
+
+    let q = Operand { dtype: Dtype::Fp8, major: Major::K, rows: q_rows, k: head_dim,
+                      outer_stride: head_dim, sf: None, data: q_data };
+    let kv = Operand { dtype: Dtype::Fp8, major: Major::K, rows: num_kv, k: head_dim,
+                       outer_stride: head_dim, sf: None, data: kv_data };
+
+    let weights: Vec<u16> = (0..num_tokens * heads).map(|i| host_bf16_bits((0.5 + (i % 7) as f32 * 0.1) as f32)).collect();
+    let weights = alloc_and_upload(dev, &weights, stream.raw())?;
+    let k_start = vec![0u32; num_tokens as usize];
+    let k_end = vec![num_kv; num_tokens as usize];
+    let ks = alloc_and_upload(dev, &k_start, stream.raw())?;
+    let ke = alloc_and_upload(dev, &k_end, stream.raw())?;
+    let mut logits = DevBuffer::alloc_zeros(dev, (num_tokens * num_kv * 2) as usize)?;
+
+    let mut run_once = || -> DgResult<()> {
+        mqa_logits(dev, stream, &q, &q_sf, &kv, &kv_sf, &weights, &ks, &ke,
+                   num_tokens, num_kv, heads, head_dim, &mut logits, num_kv)
+    };
+
+    for _ in 0..warmup {
+        run_once()?;
+    }
+    stream.sync()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        run_once()?;
+    }
+    stream.sync()?;
+    let elapsed = t0.elapsed().as_secs_f64();
+    let flops = 2.0 * num_tokens as f64 * num_kv as f64 * heads as f64 * head_dim as f64;
+    let tflops = flops / elapsed / (iters as f64) / 1e12;
+    println!(
+        "mqa_logits_fp8              tokens={num_tokens} kv={num_kv} heads={heads} head_dim={head_dim} | {tflops:8.1} TFLOPS  {elapsed:.3}s/{iters} iters"
+    );
+    Ok(())
+}
+
+fn smoke(dev: &Device) -> DgResult<()> {
+    use deepgemm::jit::{self, kernel_src};
+    println!("Smoke-compiling kernel variants for {} (arch {})...", dev.name, dev.arch.nvrtc_arch());
+    let variants: Vec<(&str, &str, String)> = vec![
+        ("transform_sf k=16", kernel_src::LAYOUT_QUANT, format!(
+            r#"extern "C" __global__ void __dg_kernel(const float* sf, unsigned* out, unsigned mn) {{ dg::transform_sf_impl<128, 64, 16, 16>(sf, out, mn); }}"#)),
+        ("transform_sf k=4", kernel_src::LAYOUT_QUANT, format!(
+            r#"extern "C" __global__ void __dg_kernel(const float* sf, unsigned* out, unsigned mn) {{ dg::transform_sf_impl<128, 64, 4, 16>(sf, out, mn); }}"#)),
+        ("quant fp8 g32", kernel_src::LAYOUT_QUANT, format!(
+            r#"extern "C" __global__ void __dg_kernel(const float* x, unsigned m, unsigned k, unsigned char* d, unsigned* sf) {{ dg::quant_mx_impl<256, 32, 0>(x, m, k, d, sf); }}"#)),
+        ("quant fp8 g128", kernel_src::LAYOUT_QUANT, format!(
+            r#"extern "C" __global__ void __dg_kernel(const float* x, unsigned m, unsigned k, unsigned char* d, unsigned* sf) {{ dg::quant_mx_impl<256, 128, 0>(x, m, k, d, sf); }}"#)),
+        ("quant fp4 g32", kernel_src::LAYOUT_QUANT, format!(
+            r#"extern "C" __global__ void __dg_kernel(const float* x, unsigned m, unsigned k, unsigned char* d, unsigned* sf) {{ dg::quant_mx_impl<256, 32, 1>(x, m, k, d, sf); }}"#)),
+        ("dequant fp8 g32", kernel_src::LAYOUT_QUANT, format!(
+            r#"extern "C" __global__ void __dg_kernel(const unsigned char* d, const unsigned* sf, unsigned m, unsigned k, unsigned t, float* o) {{ dg::dequant_mx_impl<0, 32>(d, sf, m, k, t, o); }}"#)),
+        ("dequant fp4 g32", kernel_src::LAYOUT_QUANT, format!(
+            r#"extern "C" __global__ void __dg_kernel(const unsigned char* d, const unsigned* sf, unsigned m, unsigned k, unsigned t, float* o) {{ dg::dequant_mx_impl<1, 32>(d, sf, m, k, t, o); }}"#)),
+        ("gemm fp8 nt m128 n256 k128 c2", kernel_src::GEMM_SM100, gemm_wrapper(0, 0, 32, 32, 1, 0, 0, 0, 1, 1, 128, 256, 128, 128, 128, 128, 12, 2, 0, 0, 0, 2, 148)),
+        ("gemm fp4 nt m128 n256 k256 c2", kernel_src::GEMM_SM100, gemm_wrapper(0, 0, 32, 32, 1, 1, 5, 5, 1, 1, 128, 256, 256, 128, 128, 256, 8, 2, 0, 0, 0, 2, 148)),
+        ("gemm bf16 nt m128 n128 k64 c1", kernel_src::GEMM_SM100, gemm_wrapper(0, 0, 32, 32, 0, 0, 1, 1, 2, 2, 128, 128, 64, 128, 128, 128, 20, 1, 0, 0, 0, 2, 148)),
+        ("gemm fp8 swapab masked c2", kernel_src::GEMM_SM100, gemm_wrapper(0, 0, 32, 32, 1, 0, 0, 0, 1, 1, 128, 128, 128, 128, 128, 128, 12, 2, 1, 1, 2, 0, 148)),
+        ("gemm fp8 batched c2", kernel_src::GEMM_SM100, gemm_wrapper(0, 0, 32, 32, 1, 0, 0, 0, 1, 1, 128, 128, 128, 128, 128, 128, 12, 2, 0, 0, 4, 0, 148)),
+        ("mqa fp8 h64 d128", kernel_src::MQA_LOGITS, mqa_wrapper(64, 128, 2, 256, 128, 2, 2, 2, 256, 148, 0)),
+        ("mqa fp4 h64 d128", kernel_src::MQA_LOGITS, mqa_wrapper(64, 128, 2, 256, 128, 2, 2, 2, 256, 148, 1)),
+    ];
+    let mut n_ok = 0;
+    for (name, src, body) in &variants {
+        match jit::smoke_compile(dev, src, "smoke", body) {
+            Ok(()) => { println!("  [ok] {name}"); n_ok += 1; }
+            Err(e) => println!("  [FAIL] {name}: {e}"),
+        }
+    }
+    println!("{n_ok}/{} variants compiled.", variants.len());
+    if n_ok != variants.len() { Err(DgError::Nvrtc("smoke compile failures".into())) } else { Ok(()) }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemm_wrapper(
+    major_a: u32, major_b: u32, gran_a: u32, gran_b: u32, has_sf: u32, is_mxf4: u32,
+    fmt_a: u32, fmt_b: u32, storage_a: u32, storage_b: u32,
+    block_m: u32, block_n: u32, block_k: u32,
+    swz_a: u32, swz_b: u32, swz_cd: u32,
+    stages: u32, cluster: u32, mc_on_a: u32,
+    swap_ab: u32, gemm_type: u32, cd_float: u32, num_sms: u32,
+) -> String {
+    format!(r#"extern "C" __global__ void __dg_kernel(
+    int* grouped_layout, unsigned num_groups, unsigned m, unsigned n, unsigned k,
+    const __grid_constant__ dg::TmaMap tma_a, const __grid_constant__ dg::TmaMap tma_b,
+    const __grid_constant__ dg::TmaMap tma_sfa, const __grid_constant__ dg::TmaMap tma_sfb,
+    const __grid_constant__ dg::TmaMap tma_cd) {{
+    dg::gemm_sm100_impl<{major_a}, {major_b}, {gran_a}, {gran_b}, {has_sf}, {is_mxf4},
+        {fmt_a}, {fmt_b}, {storage_a}, {storage_b}, 1, 1,
+        {block_m}, {block_n}, {block_k}, {swz_a}, {swz_b}, {swz_cd},
+        {stages}, 2, {cluster}, {mc_on_a}, {swap_ab}, (dg::GemmType){gemm_type}, 0, {cd_float}, 2, {num_sms}>
+        (grouped_layout, num_groups, m, n, k, tma_a, tma_b, tma_sfa, tma_sfb, tma_cd);
+}}"#)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mqa_wrapper(heads: u32, head_dim: u32, block_q: u32, split_kv: u32, umma_n: u32,
+               q_stages: u32, kv_stages: u32, tmem_stages: u32,
+               math_threads: u32, num_sms: u32, is_fp4: u32) -> String {
+    format!(r#"extern "C" __global__ void __dg_kernel(
+    unsigned nq, unsigned nkv, unsigned stride, const unsigned* ks, const unsigned* ke, unsigned short* logits,
+    const __grid_constant__ dg::TmaMap tma_q, const __grid_constant__ dg::TmaMap tma_sfq,
+    const __grid_constant__ dg::TmaMap tma_kv, const __grid_constant__ dg::TmaMap tma_sfkv,
+    const __grid_constant__ dg::TmaMap tma_w) {{
+    dg::mqa_logits_sm100_impl<{heads}, {head_dim}, {block_q}, {split_kv}, {umma_n},
+        {q_stages}, {kv_stages}, {tmem_stages}, 128, {math_threads}, {num_sms}, {is_fp4}>
+        (nq, nkv, stride, ks, ke, logits, tma_q, tma_sfq, tma_kv, tma_sfkv, tma_w);
+}}"#)
+}
+
+fn main() {
+    let cli = Cli::parse();
+    let dev = match Device::new(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Failed to init CUDA device 0: {e}");
+            eprintln!("Ensure the CUDA driver is available (e.g. LD_LIBRARY_PATH includes your CUDA lib dir).");
+            std::process::exit(1);
+        }
+    };
+    let stream = DevStream::new(&dev).expect("stream");
+    eprintln!("Device: {} ({:?}), {} SMs, CC {}.{}", dev.name, dev.arch, dev.num_sms, dev.cc.0, dev.cc.1);
+    if !matches!(dev.arch, crate::Arch::Sm100) {
+        eprintln!("warning: kernels target SM100 (B200); this GPU is {:?}", dev.arch);
+    }
+
+    let result = match cli.cmd {
+        Cmd::List => {
+            for b in BENCHES {
+                println!("{b}");
+            }
+            Ok(())
+        }
+        Cmd::Smoke => smoke(&dev),
+        Cmd::Bench { name, m, n, k, groups, iters, warmup } => {
+            if !BENCHES.contains(&name.as_str()) {
+                eprintln!("unknown bench '{name}'. Available:");
+                for b in BENCHES {
+                    eprintln!("  {b}");
+                }
+                std::process::exit(2);
+            }
+            if name == "mqa_logits_fp8" {
+                run_mqa_bench(&dev, &stream, iters, warmup)
+            } else {
+                run_gemm_bench(&dev, &stream, &name, m, n, k, groups, iters, warmup)
+            }
+        }
+    };
+    if let Err(e) = result {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
