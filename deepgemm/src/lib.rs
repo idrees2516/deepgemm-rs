@@ -32,6 +32,7 @@
 pub mod api;
 pub mod api_1d2d;
 pub mod api_hc_prenorm;
+pub mod api_mega_moe;
 pub mod api_sm90_mqa;
 pub mod api_sparse_mqa;
 pub mod device;

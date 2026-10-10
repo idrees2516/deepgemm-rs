@@ -146,7 +146,10 @@ DG_DEVICE void st_async_cluster_16b(uint32_t dst_smem_cluster_addr,
                                     uint32_t a, uint32_t b, uint32_t c, uint32_t d,
                                     uint32_t barrier_cluster_addr) {
     asm volatile(
-        "st.async.shared::cluster.mbarrier::complete_tx::bytes.u32.v4 [%0], {%1, %2, %3, %4}, [%5];"
+        // NOTE: NVRTC 12.9's bundled ptxas rejects upstream's `.u32.v4'
+        // spelling ("Vector Type not specified properly"); the PTX ISA form
+        // `.v4.b32' is equivalent and accepted.
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
         :: "r"(dst_smem_cluster_addr), "r"(a), "r"(b), "r"(c), "r"(d),
            "r"(barrier_cluster_addr)
         : "memory");
@@ -163,6 +166,20 @@ DG_DEVICE void tma_load_4d_2sm(const TmaMap* map, Barrier* bar, void* smem,
            "r"(cvta_shared_to_u32(&bar->barrier_)),
            "r"(c0), "r"(c1), "r"(c2), "r"(c3), "l"(cache_hint)
         : "memory");
+}
+
+// `st.bulk` zero-fill (upstream `ptx::st_shared_bulk`). The size operand
+// must be 64-bit before PTX ISA 9.0 and the address a 64-bit shared window
+// value; prelude.h's 32-bit-operand variant is rejected by ptxas (arguments
+// mismatch) — kept local to this TU, matching upstream's encoding.
+DG_DEVICE uint64_t cvta_shared_to_u64(const void* ptr) {
+    uint64_t r;
+    asm volatile("cvta.to.shared.u64 %0, %1;" : "=l"(r) : "l"(ptr));
+    return r;
+}
+DG_DEVICE void st_shared_bulk(void* smem, uint32_t num_bytes) {
+    asm volatile("st.bulk.weak.shared::cta [%0], %1, 0;"
+                 :: "l"(cvta_shared_to_u64(smem)), "l"((uint64_t)num_bytes) : "memory");
 }
 
 // `tma::copy` (2D, cta_group::2): split the box's inner extent into swizzle
@@ -230,14 +247,10 @@ DG_DEVICE float fast_rcp_f32(float x) {
     asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
     return r;
 }
+// `hmax2_bf16x2` lives in prelude.h (auto-prepended by the JIT engine).
 DG_DEVICE uint32_t hmin2_bf16x2(uint32_t a, uint32_t b) {
     uint32_t r;
     asm volatile("min.bf16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
-    return r;
-}
-DG_DEVICE uint32_t hmax2_bf16x2(uint32_t a, uint32_t b) {
-    uint32_t r;
-    asm volatile("max.bf16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
     return r;
 }
 // Four f32 -> one packed e4m3x4 word (byte order a,b,c,d).
@@ -299,19 +312,19 @@ constexpr uint32_t kSignalsOffCombineReady = moe_align_u32(
     16u /*grid_sync_count[4]*/ + 4u /*nvl_barrier_counter*/ + 8u /*nvl_barrier_signals[2]*/
     + 4u * kNumDeviceLocalityDomains * 4u /*l1/l2/shared_l1/shared_l2 task counts*/,
     128u);
-constexpr uint32_t moe_signals_off_peer_grid_idx(uint32_t num_ranks) {
+constexpr DG_DEVICE uint32_t moe_signals_off_peer_grid_idx(uint32_t num_ranks) {
     return moe_align_u32(kSignalsOffCombineReady + num_ranks * 8u, 128u);
 }
-constexpr uint32_t moe_signals_off_expert_send(uint32_t num_ranks) {
+constexpr DG_DEVICE uint32_t moe_signals_off_expert_send(uint32_t num_ranks) {
     return moe_signals_off_peer_grid_idx(num_ranks) + moe_align_u32(num_ranks * 8u, 128u);
 }
-constexpr uint64_t moe_signals_off_ring(uint32_t num_ranks) {
+constexpr DG_DEVICE uint64_t moe_signals_off_ring(uint32_t num_ranks) {
     return moe_signals_off_expert_send(num_ranks) + 3ull * kNumMaxExperts * 8ull;
 }
-constexpr uint64_t moe_signals_off_shared_l2(uint32_t num_ranks) {
+constexpr DG_DEVICE uint64_t moe_signals_off_shared_l2(uint32_t num_ranks) {
     return moe_signals_off_ring(num_ranks) + (uint64_t)kNumMaxRingBlocks * 20ull;
 }
-constexpr uint64_t moe_signals_num_bytes(uint32_t num_ranks) {
+constexpr DG_DEVICE uint64_t moe_signals_num_bytes(uint32_t num_ranks) {
     return moe_signals_off_shared_l2(num_ranks) + (uint64_t)kNumMaxSharedL2Blocks * 4ull;
 }
 // Shared-L2 input SF capacity (layout::get_num_max_shared_sf_tokens).
@@ -319,7 +332,15 @@ constexpr DG_DEVICE uint32_t moe_shared_sf_tokens(uint32_t num_max_tokens_per_ra
     return (num_max_tokens_per_rank + 7u) / 8u * 128u;
 }
 
+// NOTE (frozen-contract deviation): upstream sizes the per-rank signal
+// slots for the maximum rank count (`kNumMaxRanks`); the frozen host
+// contract `moe_layout.rs` sizes them by the *actual* rank count, so the
+// struct is templated on `kNumRanks` and lands on those formulas exactly
+// (validated by a static_assert inside the kernel for every instantiation).
+template <uint32_t kNumRanks>
 struct alignas(128) MegaMoESignals {
+    static_assert(kNumRanks > 0 and kNumRanks <= kMoeNumMaxRanks, "Invalid rank count");
+
     // Grid and NVLink synchronization
     uint32_t grid_sync_count[kNumMaxGridSyncCounters];
     uint32_t nvl_barrier_counter;
@@ -335,8 +356,8 @@ struct alignas(128) MegaMoESignals {
     // means the peer's L2 writes into this rank are done. Grid indices are
     // unique per launch, so no reset is needed; peers push theirs during
     // dispatch.
-    alignas(128) uint64_t combine_ready_grid_idx[kMoeNumMaxRanks];
-    alignas(128) uint64_t peer_grid_idx[kMoeNumMaxRanks];
+    alignas(128) uint64_t combine_ready_grid_idx[kNumRanks];
+    alignas(128) uint64_t peer_grid_idx[kNumRanks];
 
     // Expert token counts (send: per-source; recv: per-destination;
     // recv_sum: (token_count | num_arrivals << 32) accumulator)
@@ -353,10 +374,10 @@ struct alignas(128) MegaMoESignals {
     // Shared-expert signals
     uint32_t shared_l2_full_count[kNumMaxSharedL2Blocks];
 };
-// The struct must land exactly on the frozen moe_layout.rs formulas.
+// The head offset must land exactly on the frozen moe_layout.rs formula.
 static_assert(kSignalsOffCombineReady == 256, "moe_layout.rs offset_combine_ready");
-static_assert(sizeof(MegaMoESignals) == moe_signals_num_bytes(kMoeNumMaxRanks),
-              "MegaMoESignals layout drift (frozen moe_layout.rs contract)");
+// `sizeof(MegaMoESignals<kNumRanks>) == moe_signals_num_bytes(kNumRanks)` is
+// asserted inside the kernel (per instantiation).
 
 // ===========================================================================
 // 2. SymBuffer — NVLink symmetric-memory rank mapping (passed BY VALUE)
@@ -409,8 +430,9 @@ constexpr DG_DEVICE uint32_t moe_pool_tokens(uint32_t num_ranks,
                          1920u /*kLCMCandidateBlockM*/);
 }
 
+template <uint32_t kNumRanks>
 struct Workspace {
-    MegaMoESignals* signals;
+    MegaMoESignals<kNumRanks>* signals;
     uint32_t num_ranks, num_experts;
     uint32_t num_experts_per_rank;
     uint32_t num_max_tokens_per_rank;
@@ -421,7 +443,7 @@ struct Workspace {
     DG_DEVICE Workspace(void* base, uint32_t num_ranks_, uint32_t num_experts_,
                         uint32_t num_max_tokens_per_rank_, uint32_t num_topk,
                         uint32_t num_ring_tokens)
-        : signals(reinterpret_cast<MegaMoESignals*>(base)),
+        : signals(reinterpret_cast<MegaMoESignals<kNumRanks>*>(base)),
           num_ranks(num_ranks_), num_experts(num_experts_),
           num_max_tokens_per_rank(num_max_tokens_per_rank_) {
         num_experts_per_rank = num_experts / num_ranks;
@@ -439,7 +461,7 @@ struct Workspace {
 
     DG_DEVICE uint64_t get_num_bytes() const {
         uint64_t num_bytes = 0;
-        num_bytes += sizeof(MegaMoESignals);
+        num_bytes += sizeof(MegaMoESignals<kNumRanks>);
         // Source token-topk: [local expert][source rank][token]
         num_bytes += (uint64_t)num_experts * num_max_tokens_per_rank * 4ull;
         // Combine push source indices (full pool span)
@@ -504,7 +526,7 @@ struct Workspace {
                                                    uint32_t token_idx) const {
         const uint64_t offset = ((uint64_t)expert_idx * num_ranks + rank_idx)
                                   * num_max_tokens_per_rank + token_idx;
-        return reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(signals) + sizeof(MegaMoESignals)) + offset;
+        return reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(signals) + sizeof(MegaMoESignals<kNumRanks>)) + offset;
     }
     // For combine usages (full pool span). The metadata region begins where
     // the src-token-topk region of the first `num_experts_per_rank` experts
@@ -562,8 +584,9 @@ struct MoEBuffer {
 // layout::MegaMoEBuffer — the whole symmetric buffer, region by region.
 // (Construction order equals declaration order; every region begins where
 // the previous one ends. `with_sf` is always true for the fp8xfp4 kernel.)
+template <uint32_t kNumRanks>
 struct MegaMoEBuffer {
-    Workspace workspace;
+    Workspace<kNumRanks> workspace;
 
     // Input buffers (per-rank)
     MoEBuffer input_token_buffer, input_sf_buffer,
@@ -652,13 +675,13 @@ DG_DEVICE void cluster_sync_with_relaxed_arrive() {
 // cooperative-groups grid.sync protocol over a sense-tagged counter: SM 0
 // contributes 0x80000000 - (num_sms - 1), everyone else +1; the finisher's
 // carry flips the tag bit, which waiters observe via acquire loads).
-template <uint32_t kNumSMs, uint32_t kGridSyncIndex, typename sync_scope_t>
-DG_DEVICE void grid_sync(const Workspace& workspace, uint32_t sm_idx, uint32_t thread_idx,
+template <uint32_t kNumSMs, uint32_t kGridSyncIndex, uint32_t kNumRanks, typename sync_scope_t>
+DG_DEVICE void grid_sync(const Workspace<kNumRanks>& workspace, uint32_t sm_idx, uint32_t thread_idx,
                          const sync_scope_t& sync_scope) {
     constexpr uint32_t kFinishSumTag = 0x80000000u;
     sync_scope();
     if (thread_idx == 0) {
-        auto count_ptr = workspace.get_grid_sync_count_ptr<kGridSyncIndex>();
+        auto count_ptr = workspace.template get_grid_sync_count_ptr<kGridSyncIndex>();
         const uint32_t old_value = atom_add_rel_u32(
             count_ptr, sm_idx == 0 ? (kFinishSumTag - (kNumSMs - 1)) : 1u);
         uint32_t new_value = 0;
@@ -675,13 +698,13 @@ DG_DEVICE void grid_sync(const Workspace& workspace, uint32_t sm_idx, uint32_t t
 // grid syncs. Degenerates correctly for kNumRanks == 1 (map is identity).
 template <uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads,
           uint32_t kGridSyncIndex, uint32_t kTag, typename sync_scope_t>
-DG_DEVICE void nvlink_barrier(const Workspace& workspace, const SymBuffer<kNumRanks>& sym_buffer,
+DG_DEVICE void nvlink_barrier(const Workspace<kNumRanks>& workspace, const SymBuffer<kNumRanks>& sym_buffer,
                               uint32_t sm_idx, uint32_t thread_idx, const sync_scope_t& sync_scope,
                               bool sync_prologue = true, bool sync_epilogue = true) {
     static_assert(kNumRanks <= kNumThreads, "Insufficient threads");
 
     if (sync_prologue)
-        grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);
+        grid_sync<kNumSMs, kGridSyncIndex, kNumRanks>(workspace, sm_idx, thread_idx, sync_scope);
 
     if (sm_idx == 0) {
         auto* counter_ptr = workspace.get_nvl_barrier_counter_ptr();
@@ -707,7 +730,7 @@ DG_DEVICE void nvlink_barrier(const Workspace& workspace, const SymBuffer<kNumRa
     }
 
     if (sync_epilogue)
-        grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);
+        grid_sync<kNumSMs, kGridSyncIndex, kNumRanks>(workspace, sm_idx, thread_idx, sync_scope);
 }
 
 // ===========================================================================
@@ -843,7 +866,7 @@ struct MegaMoEScheduler {
                   kNumL2Clusters % kNumLocalityDomains == 0,
                   "Each domain must take whole clusters");
 
-    const Workspace& workspace;
+    const Workspace<kNumRanks>& workspace;
 
     // Task-info smem double-buffering (full/empty mbarriers per slot)
     static constexpr uint32_t kNumScheduleStages = 2;
@@ -867,7 +890,7 @@ struct MegaMoEScheduler {
     static constexpr uint32_t kNumMinStealWaves = 2;
     uint32_t sm_locality_domain_idx = 0;
 
-    DG_DEVICE MegaMoEScheduler(const Workspace& workspace_,
+    DG_DEVICE MegaMoEScheduler(const Workspace<kNumRanks>& workspace_,
                                Barrier* task_info_full_barriers_,
                                Barrier* task_info_empty_barriers_,
                                task_info_t* task_infos_)
@@ -1134,43 +1157,43 @@ template <uint32_t kNumExperts, uint32_t kNumDispatchWarps, uint32_t kNumBytesPe
           uint32_t kNumStages, uint32_t LOAD_BLOCK_M, uint32_t BLOCK_K,
           uint32_t SF_BLOCK_M, uint32_t SF_BLOCK_N, uint32_t kNumScheduleStages>
 struct MegaMoeSmemLayout {
-    static constexpr uint32_t off_expert_token_count() { return 0; }
-    static constexpr uint32_t off_dispatch_send_buffer() {
+    static constexpr DG_DEVICE uint32_t off_expert_token_count() { return 0; }
+    static constexpr DG_DEVICE uint32_t off_dispatch_send_buffer() {
         return moe_align_u32(kNumExperts * 4, 1024);
     }
-    static constexpr uint32_t cd_l1_bytes() {
+    static constexpr DG_DEVICE uint32_t cd_l1_bytes() {
         return kNumEpilogueWarpgroups * kNumTMAStoreStages * STORE_BLOCK_M_L1 * L1_OUT_BLOCK_N;
     }
-    static constexpr uint32_t cd_l2_bytes() {
+    static constexpr DG_DEVICE uint32_t cd_l2_bytes() {
         return kNumEpilogueWarpgroups * STORE_BLOCK_M_L2 * BLOCK_N * 2;
     }
-    static constexpr uint32_t off_smem_d() {
+    static constexpr DG_DEVICE uint32_t off_smem_d() {
         return moe_align_u32(off_dispatch_send_buffer() + kNumDispatchWarps * kNumBytesPerPull, 1024);
     }
-    static constexpr uint32_t off_smem_a() {
+    static constexpr DG_DEVICE uint32_t off_smem_a() {
         return moe_align_u32(off_smem_d() + (cd_l1_bytes() > cd_l2_bytes() ? cd_l1_bytes() : cd_l2_bytes()), 1024);
     }
-    static constexpr uint32_t off_smem_b() {
+    static constexpr DG_DEVICE uint32_t off_smem_b() {
         return off_smem_a() + kNumStages * LOAD_BLOCK_M * BLOCK_K;
     }
-    static constexpr uint32_t off_smem_sfa() {
+    static constexpr DG_DEVICE uint32_t off_smem_sfa() {
         return off_smem_b() + kNumStages * LOAD_BLOCK_N * BLOCK_K;
     }
-    static constexpr uint32_t off_smem_sfb() {
+    static constexpr DG_DEVICE uint32_t off_smem_sfb() {
         return off_smem_sfa() + kNumStages * SF_BLOCK_M * (BLOCK_K / 128) * 4;
     }
-    static constexpr uint32_t off_amax_reduction() {
+    static constexpr DG_DEVICE uint32_t off_amax_reduction() {
         return moe_align_u32(off_smem_sfb() + kNumStages * SF_BLOCK_N * (BLOCK_K / 128) * 4, 8);
     }
-    static constexpr uint32_t off_task_infos() {
+    static constexpr DG_DEVICE uint32_t off_task_infos() {
         return moe_align_u32(off_amax_reduction() + kNumEpilogueWarps * (STORE_BLOCK_M_L1 / 2) * 8, 16);
     }
-    static constexpr uint32_t off_dispatch_barriers() {
+    static constexpr DG_DEVICE uint32_t off_dispatch_barriers() {
         return off_task_infos() + kNumScheduleStages * 32;
     }
     // Everything before the barrier arrays is reusable by the combine phase.
-    static constexpr uint32_t reusable_bytes() { return off_dispatch_barriers(); }
-    static constexpr uint32_t num_bytes() {
+    static constexpr DG_DEVICE uint32_t reusable_bytes() { return off_dispatch_barriers(); }
+    static constexpr DG_DEVICE uint32_t num_bytes() {
         uint32_t b = off_dispatch_barriers();
         b += (kNumDispatchWarps + kNumStages * 2 + 2 * 2 + kNumEpilogueWarps * 2 + kNumScheduleStages * 2) * 8;
         b += 4;  // tmem_ptr_in_smem
@@ -1255,6 +1278,35 @@ DG_DEVICE void mega_wait_and_prefetch_next(uint32_t s, uint32_t num_valid_store_
         mega_load_epi_block_if_valid<kNumBuffers, kNumAtomsPerStore, ATOM_M, UMMA_N, WG_BLOCK_M>(
             s + kNumPrefetchStages, num_valid_store_blocks, accum_stage_idx, epilogue_wg_idx,
             raw_values, tmem_empty_barrier);
+}
+
+// ===========================================================================
+// 7.5 Dispatch top-k reader (upstream's generic lambda `read_topk_idx`, as a
+//     namespace-scope template: NVRTC's JIT mode rejects generic lambdas)
+// ===========================================================================
+// Each warp claims a strided range of tokens; within a warp, lane l covers
+// topk slot (l % kNumTopk) of token (base + l / kNumTopk), whose flattened
+// index is base * kNumTopk + l exactly.
+template <uint32_t kNumTopk, uint32_t kNumTokensPerWarp, uint32_t kNumSMs,
+          uint32_t kNumDispatchWarps, typename process_t>
+DG_DEVICE void read_topk_idx(const MoEBuffer& input_topk_idx_buffer, uint32_t num_tokens,
+                             uint32_t sm_idx, uint32_t warp_idx, uint32_t lane_idx,
+                             const process_t& process) {
+    #pragma unroll
+    for (uint32_t i = (sm_idx * kNumDispatchWarps + warp_idx) * kNumTokensPerWarp;
+         i < num_tokens;
+         i += kNumSMs * kNumDispatchWarps * kNumTokensPerWarp) {
+        int expert_idx = -1;
+        if (i + (lane_idx / kNumTopk) < num_tokens and
+            lane_idx < kNumTokensPerWarp * kNumTopk /*kNumActivateLanes*/) {
+            expert_idx = static_cast<int>(
+                reinterpret_cast<const int64_t*>(input_topk_idx_buffer.get_base_ptr())
+                    [i * kNumTopk + lane_idx]);
+            if (expert_idx >= 0)
+                process(i * kNumTopk + lane_idx, expert_idx);
+        }
+        __syncwarp();
+    }
 }
 
 // ===========================================================================
@@ -1365,7 +1417,9 @@ mega_moe_fp8_fp4_impl(void* y,
     }
 
     // Workspaces and buffer
-    const auto buffer = MegaMoEBuffer(
+    static_assert(sizeof(MegaMoESignals<kNumRanks>) == moe_signals_num_bytes(kNumRanks),
+                  "MegaMoESignals layout drift (frozen moe_layout.rs contract)");
+    const auto buffer = MegaMoEBuffer<kNumRanks>(
         sym_buffer.get_base_ptr(),
         kHidden, kIntermediateHidden,
         kNumRanks, kNumExperts,
@@ -1487,8 +1541,8 @@ mega_moe_fp8_fp4_impl(void* y,
     if (warp_idx == 0) {
         // Clean shared memory (zero-fill the expert token counts)
         if (elect_one_sync())
-            st_shared_bulk_zero(shared_storage.expert_token_count,
-                                moe_align_u32(kNumExperts * 4u, kSharedMemoryAlignment));
+            st_shared_bulk(shared_storage.expert_token_count,
+                           moe_align_u32(kNumExperts * 4u, kSharedMemoryAlignment));
     } else if (warp_idx == 1) {
         // Init m-barriers for dispatch
         #pragma unroll
@@ -1588,31 +1642,13 @@ mega_moe_fp8_fp4_impl(void* y,
 
         // ===================== Dispatch warps =====================
         static_assert(kNumTopk <= 32, "Invalid number of topk");
-        constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
-        const auto read_topk_idx = [&](const auto& process) {
-            // Each warp claims a strided range of tokens; within a warp, lane
-            // l covers topk slot (l % kNumTopk) of token (base + l / kNumTopk),
-            // whose flattened index is base * kNumTopk + l exactly.
-            #pragma unroll
-            for (uint32_t i = (sm_idx * kNumDispatchWarps + warp_idx) * kNumTokensPerWarp;
-                 i < num_tokens;
-                 i += kNumSMs * kNumDispatchWarps * kNumTokensPerWarp) {
-                int expert_idx = -1;
-                if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes) {
-                    expert_idx = static_cast<int>(
-                        reinterpret_cast<const int64_t*>(
-                            buffer.input_topk_idx_buffer.get_base_ptr())[i * kNumTopk + lane_idx]);
-                    if (expert_idx >= 0)
-                        process(i * kNumTopk + lane_idx, expert_idx);
-                }
-                __syncwarp();
-            }
-        };
 
         // Count experts' tokens
-        read_topk_idx([&](uint32_t /*token_topk_idx*/, int expert_idx) {
-            atom_add_u32_block(shared_storage.expert_token_count + expert_idx, 1u);
-        });
+        read_topk_idx<kNumTopk, kNumTokensPerWarp, kNumSMs, kNumDispatchWarps>(
+            buffer.input_topk_idx_buffer, num_tokens, sm_idx, warp_idx, lane_idx,
+            [&](uint32_t /*token_topk_idx*/, int expert_idx) {
+                atom_add_u32_block(shared_storage.expert_token_count + expert_idx, 1u);
+            });
         sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Get SM offsets: pack (arrival tag << 32 | count) and swap the local
@@ -1628,16 +1664,18 @@ mega_moe_fp8_fp4_impl(void* y,
         // Write source indices (~2 us with 512 tokens): each token-topk claims
         // its slot on the destination rank via a local atomic, then writes its
         // flattened token*topk+slot index into the destination's workspace.
-        read_topk_idx([&](uint32_t token_topk_idx, int expert_idx) {
-            const uint32_t dst_rank_idx = (uint32_t)expert_idx / kNumExpertsPerRank;
-            const uint32_t dst_slot_idx = atom_add_u32_block(shared_storage.expert_token_count + expert_idx, 1u);
-            auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
-                (uint32_t)expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
-            *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
-        });
+        read_topk_idx<kNumTopk, kNumTokensPerWarp, kNumSMs, kNumDispatchWarps>(
+            buffer.input_topk_idx_buffer, num_tokens, sm_idx, warp_idx, lane_idx,
+            [&](uint32_t token_topk_idx, int expert_idx) {
+                const uint32_t dst_rank_idx = (uint32_t)expert_idx / kNumExpertsPerRank;
+                const uint32_t dst_slot_idx = atom_add_u32_block(shared_storage.expert_token_count + expert_idx, 1u);
+                auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
+                    (uint32_t)expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
+                *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+            });
 
         // Grid sync
-        grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+        grid_sync<kNumSMs, kDispatchGridSyncIndex, kNumRanks>(
             workspace, sm_idx, thread_idx,
             [=]() { sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); });
 
@@ -2543,10 +2581,10 @@ mega_moe_fp8_fp4_impl(void* y,
                         const uint4 packed = ld_shared_u128(reinterpret_cast<const uint32_t*>(smem_ptr));
 
                         // Write into the remote combine buffer (each lane one
-                        // float4 = 16B slice of the token's hidden row)
+                        // uint4 = 16B slice of the token's hidden row)
                         const auto dst_token = buffer.combine_token_buffer.get_rank_buffer(meta.topk_idx)
                                                    .get_data_buffer(meta.token_idx);
-                        auto dst_ptr = reinterpret_cast<float4*>(reinterpret_cast<uint8_t*>(dst_token.get_base_ptr())
+                        auto dst_ptr = reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(dst_token.get_base_ptr())
                             + n_idx * 2u /*sizeof(bf16)*/ + (lane_idx % 16) * 16u);
                         *sym_buffer.map(dst_ptr, meta.rank_idx) = packed;
                     }
@@ -2610,7 +2648,7 @@ mega_moe_fp8_fp4_impl(void* y,
             peer_grid_idx = *workspace.get_peer_grid_idx_ptr(epilogue_thread_idx);
 
         // All local L2 writes are done after this grid sync
-        grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
+        grid_sync<kNumSMs, kEpilogueGridSyncIndex, kNumRanks>(
             workspace, sm_idx, epilogue_thread_idx,
             [&]() { sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); });
 

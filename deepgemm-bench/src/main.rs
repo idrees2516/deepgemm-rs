@@ -771,6 +771,44 @@ fn kernel_variants(arch: &str) -> Vec<(&'static str, &'static str, String)> {
                 kernel_src::LOCALITY_PROBE,
                 deepgemm::locality::locality_probe_body(8),
             ),
+            // Wave-3: the MegaMoE megakernel (fp8 activations x FP8/FP4
+            // weights, single fused dispatch + grouped-GEMM + combine launch).
+            (
+                "mega moe fp8xfp4 rank1",
+                deepgemm::api_mega_moe::mega_moe_unit(),
+                {
+                    let (ring, sf_ring) = deepgemm::api_mega_moe::mega_moe_ring_tokens(
+                        1, 256, 1920, 8, 148, 7168, 2048,
+                    )
+                    .unwrap();
+                    let cfg = deepgemm::api_mega_moe::MegaMoeConfig::new(
+                        1, 256, 1920, 1920, 8, 7168, 2048, ring, sf_ring, 0, 148,
+                        deepgemm::types::Dtype::Fp4,
+                        None,
+                        true,
+                    )
+                    .unwrap();
+                    deepgemm::api_mega_moe::mega_moe_body(&cfg)
+                },
+            ),
+            (
+                "mega moe fp8xfp4 rank4",
+                deepgemm::api_mega_moe::mega_moe_unit(),
+                {
+                    let (ring, sf_ring) = deepgemm::api_mega_moe::mega_moe_ring_tokens(
+                        4, 256, 1920, 8, 148, 7168, 2048,
+                    )
+                    .unwrap();
+                    let cfg = deepgemm::api_mega_moe::MegaMoeConfig::new(
+                        4, 256, 1920, 1920, 8, 7168, 2048, ring, sf_ring, 2, 148,
+                        deepgemm::types::Dtype::Fp8,
+                        None,
+                        true,
+                    )
+                    .unwrap();
+                    deepgemm::api_mega_moe::mega_moe_body(&cfg)
+                },
+            ),
             (
                 "gemm fp8 nt quant-out m128 n256",
                 kernel_src::GEMM_SM100,

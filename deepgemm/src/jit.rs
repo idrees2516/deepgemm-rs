@@ -28,6 +28,7 @@ pub mod kernel_src {
     pub const HC_PRENORM: &str = include_str!("../kernels/hc_prenorm.cu");
     pub const GEMM_SM90_1D2D: &str = include_str!("../kernels/gemm_sm90_1d2d.cu");
     pub const LOCALITY_PROBE: &str = include_str!("../kernels/locality_probe.cu");
+    pub const MEGA_MOE: &str = include_str!("../kernels/mega_moe_sm100.cu");
     pub const WGMMA_H: &str = include_str!("../kernels/wgmma.h");
     pub const GEMM_SM90_CU: &str = include_str!("../kernels/gemm_sm90.cu");
 
