@@ -326,7 +326,7 @@ fn smoke(dev: &Device) -> DgResult<()> {
         dev.arch.nvrtc_arch()
     );
     let mut n_ok = 0;
-    let variants = kernel_variants();
+    let variants = kernel_variants(&dev.arch.nvrtc_arch().to_string());
     for (name, src, body) in &variants {
         match jit::smoke_compile(dev, src, "smoke", body) {
             Ok(()) => {
@@ -351,17 +351,10 @@ fn compile_check(arch_arg: Option<String>) -> DgResult<()> {
         .or_else(|| std::env::var("DG_ARCH").ok())
         .unwrap_or_else(|| "100a".into());
     match arch.as_str() {
-        "100a" | "103a" | "120a" => {}
-        "90a" => {
-            return Err(DgError::InvalidArg(
-                "arch 90a (Hopper): the kernel suite is tcgen05-based and requires SM100+; \
-                 use 100a / 103a / 120a"
-                    .into(),
-            ));
-        }
+        "90a" | "100a" | "103a" | "120a" => {}
         other => {
             return Err(DgError::InvalidArg(format!(
-                "unknown arch {other:?}; use 100a / 103a / 120a"
+                "unknown arch {other:?}; use 90a / 100a / 103a / 120a"
             )));
         }
     }
@@ -374,7 +367,7 @@ fn compile_check(arch_arg: Option<String>) -> DgResult<()> {
     println!("  PTX  pass: --gpu-architecture=compute_{arch} (the runtime JIT path)");
     println!("  CUBIN pass: --gpu-architecture=sm_{arch} (full SASS backend)");
     let t0 = std::time::Instant::now();
-    let variants = kernel_variants();
+    let variants = kernel_variants(&arch);
     let mut n_ok = 0;
     for (name, src, body) in &variants {
         match jit::compile_check_kernel(src, body, &arch, "compile-check") {
@@ -406,8 +399,13 @@ fn compile_check(arch_arg: Option<String>) -> DgResult<()> {
 /// Covers every translation unit and every code path: mxf4 / mxf8f6f4 / f16
 /// MMAs, SF/UTCCP paths, swap-AB, m-grouped (contiguous+masked), batched,
 /// MQA logits in FP8 and FP4, quant/dequant/transform_sf.
-fn kernel_variants() -> Vec<(&'static str, &'static str, String)> {
-    vec![
+/// Kernel-variant list for compile checks, filtered by target arch family.
+/// Arch-neutral units (layout/quant) compile under every arch; the tcgen05
+/// (SM100) and wgmma (SM90) GEMMs are mutually exclusive across these arches
+/// (ptxas rejects tcgen05 below sm_100 and wgmma above sm_90).
+fn kernel_variants(arch: &str) -> Vec<(&'static str, &'static str, String)> {
+    let sm100_family = matches!(arch, "100a" | "103a" | "120a");
+    let mut v: Vec<(&'static str, &'static str, String)> = vec![
         (
             "transform_sf k=16",
             kernel_src::LAYOUT_QUANT,
@@ -443,55 +441,163 @@ fn kernel_variants() -> Vec<(&'static str, &'static str, String)> {
             kernel_src::LAYOUT_QUANT,
             r#"extern "C" __global__ void __dg_kernel(const unsigned char* d, const unsigned* sf, unsigned m, unsigned k, unsigned t, float* o) { dg::dequant_mx_impl<1, 32>(d, sf, m, k, t, o); }"#.to_string(),
         ),
-        (
-            "gemm fp8 nt m128 n256 k128 c2",
-            kernel_src::GEMM_SM100,
-            gemm_wrapper(
-                0, 0, 32, 32, 1, 0, 0, 0, 1, 1, 128, 256, 128, 128, 128, 128, 12, 2, 0, 0, 0, 0,
-                148,
+    ];
+    if sm100_family {
+        v.extend([
+            (
+                "gemm fp8 nt m128 n256 k128 c2",
+                kernel_src::GEMM_SM100,
+                gemm_wrapper(
+                    0, 0, 32, 32, 1, 0, 0, 0, 1, 1, 128, 256, 128, 128, 128, 128, 12, 2, 0, 0, 0, 0, 148,
+                ),
             ),
-        ),
-        (
-            "gemm fp4 nt m128 n256 k256 c2",
-            kernel_src::GEMM_SM100,
-            gemm_wrapper(
-                0, 0, 32, 32, 1, 1, 5, 5, 1, 1, 128, 256, 256, 128, 128, 256, 8, 2, 0, 0, 0, 0, 148,
+            (
+                "gemm fp4 nt m128 n256 k256 c2",
+                kernel_src::GEMM_SM100,
+                gemm_wrapper(
+                    0, 0, 32, 32, 1, 1, 5, 5, 1, 1, 128, 256, 256, 128, 128, 256, 8, 2, 0, 0, 0, 0, 148,
+                ),
             ),
-        ),
-        (
-            "gemm bf16 nt m128 n128 k64 c1",
-            kernel_src::GEMM_SM100,
-            gemm_wrapper(
-                0, 0, 32, 32, 0, 0, 1, 1, 2, 2, 128, 128, 64, 128, 128, 128, 20, 1, 0, 0, 0, 0, 148,
+            (
+                "gemm bf16 nt m128 n128 k64 c1",
+                kernel_src::GEMM_SM100,
+                gemm_wrapper(
+                    0, 0, 32, 32, 0, 0, 1, 1, 2, 2, 128, 128, 64, 128, 128, 128, 20, 1, 0, 0, 0, 0, 148,
+                ),
             ),
-        ),
-        (
-            "gemm fp8 swapab masked c2",
-            kernel_src::GEMM_SM100,
-            gemm_wrapper(
-                0, 0, 32, 32, 1, 0, 0, 0, 1, 1, 128, 128, 128, 128, 128, 128, 12, 2, 1, 1, 2, 0,
-                148,
+            (
+                "gemm fp8 swapab masked c2",
+                kernel_src::GEMM_SM100,
+                gemm_wrapper(
+                    1, 1, 32, 32, 1, 0, 0, 0, 1, 1, 128, 128, 128, 128, 128, 128, 12, 2, 1, 1, 2, 0, 148,
+                ),
             ),
-        ),
-        (
-            "gemm fp8 batched c2",
-            kernel_src::GEMM_SM100,
-            gemm_wrapper(
-                0, 0, 32, 32, 1, 0, 0, 0, 1, 1, 128, 128, 128, 128, 128, 128, 12, 2, 0, 0, 4, 0,
-                148,
+            (
+                "gemm fp8 batched c2",
+                kernel_src::GEMM_SM100,
+                gemm_wrapper(
+                    0, 0, 32, 32, 1, 0, 0, 0, 1, 1, 128, 128, 128, 128, 128, 128, 12, 2, 0, 0, 4, 0, 148,
+                ),
             ),
-        ),
-        (
-            "mqa fp8 h64 d128",
-            kernel_src::MQA_LOGITS,
-            mqa_wrapper(64, 128, 2, 256, 128, 2, 2, 2, 256, 148, 0),
-        ),
-        (
-            "mqa fp4 h64 d128",
-            kernel_src::MQA_LOGITS,
-            mqa_wrapper(64, 128, 2, 256, 128, 2, 2, 2, 256, 148, 1),
-        ),
-    ]
+            (
+                "mqa fp8 h64 d128",
+                kernel_src::MQA_LOGITS,
+                mqa_wrapper(64, 128, 2, 256, 128, 2, 2, 2, 256, 148, 0),
+            ),
+            (
+                "mqa fp4 h64 d128",
+                kernel_src::MQA_LOGITS,
+                mqa_wrapper(64, 128, 2, 256, 128, 2, 2, 2, 256, 148, 1),
+            ),
+        ]);
+    } else {
+        // sm_90a: wgmma suite. Stage counts verified against the SM90 smem
+        // budget (232448B) by heuristics::sm90 (see tests/heuristics tests).
+        v.extend([
+            (
+                "sm90 fp8 1d1d m128 n64 c2",
+                kernel_src::sm90_unit(),
+                sm90_fp8_wrapper(128, 64, 128, 6, 2, true, 0, 148, 0, 0, 0),
+            ),
+            (
+                "sm90 fp8 1d1d m128 n128 c1",
+                kernel_src::sm90_unit(),
+                sm90_fp8_wrapper(128, 128, 128, 4, 1, true, 0, 148, 0, 0, 0),
+            ),
+            (
+                "sm90 fp8 1d1d kgrouped",
+                kernel_src::sm90_unit(),
+                sm90_fp8_wrapper(128, 128, 128, 4, 1, true, 5, 148, 0, 0, 0),
+            ),
+            (
+                "sm90 bf16 nt m128 n64 c2",
+                kernel_src::sm90_unit(),
+                sm90_bf16_wrapper(0, 0, 128, 64, 64, 128, 128, 128, 8, 2, true, 0, false, 1, 148),
+            ),
+            (
+                "sm90 bf16 merge-stages m64 n32",
+                kernel_src::sm90_unit(),
+                sm90_bf16_wrapper(0, 0, 64, 32, 64, 128, 128, 64, 16, 1, true, 0, false, 1, 148),
+            ),
+            (
+                "sm90 bf16 fp32out mnB mgrouped",
+                kernel_src::sm90_unit(),
+                sm90_bf16_wrapper(0, 1, 128, 64, 64, 128, 128, 0, 8, 1, true, 1, true, 0, 148),
+            ),
+        ]);
+    }
+    v
+}
+
+/// Instantiation wrapper for the SM90 FP8 1D1D kernel (compile-check form).
+#[allow(clippy::too_many_arguments)]
+fn sm90_fp8_wrapper(
+    block_m: u32,
+    block_n: u32,
+    block_k: u32,
+    stages: u32,
+    multicast: u32,
+    mc_on_a: bool,
+    gemm_type: u32,  // 0 Normal, 5 KGroupedContiguous (enum value)
+    num_sms: u32,
+    shape_m: u32,
+    shape_n: u32,
+    shape_k: u32,
+) -> String {
+    format!(
+        r#"extern "C" __global__ void __dg_kernel(
+    const unsigned char* a, const unsigned char* b,
+    int* grouped_layout, dg::TmaMap* map_buf,
+    unsigned m, unsigned n, unsigned k,
+    const __grid_constant__ dg::TmaMap tma_a, const __grid_constant__ dg::TmaMap tma_b,
+    const __grid_constant__ dg::TmaMap tma_sfa, const __grid_constant__ dg::TmaMap tma_sfb,
+    const __grid_constant__ dg::TmaMap tma_cd) {{
+    dg::sm90_fp8_gemm_1d1d_impl<{shape_m}, {shape_n}, {shape_k}, 1,
+        {block_m}, {block_n}, {block_k}, 128, 128,
+        {stages}, 128, {math_threads}, {multicast}, {mc}, {num_sms},
+        (dg::GemmType){gemm_type}>
+        (a, b, grouped_layout, map_buf, m, n, k, tma_a, tma_b, tma_sfa, tma_sfb, tma_cd);
+}}"#,
+        math_threads = if block_m <= 64 { 128 } else { 256 },
+        mc = mc_on_a as u32,
+    )
+}
+
+/// Instantiation wrapper for the SM90 BF16 kernel (compile-check form).
+/// `cd`: 1=BF16 out, 0=FP32 out. `swz_d`: TMA D swizzle bytes (0 for FP32).
+#[allow(clippy::too_many_arguments)]
+fn sm90_bf16_wrapper(
+    major_a: u32,
+    major_b: u32,
+    block_m: u32,
+    block_n: u32,
+    block_k: u32,
+    swz_a: u32,
+    swz_b: u32,
+    swz_d: u32,
+    stages: u32,
+    multicast: u32,
+    mc_on_a: bool,
+    gemm_type: u32,
+    with_accum: bool,
+    cd: u32,
+    num_sms: u32,
+) -> String {
+    format!(
+        r#"extern "C" __global__ void __dg_kernel(
+    int* grouped_layout, unsigned m, unsigned n, unsigned k,
+    const __grid_constant__ dg::TmaMap tma_a, const __grid_constant__ dg::TmaMap tma_b,
+    const __grid_constant__ dg::TmaMap tma_cd) {{
+    dg::sm90_bf16_gemm_impl<{major_a}, {major_b}, 0, 0, 0, 1,
+        {block_m}, {block_n}, {block_k}, {swz_a}, {swz_b}, {swz_d},
+        {stages}, 128, {math_threads}, {multicast}, {mc}, {num_sms},
+        (dg::GemmType){gemm_type}, {with}, {cd}>
+        (grouped_layout, m, n, k, tma_a, tma_b, tma_cd);
+}}"#,
+        math_threads = if block_m <= 64 { 128 } else { 256 },
+        mc = mc_on_a as u32,
+        with = with_accum as u32,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

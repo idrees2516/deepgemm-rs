@@ -174,10 +174,11 @@ DG_DEVICE void warpgroup_wait_group() {
 // accumulator may hold garbage between blocks.
 template <uint32_t N>
 DG_DEVICE void wgmma_f8(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t scale_d) {
+    static_assert(N % 8 == 0 && 8 <= N && N <= 256, "unsupported wgmma_f8 N");
     switch (N) {
 """
 
-FOOTER = """        default: DG_STATIC_ASSERT(N == 0, "unsupported wgmma_f8 N");
+FOOTER = """        default: break;  // unreachable for supported N (switch folds)
     }
 }
 
@@ -186,10 +187,11 @@ FOOTER = """        default: DG_STATIC_ASSERT(N == 0, "unsupported wgmma_f8 N");
 // (GMMA::Major::K = 0, GMMA::Major::MN = 1).
 template <uint32_t N, uint32_t kTransA, uint32_t kTransB>
 DG_DEVICE void wgmma_bf16(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t scale_d) {
+    static_assert(N % 8 == 0 && 8 <= N && N <= 256, "unsupported wgmma_bf16 N");
     switch (N) {
 """
 
-FOOTER2 = """        default: DG_STATIC_ASSERT(N == 0, "unsupported wgmma_bf16 N");
+FOOTER2 = """        default: break;
     }
 }
 
@@ -199,10 +201,12 @@ FOOTER2 = """        default: DG_STATIC_ASSERT(N == 0, "unsupported wgmma_bf16 N
 template <uint32_t N>
 DG_DEVICE void wgmma_tf32_rs(float a0, float a1, float a2, float a3,
                              uint64_t desc_b, float* d, uint32_t scale_d) {
+    static_assert(N == 8 || N == 16 || N == 32 || N == 64 || N == 128 || N == 256,
+                  "unsupported wgmma_tf32 N");
     switch (N) {
 """
 
-FOOTER3 = """        default: DG_STATIC_ASSERT(N == 0, "unsupported wgmma_tf32 N");
+FOOTER3 = """        default: break;
     }
 }
 

@@ -23,6 +23,21 @@ pub mod kernel_src {
     pub const GEMM_SM100: &str = include_str!("../kernels/gemm_sm100.cu");
     pub const LAYOUT_QUANT: &str = include_str!("../kernels/layout_quant.cu");
     pub const MQA_LOGITS: &str = include_str!("../kernels/mqa_logits_sm100.cu");
+    pub const WGMMA_H: &str = include_str!("../kernels/wgmma.h");
+    pub const GEMM_SM90_CU: &str = include_str!("../kernels/gemm_sm90.cu");
+
+    /// SM100 unit: prelude (auto-prepended by get_kernel) + gemm_sm100.cu.
+    pub fn sm100_unit() -> &'static str {
+        GEMM_SM100
+    }
+
+    /// SM90 unit: prelude (auto-prepended) + wgmma.h + gemm_sm90.cu.
+    /// wgmma.h must come first: gemm_sm90.cu's descriptor builders and both
+    /// kernels reference the wgmma layer.
+    pub fn sm90_unit() -> &'static str {
+        static U: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        U.get_or_init(|| format!("{WGMMA_H}\n{GEMM_SM90_CU}")).as_str()
+    }
 }
 
 struct SendPtr<T>(T);
@@ -275,7 +290,15 @@ pub fn compile_check_kernel(
     ensure_nvrtc()?;
     let source = format!("{PRELUDE}\n{source_tu}\n{body}");
     let ptx = compile_ptx_cached(&source, arch, tag)?;
-    let cubin_len = compile_cubin(&source, arch, tag).ok().map(|v| v.len());
+    let cubin_len = compile_cubin(&source, arch, tag)
+        .map_err(|e| {
+            // PTX passed but ptxas (SASS) failed: surface the reason —
+            // a kernel that cannot reach SASS will not run on hardware.
+            eprintln!("warning: SASS generation failed for {tag} (arch {arch}): {e}");
+            e
+        })
+        .ok()
+        .map(|v| v.len());
     Ok(CompileCheckResult {
         ptx_len: ptx.len(),
         cubin_len,

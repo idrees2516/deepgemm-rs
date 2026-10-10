@@ -92,6 +92,7 @@ DG_DEVICE void warpgroup_wait_group() {
 // accumulator may hold garbage between blocks.
 template <uint32_t N>
 DG_DEVICE void wgmma_f8(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t scale_d) {
+    static_assert(N % 8 == 0 && 8 <= N && N <= 256, "unsupported wgmma_f8 N");
     switch (N) {
 
         case 8:
@@ -446,7 +447,7 @@ DG_DEVICE void wgmma_f8(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t sca
                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]), "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]), "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]), "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]), "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]), "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]), "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]), "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63]), "+f"(d[64]), "+f"(d[65]), "+f"(d[66]), "+f"(d[67]), "+f"(d[68]), "+f"(d[69]), "+f"(d[70]), "+f"(d[71]), "+f"(d[72]), "+f"(d[73]), "+f"(d[74]), "+f"(d[75]), "+f"(d[76]), "+f"(d[77]), "+f"(d[78]), "+f"(d[79]), "+f"(d[80]), "+f"(d[81]), "+f"(d[82]), "+f"(d[83]), "+f"(d[84]), "+f"(d[85]), "+f"(d[86]), "+f"(d[87]), "+f"(d[88]), "+f"(d[89]), "+f"(d[90]), "+f"(d[91]), "+f"(d[92]), "+f"(d[93]), "+f"(d[94]), "+f"(d[95]), "+f"(d[96]), "+f"(d[97]), "+f"(d[98]), "+f"(d[99]), "+f"(d[100]), "+f"(d[101]), "+f"(d[102]), "+f"(d[103]), "+f"(d[104]), "+f"(d[105]), "+f"(d[106]), "+f"(d[107]), "+f"(d[108]), "+f"(d[109]), "+f"(d[110]), "+f"(d[111]), "+f"(d[112]), "+f"(d[113]), "+f"(d[114]), "+f"(d[115]), "+f"(d[116]), "+f"(d[117]), "+f"(d[118]), "+f"(d[119]), "+f"(d[120]), "+f"(d[121]), "+f"(d[122]), "+f"(d[123]), "+f"(d[124]), "+f"(d[125]), "+f"(d[126]), "+f"(d[127])
                 : "l"(desc_a), "l"(desc_b), "r"(scale_d), "n"(1), "n"(1));
             break;
-        default: DG_STATIC_ASSERT(N == 0, "unsupported wgmma_f8 N");
+        default: break;  // unreachable for supported N (switch folds)
     }
 }
 
@@ -455,6 +456,7 @@ DG_DEVICE void wgmma_f8(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t sca
 // (GMMA::Major::K = 0, GMMA::Major::MN = 1).
 template <uint32_t N, uint32_t kTransA, uint32_t kTransB>
 DG_DEVICE void wgmma_bf16(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t scale_d) {
+    static_assert(N % 8 == 0 && 8 <= N && N <= 256, "unsupported wgmma_bf16 N");
     switch (N) {
 
         case 8:
@@ -841,7 +843,7 @@ DG_DEVICE void wgmma_bf16(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t s
                 : "l"(desc_a), "l"(desc_b), "r"(scale_d),
                   "n"(1), "n"(1), "n"(int32_t(kTransA)), "n"(int32_t(kTransB)));
             break;
-        default: DG_STATIC_ASSERT(N == 0, "unsupported wgmma_bf16 N");
+        default: break;
     }
 }
 
@@ -851,6 +853,8 @@ DG_DEVICE void wgmma_bf16(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t s
 template <uint32_t N>
 DG_DEVICE void wgmma_tf32_rs(float a0, float a1, float a2, float a3,
                              uint64_t desc_b, float* d, uint32_t scale_d) {
+    static_assert(N == 8 || N == 16 || N == 32 || N == 64 || N == 128 || N == 256,
+                  "unsupported wgmma_tf32 N");
     switch (N) {
 
         case 8:
@@ -925,7 +929,7 @@ DG_DEVICE void wgmma_tf32_rs(float a0, float a1, float a2, float a3,
                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(desc_b),
                   "r"(scale_d), "n"(1), "n"(1));
             break;
-        default: DG_STATIC_ASSERT(N == 0, "unsupported wgmma_tf32 N");
+        default: break;
     }
 }
 

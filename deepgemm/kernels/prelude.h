@@ -286,6 +286,11 @@ DG_DEVICE void tma_store_wait() {
 // ---------------------------------------------------------------------------
 // TMA (cp.async.bulk.tensor / cp.async.bulk)
 // ---------------------------------------------------------------------------
+// 64-bit cache-hint descriptor for `.L2::cache_hint` ("l" register operand).
+// 0x10...0 = access_property::normal (upstream DeepGEMM / CUDA access-policy
+// encoding). Must stay uint64_t — a uint32_t silently truncates to 0 (no hint).
+constexpr uint64_t kEvictNormalHint = 0x1000000000000000ull;
+
 // 128-byte aligned tensor map passed by value as a kernel parameter.
 struct alignas(64) TmaMap {
     uint64_t data_[16];
@@ -306,14 +311,17 @@ DG_DEVICE void tma_load_2d(const TmaMap* map, Barrier* bar, void* smem,
         : "memory");
 }
 
-// 2D multicast load (SM90 path).
+// 2D multicast load (SM90 path). NOTE operand order for the multicast form:
+// [dstSmem], [tensorMap, {coords}], [mbar], ctaMask, cachePolicy — the policy
+// operand is REQUIRED whenever `.L2::cache_hint` is in the opcode string.
 DG_DEVICE void tma_load_2d_multicast(const TmaMap* map, Barrier* bar, void* smem,
                                      uint16_t cta_mask, uint32_t c_inner, uint32_t c_outer) {
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
-        " [%0], [%1, {%4, %5}], [%2], %3;"
+        " [%0], [%1, {%4, %5}], [%2], %3, %6;"
         :: "r"(cvta_shared_to_u32(smem)), "l"(map),
-           "r"(cvta_shared_to_u32(&bar->barrier_)), "h"(cta_mask), "r"(c_inner), "r"(c_outer)
+           "r"(cvta_shared_to_u32(&bar->barrier_)), "h"(cta_mask), "r"(c_inner), "r"(c_outer),
+           "l"(kEvictNormalHint)
         : "memory");
 }
 
@@ -858,7 +866,7 @@ enum class GemmType : uint32_t {
     KGroupedContiguous = 5,
 };
 
-DG_DEVICE bool gemm_type_is_m_grouped_contiguous(GemmType t) { return t == GemmType::MGroupedContiguous; }
+DG_DEVICE constexpr bool gemm_type_is_m_grouped_contiguous(GemmType t) { return t == GemmType::MGroupedContiguous; }
 // `KGroupedContiguousWithPsumLayout` (upstream's second k-grouped flavor,
 // psum-accumulating weight-grad) is intentionally not ported; the plain
 // KGroupedContiguous flavor covers the fused weight-grad GEMM use case.
@@ -1068,11 +1076,6 @@ DG_DEVICE uint32_t inner_block_atom_size() {
 // UMMA majors, cache hints, and descriptor builders (mma/sm100.cuh port)
 // ---------------------------------------------------------------------------
 enum : uint32_t { MAJOR_K = 0, MAJOR_MN = 1 };
-// 64-bit cache-hint descriptor for `.L2::cache_hint` ("l" register operand).
-// 0x10...0 = access_property::normal (upstream DeepGEMM / CUDA access-policy
-// encoding). Must stay uint64_t — a uint32_t silently truncates to 0 (no hint).
-constexpr uint64_t kEvictNormalHint = 0x1000000000000000ull;
-
 constexpr DG_DEVICE uint32_t get_atom_base(UmmaLayoutType layout_type) {
     return layout_type == UmmaLayoutType::SWIZZLE_128B_BASE32B ? 32u : 16u;
 }
