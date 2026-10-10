@@ -274,9 +274,9 @@ fn run_fp8_1d1d(
     // Grouped-layout + tensormap scratch for kk.
     let gl_buf;
     let map_buf;
-    let gl_ptr;
-    let map_ptr;
-    if is_kk {
+    
+    
+    let (gl_ptr, map_ptr) = if is_kk {
         let ks = ks.unwrap();
         gl_buf = alloc_and_upload(
             dev,
@@ -285,12 +285,10 @@ fn run_fp8_1d1d(
         )?;
         // 2 descriptors (256B) per CTA, 128B-aligned base.
         map_buf = DevBuffer::alloc(dev, (dev.num_sms as usize) * 2 * 128)?;
-        gl_ptr = gl_buf.ptr;
-        map_ptr = map_buf.ptr;
+        (gl_buf.ptr, map_buf.ptr)
     } else {
-        gl_ptr = 0;
-        map_ptr = 0;
-    }
+        (0, 0)
+    };
 
     let gt = if is_kk { 5 } else { 0 };
     let sig = format!("{:?}", (cfg, gt, is_kk, x.a.k));

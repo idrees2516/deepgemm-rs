@@ -432,7 +432,7 @@ pub fn make_tma_mqa_qk_paged(
             (head_dim / pack) as u64 * dtype.elem_size() as u64,
             (head_dim / pack) as u64 * dtype.elem_size() as u64 * page_kv as u64,
         ],
-        &[(head_dim / pack) as u32, page_kv, 1],
+        &[(head_dim / pack), page_kv, 1],
         &[1, 1, 1],
         sys::tm_interleave_none(),
         sys::tm_swizzle(swizzle),

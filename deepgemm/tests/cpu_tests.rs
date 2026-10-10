@@ -256,7 +256,7 @@ mod runtime_tests {
     fn size_classes_are_2mib_buckets() {
         // (private helper; re-derived here to avoid dead-code warnings)
         fn cls(b: usize) -> usize {
-            (b.max(1) + (2 << 20) - 1) / (2 << 20) * (2 << 20)
+            b.max(1).div_ceil(2 << 20) * (2 << 20)
         }
         assert_eq!(cls(1), 2 << 20);
         assert_eq!(cls(2 << 20), 2 << 20);
@@ -276,8 +276,8 @@ mod moe_layout_tests {
         let recv = 2 * 128;
         let epr = 32;
         let want = {
-            let raw = recv * (8u32.min(32)) + epr * 239;
-            (raw + 1919) / 1920 * 1920
+            let raw = recv * 8u32 + epr * 239;
+            raw.div_ceil(1920) * 1920
         };
         assert_eq!(t, want);
         // Single rank degenerate case.

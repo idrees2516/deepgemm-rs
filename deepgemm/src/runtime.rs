@@ -29,7 +29,7 @@
 //! # }
 //! ```
 use crate::device::{DevBuffer, DevStream, Device};
-use crate::error::{DgError, DgResult};
+use crate::error::DgResult;
 use crate::jit;
 use crate::sys;
 use std::collections::HashMap;
@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex};
 /// handful of distinct shapes hit the same buckets.
 fn size_class(bytes: usize) -> usize {
     const CLASS: usize = 2 << 20;
-    (bytes.max(1) + CLASS - 1) / CLASS * CLASS
+    bytes.max(1).div_ceil(CLASS) * CLASS
 }
 
 struct Pool {

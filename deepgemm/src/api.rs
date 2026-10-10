@@ -1191,7 +1191,7 @@ pub fn quantize_output_fp8(
         .u32(n)
         .u32(tma_aligned)
         .u32(tma_aligned);
-    let total = (m * (n / 32)) as u32;
+    let total = m * (n / 32);
     jit::launch(
         dev,
         func,

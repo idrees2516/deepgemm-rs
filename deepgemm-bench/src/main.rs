@@ -116,7 +116,7 @@ fn make_sf(
 /// cache; measures effective tokens/s (the serving metric) as well as TFLOPS.
 fn run_mqa_paged_bench(dev: &Device, stream: &DevStream, iters: u32, warmup: u32) -> DgResult<()> {
     use deepgemm::device::alloc_and_upload;
-    use deepgemm::types::SfTensor;
+    
 
     let num_requests = 512u32;
     let ctx_len = 512u32;
@@ -381,7 +381,7 @@ fn run_gemm_bench(
                 let per = m / groups;
                 let masked: Vec<i32> = (0..groups).map(|_| per as i32).collect();
                 let masked_buf = alloc_and_upload(dev, &masked, stream.raw())?;
-                let per = m / groups;
+                let _per = m / groups;
                 let a2 = Operand {
                     dtype: Dtype::Bf16,
                     major: Major::K,
@@ -531,7 +531,7 @@ fn smoke(dev: &Device) -> DgResult<()> {
         dev.arch.nvrtc_arch()
     );
     let mut n_ok = 0;
-    let variants = kernel_variants(&dev.arch.nvrtc_arch().to_string());
+    let variants = kernel_variants(dev.arch.nvrtc_arch());
     for (name, src, body) in &variants {
         match jit::smoke_compile(dev, src, "smoke", body) {
             Ok(()) => {
