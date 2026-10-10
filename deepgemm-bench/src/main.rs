@@ -112,6 +112,66 @@ fn make_sf(
     transform_sf(dev, stream, &scales, m, gran)
 }
 
+/// Paged MQA bench: decode-shaped — many short requests over a paged KV
+/// cache; measures effective tokens/s (the serving metric) as well as TFLOPS.
+fn run_mqa_paged_bench(dev: &Device, stream: &DevStream, iters: u32, warmup: u32) -> DgResult<()> {
+    use deepgemm::device::alloc_and_upload;
+    use deepgemm::types::SfTensor;
+
+    let num_requests = 512u32;
+    let ctx_len = 512u32;
+    let num_tokens = num_requests; // 1 token per request (pure decode)
+    let heads = 64u32;
+    let head_dim = 128u32;
+    let page_kv = 64u32;
+    let num_pages_per_req = ctx_len / page_kv;
+    let num_pages = num_requests * num_pages_per_req;
+    let q_rows = num_tokens * heads;
+    let kv_gran = SfGran::G32;
+
+    let q_data = DevBuffer::alloc_zeros(dev, (q_rows * head_dim) as usize)?;
+    let kv_pages = DevBuffer::alloc_zeros(dev, (num_pages * page_kv * head_dim) as usize)?;
+    let q_sf = make_sf(dev, stream, q_rows, head_dim, kv_gran, 3)?;
+    // Paged SF: one int32 word per token, page-major [num_pages, page_kv].
+    let kv_sf_pages = DevBuffer::alloc_zeros(dev, (num_pages * page_kv) as usize * 4)?;
+    let weights = DevBuffer::alloc_zeros(dev, (num_tokens * heads) as usize * 2)?;
+    let context_lens: Vec<u32> = vec![ctx_len; num_tokens as usize];
+    let indices: Vec<u32> = (0..num_tokens).collect::<Vec<u32>>(); // 1 token/req
+    // Per-TOKEN rows: [num_tokens, num_pages_per_req], identity page ids.
+    let block_table: Vec<u32> = (0..num_tokens * num_pages_per_req).collect::<Vec<u32>>();
+    let mut out = DevBuffer::alloc_zeros(dev, (num_tokens * ctx_len) as usize * 2)?;
+
+    let q = Operand {
+        dtype: Dtype::Fp8, major: Major::K, rows: q_rows, k: head_dim,
+        outer_stride: head_dim, sf: None, data: q_data,
+    };
+    let cl = alloc_and_upload(dev, &context_lens, stream.raw())?;
+    let idx = alloc_and_upload(dev, &indices, stream.raw())?;
+    let bt = alloc_and_upload(dev, &block_table, stream.raw())?;
+
+    let run_once = |out: &mut DevBuffer| -> DgResult<()> {
+        deepgemm::api::mqa_logits_paged(
+            dev, stream, &q, &q_sf, &kv_pages, &kv_sf_pages, &weights,
+            page_kv, num_pages, &cl, &idx, &bt, num_pages_per_req,
+            num_tokens, heads, head_dim, out, ctx_len,
+        )
+    };
+    for _ in 0..warmup { run_once(&mut out)?; }
+    stream.sync()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters { run_once(&mut out)?; }
+    stream.sync()?;
+    let elapsed = t0.elapsed().as_secs_f64();
+    let tokens = num_tokens as f64;
+    let flops = 2.0 * tokens * ctx_len as f64 * heads as f64 * head_dim as f64;
+    let tflops = flops / elapsed / (iters as f64) / 1e12;
+    println!(
+        "mqa_logits_paged_fp8       requests={num_requests} ctx={ctx_len} pages={num_pages} | {tflops:8.1} TFLOPS, {:.0} tokens/s  {elapsed:.3}s/{iters} iters",
+        tokens * iters as f64 / elapsed
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_gemm_bench(
     dev: &Device,
@@ -615,6 +675,16 @@ fn kernel_variants(arch: &str) -> Vec<(&'static str, &'static str, String)> {
                 kernel_src::MQA_LOGITS,
                 mqa_wrapper(64, 128, 2, 256, 128, 2, 2, 2, 256, 148, 1),
             ),
+            (
+                "mqa paged fp8 h64 d128 p64",
+                kernel_src::MQA_LOGITS,
+                mqa_paged_wrapper(64, 128, 2, 256, 64, 128, 2, 4, 2, 256, 148, 0),
+            ),
+            (
+                "mqa paged metadata",
+                kernel_src::MQA_LOGITS,
+                r#"extern "C" __global__ void __dg_kernel(const unsigned* cl, const unsigned* idx, unsigned n, unsigned* meta) { dg::mqa_paged_metadata_impl<256, 148, 32, 128>(cl, idx, n, meta); }"#.to_string(),
+            ),
         ]);
     } else {
         // sm_90a: wgmma suite. Stage counts verified against the SM90 smem
@@ -657,6 +727,38 @@ fn kernel_variants(arch: &str) -> Vec<(&'static str, &'static str, String)> {
         ]);
     }
     v
+}
+
+/// Instantiation wrapper for the paged MQA kernel (compile-check form).
+#[allow(clippy::too_many_arguments)]
+fn mqa_paged_wrapper(
+    heads: u32,
+    head_dim: u32,
+    block_q: u32,
+    split_kv: u32,
+    page_kv: u32,
+    umma_n: u32,
+    q_stages: u32,
+    kv_stages: u32,
+    tmem_stages: u32,
+    math_threads: u32,
+    num_sms: u32,
+    is_fp4: u32,
+) -> String {
+    format!(
+        r#"extern "C" __global__ void __dg_kernel(
+    unsigned nq, unsigned nkv, unsigned stride, const unsigned* ks, const unsigned* ke, unsigned short* logits,
+    const __grid_constant__ dg::TmaMap tma_q, const __grid_constant__ dg::TmaMap tma_sfq,
+    const __grid_constant__ dg::TmaMap tma_kv, const __grid_constant__ dg::TmaMap tma_sfkv,
+    const __grid_constant__ dg::TmaMap tma_w,
+    const unsigned* cl, const unsigned* idx, const unsigned* bt, unsigned bts, const unsigned* meta) {{
+    dg::mqa_logits_sm100_impl<{heads}, {head_dim}, {block_q}, {split_kv}, {umma_n},
+        {q_stages}, {kv_stages}, {tmem_stages}, 128, {math_threads}, {num_sms}, {is_fp4},
+        true, {page_kv}>
+        (nq, nkv, stride, ks, ke, logits, tma_q, tma_sfq, tma_kv, tma_sfkv, tma_w,
+         cl, idx, bt, bts, meta);
+}}"#
+    )
 }
 
 /// Instantiation wrapper for the SM90 FP8 1D1D kernel (compile-check form).
@@ -792,8 +894,8 @@ fn mqa_wrapper(
     const __grid_constant__ dg::TmaMap tma_kv, const __grid_constant__ dg::TmaMap tma_sfkv,
     const __grid_constant__ dg::TmaMap tma_w) {{
     dg::mqa_logits_sm100_impl<{heads}, {head_dim}, {block_q}, {split_kv}, {umma_n},
-        {q_stages}, {kv_stages}, {tmem_stages}, 128, {math_threads}, {num_sms}, {is_fp4}>
-        (nq, nkv, stride, ks, ke, logits, tma_q, tma_sfq, tma_kv, tma_sfkv, tma_w);
+        {q_stages}, {kv_stages}, {tmem_stages}, 128, {math_threads}, {num_sms}, {is_fp4}, false, 0>
+        (nq, nkv, stride, ks, ke, logits, tma_q, tma_sfq, tma_kv, tma_sfkv, tma_w, 0, 0, 0, 0, 0);
 }}"#
     )
 }
@@ -883,6 +985,8 @@ fn main() {
             }
             if name == "mqa_logits_fp8" {
                 run_mqa_bench(d, &stream, *iters, *warmup)
+            } else if name == "mqa_logits_paged_fp8" {
+                run_mqa_paged_bench(d, &stream, *iters, *warmup)
             } else {
                 run_gemm_bench(d, &stream, name, *m, *n, *k, *groups, *iters, *warmup)
             }

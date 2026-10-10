@@ -865,9 +865,12 @@ pub fn mqa_logits(
         block_q * num_heads,
         is_fp4,
     )?;
-    let tm_kv = tma::make_tma_mqa_qk(dev, kv.dtype, &kv.data, kv.rows, head_dim, 128, is_fp4)?;
+    // Box sizes must equal the producer's per-TMA step (kNumKVTokensPerTMA =
+    // 256 for SPLIT_KV=256), otherwise the full barrier under-credits and the
+    // stage never completes (latent-hang fix).
+    let tm_kv = tma::make_tma_mqa_qk(dev, kv.dtype, &kv.data, kv.rows, head_dim, split_kv, is_fp4)?;
     let tm_sf_q = tma::make_tma_mqa_sf(dev, &q_sf.buf, q.rows, block_q * num_heads)?;
-    let tm_sf_kv = tma::make_tma_mqa_sf(dev, &kv_sf.buf, kv.rows, 128)?;
+    let tm_sf_kv = tma::make_tma_mqa_sf(dev, &kv_sf.buf, kv.rows, split_kv)?;
     let tm_w = tma::make_tma_mqa_weights(dev, weights, num_heads, num_tokens)?;
 
     let body = format!(
@@ -884,9 +887,9 @@ pub fn mqa_logits(
         {block_q}, {split_kv}, {umma_n},
         {q_stages}, {kv_stages}, {tmem_stages},
         128, {math_threads},
-        {num_sms}, {is_fp4}
+        {num_sms}, {is_fp4}, false, 0
     >(num_q_tokens, num_kv_tokens, logits_stride, cu_k_start, cu_k_end, logits,
-      tma_q, tma_sf_q, tma_kv, tma_sf_kv, tma_w);
+      tma_q, tma_sf_q, tma_kv, tma_sf_kv, tma_w, 0, 0, 0, 0, 0);
 }}"#,
         heads = num_heads,
         head_dim = head_dim,
@@ -924,6 +927,177 @@ pub fn mqa_logits(
         .tensormap(&tm_kv)
         .tensormap(&tm_sf_kv)
         .tensormap(&tm_w);
+    jit::launch(
+        dev,
+        func,
+        stream.raw(),
+        &sys::LaunchEx {
+            grid: (dev.num_sms, 1, 1),
+            block: (128 + num_math_threads, 1, 1),
+            smem,
+            cluster: None,
+            pdl: true,
+        },
+        args,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// MQA logits, PAGED KV variant (decode path): port of
+// `sm100_paged_mqa_logits` (scheduler + metadata kernel + main kernel).
+// ---------------------------------------------------------------------------
+#[allow(clippy::too_many_arguments)]
+pub fn mqa_logits_paged(
+    dev: &Device,
+    stream: &DevStream,
+    q: &Operand,
+    q_sf: &SfTensor,
+    kv_pages: &DevBuffer,     // [num_pages, PAGE_KV, head_dim]
+    kv_sf_pages: &DevBuffer,  // [num_pages, PAGE_KV] int32 (word/token)
+    weights: &DevBuffer,      // [num_q_tokens, heads] bf16
+    page_kv: u32,
+    num_pages: u32,
+    context_lens: &DevBuffer, // [num_q_tokens]
+    indices: &DevBuffer,      // [num_q_tokens] request ids (sorted)
+    block_table: &DevBuffer,  // [num_q_tokens, stride] (page ids per request)
+    block_table_stride: u32,
+    num_tokens: u32,
+    num_heads: u32,
+    head_dim: u32,
+    logits: &mut DevBuffer,
+    logits_stride: u32,
+) -> DgResult<()> {
+    if !matches!(dev.arch, crate::device::Arch::Sm100) {
+        return Err(DgError::Unsupported(
+            "the tcgen05 kernels require SM100 (Blackwell)".into(),
+        ));
+    }
+    if head_dim % 32 != 0 || head_dim > 128 {
+        return Err(DgError::InvalidArg("head_dim must be 32/64/128".into()));
+    }
+    if num_heads % 4 != 0 || num_heads > 256 {
+        return Err(DgError::InvalidArg("num_heads must be a multiple of 4 (<= 256)".into()));
+    }
+    if page_kv == 0 || page_kv % 4 != 0 || 256 % page_kv != 0 {
+        return Err(DgError::InvalidArg("page_kv must divide 256 (multiple of 4)".into()));
+    }
+    let is_fp4 = q.dtype == Dtype::Fp4;
+    if q.dtype != Dtype::Fp8 && !is_fp4 {
+        return Err(DgError::InvalidArg("paged MQA needs FP8 or FP4 Q".into()));
+    }
+
+    let block_q = (128 / num_heads).clamp(1, 32).max(256 / num_heads).min(32);
+    let umma_n = ceil_div(block_q * num_heads, 8) * 8;
+    let num_math_threads = 256u32;
+    let split_kv = 256u32;
+    // Deeper KV ring so full-ring reuse (num_kv_splits == kNumKVStages) fires.
+    let (q_stages, kv_stages, tmem_stages) = (2u32, 4u32, 2u32);
+
+    let tm_q = tma::make_tma_mqa_qk(dev, q.dtype, &q.data, q.rows, head_dim, block_q * num_heads, is_fp4)?;
+    let tm_kv = tma::make_tma_mqa_qk_paged(dev, q.dtype, kv_pages, head_dim, page_kv, num_pages, is_fp4)?;
+    let tm_sf_q = tma::make_tma_mqa_sf(dev, &q_sf.buf, q.rows, block_q * num_heads)?;
+    let tm_sf_kv = tma::make_tma_mqa_sf_paged(dev, kv_sf_pages, page_kv, num_pages)?;
+    let tm_w = tma::make_tma_mqa_weights(dev, weights, num_heads, num_tokens)?;
+
+    // schedule_meta: [num_sms + 1] uint2 (per-SM starts + sentinel).
+    let meta = DevBuffer::alloc(dev, (dev.num_sms as usize + 1) * 8)?;
+    let meta_body = format!(
+        r#"extern "C" __global__ void __dg_kernel(
+    const unsigned* context_lens, const unsigned* indices,
+    unsigned num_q_tokens, unsigned* schedule_meta) {{
+    dg::mqa_paged_metadata_impl<{split_kv}, {sms}, {block_q}, 128>(
+        context_lens, indices, num_q_tokens, schedule_meta);
+}}"#,
+        split_kv = split_kv,
+        sms = dev.num_sms,
+        block_q = block_q,
+    );
+    let meta_sig = format!("meta_{block_q}_{split_kv}");
+    let meta_func = jit::get_kernel(dev, jit::kernel_src::MQA_LOGITS, "mqa_meta", &meta_sig, &meta_body)?;
+    let meta_args = Args::new()
+        .ptr(context_lens.ptr as *const u8 as *const u32)
+        .ptr(indices.ptr as *const u8 as *const u32)
+        .u32(num_tokens)
+        .devptr(meta.ptr);
+    let meta_smem = (2 * num_tokens as usize + 32 / 4 + 1) * 4 + 64;
+    jit::launch(
+        dev,
+        meta_func,
+        stream.raw(),
+        &sys::LaunchEx {
+            grid: (1, 1, 1),
+            block: (128, 1, 1),
+            smem: meta_smem as u32,
+            cluster: None,
+            pdl: false,
+        },
+        meta_args,
+    )?;
+
+    let body = format!(
+        r#"extern "C" __global__ void __dg_kernel(
+    unsigned num_q_tokens, unsigned num_kv_tokens, unsigned logits_stride,
+    const unsigned* cu_k_start, const unsigned* cu_k_end, unsigned short* logits,
+    const __grid_constant__ dg::TmaMap tma_q,
+    const __grid_constant__ dg::TmaMap tma_sf_q,
+    const __grid_constant__ dg::TmaMap tma_kv,
+    const __grid_constant__ dg::TmaMap tma_sf_kv,
+    const __grid_constant__ dg::TmaMap tma_w,
+    const unsigned* context_lens, const unsigned* indices,
+    const unsigned* block_table, unsigned block_table_stride,
+    const unsigned* schedule_meta) {{
+    dg::mqa_logits_sm100_impl<
+        {heads}, {head_dim},
+        {block_q}, {split_kv}, {umma_n},
+        {q_stages}, {kv_stages}, {tmem_stages},
+        128, {math_threads},
+        {num_sms}, {is_fp4},
+        true, {page_kv}
+    >(num_q_tokens, num_kv_tokens, logits_stride, cu_k_start, cu_k_end, logits,
+      tma_q, tma_sf_q, tma_kv, tma_sf_kv, tma_w,
+      context_lens, indices, block_table, block_table_stride, schedule_meta);
+}}"#,
+        heads = num_heads,
+        head_dim = head_dim,
+        block_q = block_q,
+        split_kv = split_kv,
+        umma_n = umma_n,
+        q_stages = q_stages,
+        kv_stages = kv_stages,
+        tmem_stages = tmem_stages,
+        math_threads = num_math_threads,
+        num_sms = dev.num_sms,
+        is_fp4 = is_fp4 as u32,
+        page_kv = page_kv,
+    );
+    let sig = format!("mqa_paged_{num_heads}_{head_dim}_{block_q}_{is_fp4}_{page_kv}");
+    let func = jit::get_kernel(dev, jit::kernel_src::MQA_LOGITS, "mqa_logits_paged", &sig, &body)?;
+
+    let qk_bytes_per_token = if is_fp4 { head_dim / 2 } else { head_dim };
+    let smem = block_q * num_heads * qk_bytes_per_token * q_stages
+        + split_kv * qk_bytes_per_token * kv_stages
+        + block_q * num_heads * 4 * q_stages
+        + split_kv * 4 * kv_stages
+        + block_q * num_heads * 2 * q_stages
+        + 1024u32;
+
+    let args = Args::new()
+        .u32(num_tokens)
+        .u32(num_pages * page_kv)
+        .u32(logits_stride)
+        .devptr(0)
+        .devptr(0)
+        .ptr(logits.ptr as *const u8 as *const u16)
+        .tensormap(&tm_q)
+        .tensormap(&tm_sf_q)
+        .tensormap(&tm_kv)
+        .tensormap(&tm_sf_kv)
+        .tensormap(&tm_w)
+        .ptr(context_lens.ptr as *const u8 as *const u32)
+        .ptr(indices.ptr as *const u8 as *const u32)
+        .ptr(block_table.ptr as *const u8 as *const u32)
+        .u32(block_table_stride)
+        .devptr(meta.ptr);
     jit::launch(
         dev,
         func,

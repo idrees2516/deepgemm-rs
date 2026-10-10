@@ -187,6 +187,8 @@ DG_DEVICE void cluster_wait() { asm volatile("barrier.cluster.wait;" ::: "memory
 DG_DEVICE void cluster_sync_relaxed() { cluster_arrive_relaxed(); cluster_wait(); }
 
 DG_DEVICE void griddepcontrol_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+// PDL: allow the NEXT kernel (metadata -> main) to start its prologue now.
+DG_DEVICE void griddepcontrol_launch_dependent() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
 
 DG_DEVICE bool elect_one_sync() {
     uint32_t pred = 0;
@@ -322,6 +324,18 @@ DG_DEVICE void tma_load_2d_multicast(const TmaMap* map, Barrier* bar, void* smem
         :: "r"(cvta_shared_to_u32(smem)), "l"(map),
            "r"(cvta_shared_to_u32(&bar->barrier_)), "h"(cta_mask), "r"(c_inner), "r"(c_outer),
            "l"(kEvictNormalHint)
+        : "memory");
+}
+
+// 3D tile load (paged MQA KV: [head_dim, PAGE_KV, page]).
+DG_DEVICE void tma_load_3d(const TmaMap* map, Barrier* bar, void* smem,
+                           uint64_t cache_hint, uint32_t c0, uint32_t c1, uint32_t c2) {
+    asm volatile(
+        "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+        " [%0], [%1, {%3, %4, %5}], [%2], %6;"
+        :: "r"(cvta_shared_to_u32(smem)), "l"(map),
+           "r"(cvta_shared_to_u32(&bar->barrier_)), "r"(c0), "r"(c1), "r"(c2),
+           "l"(cache_hint)
         : "memory");
 }
 

@@ -60,6 +60,12 @@ fn dtype_of(dtype: Dtype, fp4_unpacked_smem: bool) -> DgResult<sys::TmDtype> {
 
 /// Encode a 2D tiled tensor map.
 #[allow(clippy::too_many_arguments)]
+/// Wire dtype for the paged 3D maps (same encoding as make_tma_2d uses for
+/// mqa Q/KV: FP8/FP4-packed/BF16 as INT8/16U4_ALIGN8B/INT16).
+fn dtype_of2(dtype: Dtype) -> DgResult<sys::TmDtype> {
+    dtype_of(dtype, false)
+}
+
 fn make_tma_2d(
     dev: &Device,
     dtype: Dtype,
@@ -396,6 +402,63 @@ pub fn make_tma_sf_fp32(
         block_mn,
         1,
         tma_aligned,
+        0,
+    )
+}
+
+/// Paged MQA KV map: 3D [head_dim (inner, same units as the 2D QK map),
+/// PAGE_KV (tokens/page), num_pages], box [head_dim, PAGE_KV, 1] — the gather
+/// loads exactly one page per call (tma_load_3d with page row coord).
+#[allow(clippy::too_many_arguments)]
+pub fn make_tma_mqa_qk_paged(
+    dev: &Device,
+    dtype: Dtype,
+    buf: &DevBuffer,
+    head_dim: u32,
+    page_kv: u32,
+    num_pages: u32,
+    is_packed_fp4: bool,
+) -> DgResult<sys::TensorMap> {
+    let _ = is_packed_fp4;
+    let pack = if dtype == Dtype::Fp4 { 2 } else { 1 };
+    let swizzle = (head_dim / pack).min(128);
+    dev.bind()?;
+    sys::tensor_map_encode_tiled(
+        dtype_of2(dtype)?,
+        3,
+        buf.ptr as *mut _,
+        &[(head_dim / pack) as u64, page_kv as u64, num_pages as u64],
+        &[
+            (head_dim / pack) as u64 * dtype.elem_size() as u64,
+            (head_dim / pack) as u64 * dtype.elem_size() as u64 * page_kv as u64,
+        ],
+        &[(head_dim / pack) as u32, page_kv, 1],
+        &[1, 1, 1],
+        sys::tm_interleave_none(),
+        sys::tm_swizzle(swizzle),
+        sys::tm_l2_256b(),
+        sys::tm_oob_fill_none(),
+    )
+}
+
+/// Paged MQA SF map: 2D [PAGE_KV slots (inner), num_pages], box [PAGE_KV, 1].
+/// One packed SF word per KV token (same granularity as the contiguous map).
+pub fn make_tma_mqa_sf_paged(
+    dev: &Device,
+    buf: &DevBuffer,
+    page_kv: u32,
+    num_pages: u32,
+) -> DgResult<sys::TensorMap> {
+    make_tma_2d(
+        dev,
+        Dtype::F32,
+        false,
+        buf.ptr,
+        page_kv,
+        num_pages,
+        page_kv,
+        1,
+        page_kv,
         0,
     )
 }
