@@ -15,12 +15,18 @@
 //!   with `griddepcontrol` PDL so consecutive kernels overlap prologue with
 //!   the predecessor's epilogue.
 //!
-//! ```
+//! ```no_run
 //! use deepgemm::runtime::Runtime;
-//! let rt = Runtime::new(0).unwrap();
-//! rt.chain(|s| {
-//!     deepgemm::api::fp8_gemm_nt(&rt.device, s, &a, &sfa, &b, &sfb, &mut d).unwrap();
+//! # fn main() -> Result<(), deepgemm::error::DgError> {
+//! let rt = Runtime::new(0)?;            // pooled handle on device 0
+//! let scratch = rt.scratch(1 << 20)?;   // pooled workspace (2 MiB size-class)
+//! let a = rt.upload(&[0f32; 1024])?;    // zero-copy HtoD upload
+//! rt.chain(|s| {                        // PDL chain on a pool stream
+//!     let _ = (s, &a);                  // kernels launched via api::* on `s`
 //! });
+//! rt.release(scratch);                  // recycle for the next call
+//! # Ok(())
+//! # }
 //! ```
 use crate::device::{DevBuffer, DevStream, Device};
 use crate::error::{DgError, DgResult};
