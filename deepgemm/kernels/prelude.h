@@ -850,10 +850,19 @@ enum class GemmType : uint32_t {
     MGroupedContiguous = 1,
     MGroupedMasked = 2,
     Batched = 4,
+    // Weight-grad GEMMs: A/B are stacked along K; `grouped_layout[g]` is the
+    // K size (elements, % kKAlignment) of group g. The physical K offset of
+    // group g is the prefix sum (`current_k_start`), maintained by the
+    // scheduler; the 1D1D SM90 kernel patches its TMA descriptors on the fly
+    // (tensormap.replace) at every group transition.
+    KGroupedContiguous = 5,
 };
 
 DG_DEVICE bool gemm_type_is_m_grouped_contiguous(GemmType t) { return t == GemmType::MGroupedContiguous; }
-DG_DEVICE bool gemm_type_is_k_grouped(GemmType t) { return false; }  // not ported
+// `KGroupedContiguousWithPsumLayout` (upstream's second k-grouped flavor,
+// psum-accumulating weight-grad) is intentionally not ported; the plain
+// KGroupedContiguous flavor covers the fused weight-grad GEMM use case.
+DG_DEVICE constexpr bool gemm_type_is_k_grouped(GemmType t) { return t == GemmType::KGroupedContiguous; }
 
 template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t kNumMulticast, bool kIsMulticastOnA,
           uint32_t kNumSMs>
@@ -874,6 +883,7 @@ template <GemmType kGemmType,
           uint32_t BLOCK_M, uint32_t BLOCK_N,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
           uint32_t kNumSMs,
+          uint32_t kKAlignment = 128,
           uint32_t kNum1DBlocksPerGroup = get_num_1d_blocks_per_group<BLOCK_M, BLOCK_N, kNumMulticast, kIsMulticastOnA, kNumSMs>()>
 struct Scheduler {
     int current_iter = -1;
@@ -881,11 +891,17 @@ struct Scheduler {
     uint32_t num_m_blocks;
     uint32_t num_n_blocks;
     uint32_t num_blocks_in_group = 0;
+    // Set by the Normal-path scheduler when a cluster peer CTA shares this
+    // m-block (SM90 TMA multicast): the math warps then arrive the peer CTA's
+    // empty barriers as well, so its producer waits for BOTH consumers.
+    bool is_peer_cta_alive = false;
 
     int* grouped_layout;
     uint32_t current_group_idx = 0;
     uint32_t current_m_cumsum = 0;
     uint32_t current_shape_k;
+    // K-grouped (weight-grad): physical K start of the current group.
+    uint32_t current_k_start = 0;
 
     enum class IndexType { MN, K, SF_K };
 
@@ -893,13 +909,20 @@ struct Scheduler {
         : grouped_layout(grouped_layout_) {
         num_m_blocks = dg::ceil_div_u32(shape_m, BLOCK_M);
         num_n_blocks = dg::ceil_div_u32(shape_n, BLOCK_N);
-        current_shape_k = shape_k;
+        current_shape_k = gemm_type_is_k_grouped(kGemmType) ? 0 : shape_k;
         if (kGemmType == GemmType::Normal || kGemmType == GemmType::Batched ||
             kGemmType == GemmType::MGroupedContiguous) {
             num_blocks = num_m_blocks * num_n_blocks;
         } else {  // MGroupedMasked
             num_blocks = 0;
         }
+    }
+
+    // Advance to the next K group (K-grouped weight-grad). Non-psum flavor:
+    // `grouped_layout[g]` is the K size of group g.
+    DG_DEVICE void get_next_k_group() {
+        current_k_start += current_shape_k;
+        current_shape_k = (uint32_t)grouped_layout[current_group_idx];
     }
 
     DG_DEVICE void get_swizzled_block_idx(uint32_t block_idx, uint32_t& m_block_idx, uint32_t& n_block_idx) {
@@ -967,8 +990,51 @@ struct Scheduler {
             return true;
         } else {
             if (next_block_idx >= num_blocks) return false;
-            get_swizzled_block_idx(next_block_idx, m_block_idx, n_block_idx);
+            if (gemm_type_is_k_grouped(kGemmType)) {
+                // K-grouped (weight-grad): every (m, n) block re-runs over each
+                // K group; advance `current_group_idx` until the (linear, L2-
+                // swizzled) block index falls into the group's range.
+                while (true) {
+                    if (current_group_idx >= kNumGroupsRuntime) return false;
+                    if (next_block_idx < (current_group_idx + 1) * num_blocks) break;
+                    current_group_idx++;
+                    if (current_group_idx >= kNumGroupsRuntime) return false;
+                    // `current_k_start` moves by the PREVIOUS group's size; the
+                    // tensormap patcher reads both fields at the transition.
+                    get_next_k_group();
+                }
+                get_swizzled_block_idx(next_block_idx - current_group_idx * num_blocks,
+                                       m_block_idx, n_block_idx);
+            } else {
+                get_swizzled_block_idx(next_block_idx, m_block_idx, n_block_idx);
+            }
+            // SM90 TMA multicast: the peer CTA (cluster partner) processes the
+            // same m-block iff its swizzled block exists in this wave.
+            is_peer_cta_alive = num_n_blocks % kNumMulticast == 0 ||
+                                 num_m_blocks % kNumMulticast == 0 ||
+                                 (next_block_idx ^ 1) < num_blocks;
             return true;
+        }
+    }
+
+    // SM90 only: whether the TMA multicast for this block is legal (the peer
+    // CTA would read identical data). For MGroupedContiguous with multicast
+    // on B, the peer m-block must belong to the same expert group.
+    DG_DEVICE bool is_tma_multicast_valid(uint32_t m_block_idx) const {
+        if (num_blocks_in_group == 1)
+            return false;
+        if (kGemmType == GemmType::Normal || kGemmType == GemmType::MGroupedMasked ||
+            gemm_type_is_k_grouped(kGemmType) || kGemmType == GemmType::Batched) {
+            return true;
+        } else {
+            // MGroupedContiguous
+            if (kIsMulticastOnA) {
+                return true;
+            } else {
+                const int group_idx = grouped_layout[m_block_idx * BLOCK_M];
+                const int peer_group_idx = grouped_layout[(m_block_idx ^ 1) * BLOCK_M];
+                return group_idx == peer_group_idx;
+            }
         }
     }
 
@@ -1065,5 +1131,387 @@ DG_DEVICE void replace_smem_desc_addr(SmemDescriptor& desc, const void* smem_ptr
     desc.start_address_ = (uint16_t)(cvta_shared_to_u32(smem_ptr) >> 4);
 }
 
+// ===========================================================================
+// Extended primitive layer (mega-kernels, SM90 suite, aux kernels)
+//
+// Everything below was added for the "implement all unimplemented parts"
+// wave: TMEM stores + TF32 TS-MMA (MegaMHC / hc-prenorm), LDSM/STSM b16+b8
+// (SM90 & MoE epilogues), cp.async (sparse-MQA KV gather), gmem
+// release/acquire atomics (the MoE megakernel's cross-CTA / cross-rank
+// producer-consumer graph), tensormap runtime patching (k-grouped GEMM),
+// and the UE8M0/BF16 quantization helpers shared by the mega epilogues.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// TMEM stores (tcgen05.st) — write post-mixed A-operands / partials.
+// Lane mapping mirrors the 16dp256b loads: each lane owns 2 datapaths x 2
+// columns; the `addr | 0x00100000` trick addresses datapaths +16.
+// ---------------------------------------------------------------------------
+DG_DEVICE void tmem_store_16dp256b_x1(uint32_t addr, uint32_t v0, uint32_t v1, uint32_t v2, uint32_t v3) {
+    asm volatile("tcgen05.st.sync.aligned.16x256b.x1.b32 [%0], {%1, %2, %3, %4};"
+                 :: "r"(addr), "r"(v0), "r"(v1), "r"(v2), "r"(v3));
+}
+DG_DEVICE void tmem_store_16dp256b_x2(uint32_t addr, const uint32_t* v) {
+    asm volatile("tcgen05.st.sync.aligned.16x256b.x2.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+                 :: "r"(addr), "r"(v[0]), "r"(v[1]), "r"(v[2]), "r"(v[3]),
+                    "r"(v[4]), "r"(v[5]), "r"(v[6]), "r"(v[7]));
+}
+DG_DEVICE void tmem_store_16dp256b_x4(uint32_t addr, const uint32_t* v) {
+    asm volatile("tcgen05.st.sync.aligned.16x256b.x4.b32 [%0], "
+                 "{%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
+                 :: "r"(addr), "r"(v[0]), "r"(v[1]), "r"(v[2]), "r"(v[3]),
+                    "r"(v[4]), "r"(v[5]), "r"(v[6]), "r"(v[7]), "r"(v[8]), "r"(v[9]),
+                    "r"(v[10]), "r"(v[11]), "r"(v[12]), "r"(v[13]), "r"(v[14]), "r"(v[15]));
+}
+
+// TF32 TS-MMA (SM100): A operand read from TMEM, B from SMEM descriptor.
+// Used by the hyperconnection prenorm GEMM (fp32 weights reduced to tf32).
+DG_DEVICE void mma_tf32_ts_1sm(uint32_t tmem_c, uint32_t tmem_a, uint64_t desc_b,
+                               uint32_t scale_c, uint64_t idesc) {
+    asm volatile(
+        "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+        "tcgen05.mma.cta_group::1.kind::tf32 [%0], [%1], %2, %3, p;\n\t}"
+        :: "r"(tmem_c), "r"(tmem_a), "l"(desc_b), "r"((uint32_t)(idesc >> 32)), "r"(scale_c));
+}
+
+// ---------------------------------------------------------------------------
+// LDSM / STSM (SM90 + MoE epilogues)
+// ---------------------------------------------------------------------------
+// ldmatrix x4, non-transposed, b16 elements (hc-prenorm cast warps).
+DG_DEVICE void ldsm_x4_b16_n(uint32_t smem_addr, uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) {
+    asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(a), "=r"(b), "=r"(c), "=r"(d) : "r"(smem_addr));
+}
+// ldmatrix x2, non-transposed (upper/lower 8-row halves).
+DG_DEVICE void ldsm_x2_b16_n(uint32_t smem_addr, uint32_t& a, uint32_t& b) {
+    asm volatile("ldmatrix.sync.aligned.x2.m8n8.shared.b16 {%0, %1}, [%2];"
+                 : "=r"(a), "=r"(b) : "r"(smem_addr));
+}
+// stmatrix x2, non-transposed, b16 (SM90 1D2D/bf16 swizzled epilogues).
+DG_DEVICE void stsm_x2_b16_n(uint32_t smem_addr, uint32_t a, uint32_t b) {
+    asm volatile("stmatrix.sync.aligned.x2.m8n8.shared.b16 [%0], {%1, %2};"
+                 :: "r"(smem_addr), "r"(a), "r"(b));
+}
+// stmatrix x1, transposed, b8 (SM100 FP8 MoE epilogue: 4 fp8 values/word).
+DG_DEVICE void stsm_x1_b8_trans(uint32_t smem_addr, uint32_t a) {
+    asm volatile("stmatrix.sync.aligned.m16n8.x1.trans.shared.b8 [%0], {%1};"
+                 :: "r"(smem_addr), "r"(a));
+}
+
+// ---------------------------------------------------------------------------
+// cp.async (sparse-MQA KV gather + metadata loads)
+// ---------------------------------------------------------------------------
+// 16B cg copy (L2::256B hint).
+DG_DEVICE void cp_async_cg16(void* smem, const void* gmem) {
+    asm volatile("cp.async.cg.shared::cta.global.L2::256B [%0], [%1], 16;"
+                 :: "r"(cvta_shared_to_u32(smem)), "l"(gmem));
+}
+// 16B cg copy with zfill: only `src_bytes` are read, the rest zero-filled
+// (partial-KV-block clipping).
+DG_DEVICE void cp_async_cg16_zfill(void* smem, const void* gmem, uint32_t src_bytes) {
+    asm volatile("cp.async.cg.shared::cta.global.L2::256B [%0], [%1], 16, %2;"
+                 :: "r"(cvta_shared_to_u32(smem)), "l"(gmem), "r"(src_bytes));
+}
+// 4B ca copy with zfill (scalar SF loads on unaligned KV starts).
+DG_DEVICE void cp_async_ca4_zfill(void* smem, const void* gmem, uint32_t src_bytes) {
+    asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 4, %2;"
+                 :: "r"(cvta_shared_to_u32(smem)), "l"(gmem), "r"(src_bytes));
+}
+// 4B ca copy (scalar SF).
+DG_DEVICE void cp_async_ca4(void* smem, const void* gmem) {
+    asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 4;"
+                 :: "r"(cvta_shared_to_u32(smem)), "l"(gmem));
+}
+DG_DEVICE void cp_async_commit_group() { asm volatile("cp.async.commit_group;" ::: "memory"); }
+template <int kNumRemainingWaits>
+DG_DEVICE void cp_async_wait_group() {
+    asm volatile("cp.async.wait_group %0;" :: "n"(kNumRemainingWaits) : "memory");
+}
+// cp.async -> mbarrier arrival WITHOUT bumping the pending-arrival count
+// (fires when all prior cp.async of this thread complete).  Barrier init
+// counts can therefore equal the number of participating threads.
+DG_DEVICE void cpasync_barrier_arrive_noinc(Barrier* bar) {
+    asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];"
+                 :: "r"(cvta_shared_to_u32(&bar->barrier_)));
+}
+
+// ---------------------------------------------------------------------------
+// mbarrier: count-arrival with predicate
+// ---------------------------------------------------------------------------
+DG_DEVICE void mbarrier_arrive_count_pred(Barrier* bar, uint32_t count, bool pred) {
+    asm volatile(
+        "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %2, 0;\n\t"
+        "@p mbarrier.arrive.shared::cta.b64 _, [%0], %1;\n\t}"
+        :: "r"(cvta_shared_to_u32(&bar->barrier_)), "r"(count), "r"((uint32_t)pred));
+}
+
+// ---------------------------------------------------------------------------
+// TMA 1D store + hinted 2D/3D stores (mega-kernel epilogues)
+// ---------------------------------------------------------------------------
+DG_DEVICE void tma_store_1d(void* gmem, const void* smem, uint32_t num_bytes, uint64_t cache_hint) {
+    asm volatile(
+        "cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint [%0], [%1], %2, %3;"
+        :: "l"(gmem), "r"(cvta_shared_to_u32(smem)), "r"(num_bytes), "l"(cache_hint)
+        : "memory");
+}
+DG_DEVICE void tma_store_2d_hint(const TmaMap* map, const void* smem,
+                                 uint32_t c_inner, uint32_t c_outer, uint64_t cache_hint) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group.L2::cache_hint"
+        " [%0, {%2, %3}], [%1], %4;"
+        :: "l"(map), "r"(cvta_shared_to_u32(smem)), "r"(c_inner), "r"(c_outer), "l"(cache_hint)
+        : "memory");
+}
+DG_DEVICE void tma_store_3d_hint(const TmaMap* map, const void* smem,
+                                 uint32_t c0, uint32_t c1, uint32_t c2, uint64_t cache_hint) {
+    asm volatile(
+        "cp.async.bulk.tensor.3d.global.shared::cta.bulk_group.L2::cache_hint"
+        " [%0, {%2, %3, %4}], [%1], %5;"
+        :: "l"(map), "r"(cvta_shared_to_u32(smem)), "r"(c0), "r"(c1), "r"(c2), "l"(cache_hint)
+        : "memory");
+}
+
+// ---------------------------------------------------------------------------
+// Global-memory atomics and release/acquire (MoE megakernel dependency graph)
+//
+// The megakernels replace kernel-boundary synchronization with a device-wide
+// producer-consumer graph: ring counters (red.add / ld.acquire), XOR masks
+// (red.xor), grid-tag barriers (st.release / ld.acquire) and cross-rank
+// NVLink signals (atom/red/st/ld with the .sys scope).
+// ---------------------------------------------------------------------------
+DG_DEVICE uint32_t atom_add_u32(uint32_t* p, uint32_t v) {
+    uint32_t old;
+    asm volatile("atom.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(p), "r"(v) : "memory");
+    return old;
+}
+DG_DEVICE uint32_t atom_add_u32_block(uint32_t* p, uint32_t v) {
+    uint32_t old;
+    asm volatile("atom.shared.add.u32 %0, [%1], %2;" : "=r"(old) : "r"(cvta_shared_to_u32(p)), "r"(v) : "memory");
+    return old;
+}
+DG_DEVICE uint64_t atom_add_u64(uint64_t* p, uint64_t v) {
+    uint64_t old;
+    asm volatile("atom.global.add.u64 %0, [%1], %2;" : "=l"(old) : "l"(p), "l"(v) : "memory");
+    return old;
+}
+DG_DEVICE uint64_t atom_add_u64_sys(uint64_t* p, uint64_t v) {
+    uint64_t old;
+    asm volatile("atom.sys.global.add.u64 %0, [%1], %2;" : "=l"(old) : "l"(p), "l"(v) : "memory");
+    return old;
+}
+DG_DEVICE uint32_t atom_add_rel_u32(uint32_t* p, uint32_t v) {
+    uint32_t old;
+    asm volatile("atom.release.gpu.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(p), "r"(v) : "memory");
+    return old;
+}
+DG_DEVICE void red_add_u32(uint32_t* p, uint32_t v) {
+    asm volatile("red.gpu.global.add.u32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
+}
+DG_DEVICE void red_add_rel_u32(uint32_t* p, uint32_t v) {
+    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
+}
+DG_DEVICE void red_add_rel_sys_i32(int32_t* p, int32_t v) {
+    asm volatile("red.release.sys.global.add.s32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
+}
+DG_DEVICE void red_xor_rel_u64(uint64_t* p, uint64_t v) {
+    asm volatile("red.release.gpu.global.xor.b64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
+}
+DG_DEVICE uint32_t ld_acq_u32(const uint32_t* p) {
+    uint32_t v;
+    asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+DG_DEVICE uint64_t ld_acq_u64(const uint64_t* p) {
+    uint64_t v;
+    asm volatile("ld.acquire.gpu.global.b64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
+    return v;
+}
+DG_DEVICE uint32_t ld_acq_sys_u32(const uint32_t* p) {
+    uint32_t v;
+    asm volatile("ld.acquire.sys.global.b32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+DG_DEVICE uint64_t ld_acq_sys_u64(const uint64_t* p) {
+    uint64_t v;
+    asm volatile("ld.acquire.sys.global.b64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
+    return v;
+}
+DG_DEVICE uint32_t ld_vol_u32(const uint32_t* p) {
+    uint32_t v;
+    asm volatile("ld.volatile.global.b32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+DG_DEVICE uint64_t ld_vol_u64(const uint64_t* p) {
+    uint64_t v;
+    asm volatile("ld.volatile.global.b64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
+    return v;
+}
+DG_DEVICE void st_rel_sys_u64(uint64_t* p, uint64_t v) {
+    asm volatile("st.release.sys.global.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
+}
+DG_DEVICE void st_rel_u64(uint64_t* p, uint64_t v) {
+    asm volatile("st.release.gpu.global.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
+}
+DG_DEVICE void fence_acq_rel_cta() { asm volatile("fence.acq_rel.cta;" ::: "memory"); }
+
+// ---------------------------------------------------------------------------
+// Misc new primitives
+// ---------------------------------------------------------------------------
+DG_DEVICE uint64_t get_grid_id() {
+    uint64_t g;
+    asm volatile("mov.u64 %0, %%gridid;" : "=l"(g));
+    return g;
+}
+DG_DEVICE uint32_t get_sm_idx() {
+    uint32_t r;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(r));
+    return r;
+}
+// redux.sync.max.f32 (SM100 family). NaN-ignoring warp max in one op.
+DG_DEVICE float redux_max_f32(float v) {
+    float r;
+    asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(r) : "f"(v));
+    return r;
+}
+// Stochastic-rounding convert: two f32 -> bf16x2 with 16 random bits per half
+// from `rnd_bits` (low 16 -> lower element, high 16 -> upper).
+DG_DEVICE uint32_t cvt_rs_bf16x2_f32(float lo, float hi, uint32_t rnd_bits) {
+    uint32_t r;
+    asm volatile("cvt.rs.bf16x2.f32 %0, %1, %2, %3;" : "=r"(r) : "f"(hi), "f"(lo), "r"(rnd_bits));
+    return r;
+}
+// Evict-first uint4 load (metadata / combine reads; L1::no_allocate).
+DG_DEVICE uint4 ld_global_evict_first_u128(const void* p) {
+    uint4 v;
+    asm volatile("ld.weak.global.L1::no_allocate.L2::cache_hint.v4.b32 {%0, %1, %2, %3}, [%4], %5;"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p), "l"(0x12f0000000000000ull));
+    return v;
+}
+// Cache-global (L1-bypassing) u32 load (locality-domain probe).
+DG_DEVICE uint32_t ld_global_cg_u32(const void* p) {
+    uint32_t v;
+    asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(v) : "l"(p));
+    return v;
+}
+// Bulk zero-fill of shared memory (st.bulk with zero fill value).
+DG_DEVICE void st_shared_bulk_zero(void* smem, uint32_t num_bytes) {
+    asm volatile("st.bulk.weak.shared::cta [%0], %1, 0;"
+                 :: "r"(cvta_shared_to_u32(smem)), "r"(num_bytes) : "memory");
+}
+// Asynchronous 16B store into a *cluster peer's* shared memory, signaling an
+// mbarrier with complete_tx bytes (the mega-MoE task-info broadcast).
+// `dst_smem_cluster_addr` is a mapa-translated shared::cluster address.
+DG_DEVICE void st_async_cluster_u32x4(uint32_t dst_smem_cluster_addr,
+                                      uint32_t a, uint32_t b, uint32_t c, uint32_t d, Barrier* bar) {
+    asm volatile(
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.u32.v4 [%0], {%1, %2, %3, %4}, [%5];"
+        :: "r"(dst_smem_cluster_addr), "r"(a), "r"(b), "r"(c), "r"(d),
+           "r"(cvta_shared_to_u32(&bar->barrier_))
+        : "memory");
+}
+// mapa for a generic smem pointer -> cluster peer address (u32 window).
+DG_DEVICE uint32_t mapa_shared_cluster(const void* smem_ptr, uint32_t cta_id) {
+    uint32_t r;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
+                 : "=r"(r) : "r"(cvta_shared_to_u32(smem_ptr)), "r"(cta_id));
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// BF16 <-> FP32 unpack and UE8M0 amax quantization (mega epilogues)
+// ---------------------------------------------------------------------------
+DG_DEVICE float f32_from_bf16(uint32_t bits16) {
+    float f;
+    asm volatile("{\n\t.reg .b16 t;\n\tmov.b16 t, %1;\n\tcvt.f32.bf16 %0, t;\n\t}"
+                 : "=f"(f) : "h"((uint16_t)bits16));
+    return f;
+}
+// |bf16x2| (both halves).
+DG_DEVICE uint32_t habs2_bf16x2(uint32_t v) {
+    uint32_t r;
+    asm volatile("abs.bf16x2 %0, %1;" : "=r"(r) : "r"(v));
+    return r;
+}
+// max of two bf16x2 (per half).
+DG_DEVICE uint32_t hmax2_bf16x2(uint32_t a, uint32_t b) {
+    uint32_t r;
+    asm volatile("max.bf16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+    return r;
+}
+// amax of a packed bf16x2 word -> raw bf16 bits of the max magnitude.
+DG_DEVICE uint32_t get_packed_bf16_amax(uint32_t packed) {
+    return hmax2_bf16x2(habs2_bf16x2(packed), packed & 0x7fff7fffu);
+}
+// UE8M0 exponent for E4M3 quantization of a BF16 amax (bit input).
+// Exact port of math::get_ue8m0_sf_exp<E4M3>: ceil to a power of two that
+// keeps |x*sf| <= 448 (E4M3 max), clamped below ~1e-4.
+//   mant_bits=7, quant_max_mantissa=0x60 (1.75), quant_max_exp=8 (448),
+//   min_sf_exp=105.
+DG_DEVICE uint32_t get_ue8m0_sf_exp_e4m3(uint32_t amax_bf16_bits) {
+    const uint32_t rounded = (amax_bf16_bits + 0x7f - 0x60) >> 7;
+    const uint32_t clamped = rounded < (105u + 8u) ? (105u + 8u) : rounded;
+    return clamped - 8u;
+}
+// UE8M0 reciprocal scale as bf16 raw bits: 2^-(sf_exp-127) = (254-exp)<<7.
+DG_DEVICE uint32_t get_ue8m0_sf_inv_bf16(uint32_t sf_exp) {
+    return (254u - sf_exp) << 7;
+}
+// Scale two packed-bf16x2 words (4 values) by a bf16x2 reciprocal scale and
+// convert to packed e4m3x4 (one u32, 4 fp8 bytes).  Exact power-of-two
+// scaling in bf16 then RN-satfinite convert — bitwise identical to the
+// upstream __nv_fp8x4 path.
+DG_DEVICE uint32_t scale_bf16x2_into_fp8x4(uint32_t v01, uint32_t v23, uint32_t sf_inv) {
+    const uint32_t s01 = fma_bf16x2(v01, low2_bf16x2(sf_inv), 0);
+    const uint32_t s23 = fma_bf16x2(v23, low2_bf16x2(sf_inv), 0);
+    const float a = f32_from_bf16(s01 & 0xffff), b = f32_from_bf16(s01 >> 16);
+    const float c = f32_from_bf16(s23 & 0xffff), d = f32_from_bf16(s23 >> 16);
+    const uint32_t lo = cvt_e4m3x2_f32(a, b);   // bytes (a, b)
+    const uint32_t hi = cvt_e4m3x2_f32(c, d);   // bytes (c, d)
+    return (lo & 0xffu) | ((lo & 0xff00u) << 8) | ((hi & 0xffu) << 16) | ((hi & 0xff00u) << 24);
+}
+
+// ---------------------------------------------------------------------------
+// Tensormap runtime patching (k-grouped GEMM: one launch over ragged K groups)
+//
+// The producer copies the base tensormap into SMEM, patches the global
+// address / inner dimension / inner stride for the current k-group, commits,
+// then republishes it to a gmem scratch slot every CTA reads via TMA.
+// ---------------------------------------------------------------------------
+DG_DEVICE void tensormap_replace_global_addr(void* smem_desc, const void* gmem_addr) {
+    asm volatile("tensormap.replace.tile.global_address.shared::cta.b1024.b64 [%0], %1;"
+                 :: "r"(cvta_shared_to_u32(smem_desc)), "l"(gmem_addr) : "memory");
+}
+DG_DEVICE void tensormap_replace_global_inner_dim(void* smem_desc, uint32_t dim0) {
+    asm volatile("tensormap.replace.tile.global_dim.shared::cta.b1024.b32 [%0], 0, %1;"
+                 :: "r"(cvta_shared_to_u32(smem_desc)), "r"(dim0) : "memory");
+}
+DG_DEVICE void tensormap_replace_global_inner_stride(void* smem_desc, uint64_t stride0) {
+    asm volatile("tensormap.replace.tile.global_stride.shared::cta.b1024.b64 [%0], 0, %1;"
+                 :: "r"(cvta_shared_to_u32(smem_desc)), "l"(stride0) : "memory");
+}
+DG_DEVICE void tensormap_fence_release_gpu() {
+    asm volatile("fence.proxy.tensormap::generic.release.gpu;" ::: "memory");
+}
+DG_DEVICE void tensormap_fence_acquire_gpu(const void* gmem_desc) {
+    asm volatile("fence.proxy.tensormap::generic.acquire.gpu [%0], 128;" :: "l"(gmem_desc) : "memory");
+}
+DG_DEVICE void tma_desc_commit_group() { asm volatile("cp.async.bulk.commit_group;" ::: "memory"); }
+DG_DEVICE void tma_desc_wait_group() {
+    asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
+}
+
+// ---------------------------------------------------------------------------
+// K-grouped scheduler support moved into `Scheduler` itself (see above):
+// `gemm_type_is_k_grouped` + `get_next_k_group` + the K-grouped branch of
+// `get_next_block` (weight-grad GEMMs: A/B stacked along K).
+//
+// The tensormap runtime-patching primitives just above (`tensormap_replace_*`,
+// `tma_desc_commit_group`, `tensormap_fence_*`) are consumed by the SM90 1D1D
+// kernel at every K-group transition: patch SMEM copy -> commit/wait in-flight
+// TMA reads -> store to GMEM buffer -> release fence -> acquire on the new
+// descriptor. This keeps ONE persistent launch across all K groups (zero
+// relaunch overhead), the reason weight-grad GEMMs are fused this way.
+// ---------------------------------------------------------------------------
 
 } // namespace dg
