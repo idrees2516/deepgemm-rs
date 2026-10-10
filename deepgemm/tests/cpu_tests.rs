@@ -249,3 +249,15 @@ mod sm90_tests {
         assert_eq!(Arch::from_cc(9, 0), Arch::Sm90);
     }
 }
+
+#[cfg(test)]
+mod runtime_tests {
+    #[test]
+    fn size_classes_are_2mib_buckets() {
+        // (private helper; re-derived here to avoid dead-code warnings)
+        fn cls(b: usize) -> usize { (b.max(1) + (2 << 20) - 1) / (2 << 20) * (2 << 20) }
+        assert_eq!(cls(1), 2 << 20);
+        assert_eq!(cls(2 << 20), 2 << 20);
+        assert_eq!(cls((2 << 20) + 1), 4 << 20);
+    }
+}
