@@ -23,6 +23,10 @@ pub mod kernel_src {
     pub const GEMM_SM100: &str = include_str!("../kernels/gemm_sm100.cu");
     pub const LAYOUT_QUANT: &str = include_str!("../kernels/layout_quant.cu");
     pub const MQA_LOGITS: &str = include_str!("../kernels/mqa_logits_sm100.cu");
+    pub const MQA_SM90: &str = include_str!("../kernels/mqa_logits_sm90.cu");
+    pub const SPARSE_MQA: &str = include_str!("../kernels/sparse_mqa_sm100.cu");
+    pub const HC_PRENORM: &str = include_str!("../kernels/hc_prenorm.cu");
+    pub const GEMM_SM90_1D2D: &str = include_str!("../kernels/gemm_sm90_1d2d.cu");
     pub const WGMMA_H: &str = include_str!("../kernels/wgmma.h");
     pub const GEMM_SM90_CU: &str = include_str!("../kernels/gemm_sm90.cu");
 
