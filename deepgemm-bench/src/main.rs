@@ -766,6 +766,26 @@ fn kernel_variants(arch: &str) -> Vec<(&'static str, &'static str, String)> {
 }"#
                 .to_string(),
             ),
+            (
+                "locality probe chase",
+                kernel_src::LOCALITY_PROBE,
+                deepgemm::locality::locality_probe_body(8),
+            ),
+            (
+                "gemm fp8 nt quant-out m128 n256",
+                kernel_src::GEMM_SM100,
+                r#"extern "C" __global__ void __dg_kernel(
+    int* grouped_layout, unsigned num_groups, unsigned m, unsigned n, unsigned k,
+    const __grid_constant__ dg::TmaMap tma_a, const __grid_constant__ dg::TmaMap tma_b,
+    const __grid_constant__ dg::TmaMap tma_sfa, const __grid_constant__ dg::TmaMap tma_sfb,
+    const __grid_constant__ dg::TmaMap tma_cd,
+    unsigned* sfd, unsigned sfd_stride) {
+    dg::gemm_sm100_impl<0, 0, 32, 32, 1, 0, 0, 0, 1, 1, 1, 1, 128, 256, 128, 128, 128, 128, 12, 2, 2, 1, 0,
+        (dg::GemmType)0, 0, 0, 1, 148, 1>
+        (grouped_layout, num_groups, m, n, k, tma_a, tma_b, tma_sfa, tma_sfb, tma_cd, sfd, sfd_stride);
+}"#
+                .to_string(),
+            ),
         ]);
     } else {
         // sm_90a: wgmma suite. Stage counts verified against the SM90 smem

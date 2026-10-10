@@ -34,6 +34,7 @@ fn gemm_body(
     gran_b: u32,
     accumulate: bool,
     num_sms: u32,
+    with_output_sf: bool,
 ) -> String {
     let has_sf = !(a.dtype == Dtype::Bf16 && b.dtype == Dtype::Bf16);
     let is_mxf4 = a.dtype == Dtype::Fp4 && b.dtype == Dtype::Fp4;
@@ -68,7 +69,7 @@ fn gemm_body(
     const __grid_constant__ dg::TmaMap tma_b,
     const __grid_constant__ dg::TmaMap tma_sfa,
     const __grid_constant__ dg::TmaMap tma_sfb,
-    const __grid_constant__ dg::TmaMap tma_cd) {{
+    const __grid_constant__ dg::TmaMap tma_cd{sf_params}) {{
     dg::gemm_sm100_impl<
         {major_a}, {major_b},
         {gran_a}, {gran_b}, {has_sf}, {is_mxf4},
@@ -81,10 +82,20 @@ fn gemm_body(
         {cluster}, {mc_on_a},
         {swap_ab}, (dg::GemmType){gt}, {accum},
         {cd_float}, {cd_elem},
-        {num_sms}
+        {num_sms}, {with_sf}
     >(grouped_layout, num_groups, shape_m, shape_n, shape_k,
-      tma_a, tma_b, tma_sfa, tma_sfb, tma_cd);
+      tma_a, tma_b, tma_sfa, tma_sfb, tma_cd{sf_args});
 }}"#,
+        sf_params = if with_output_sf {
+            String::from(",\n    unsigned* sfd, unsigned sfd_stride")
+        } else {
+            String::new()
+        },
+        sf_args = if with_output_sf {
+            String::from(", sfd, sfd_stride")
+        } else {
+            String::new()
+        },
         major_a = a.major as u32,
         major_b = b.major as u32,
         gran_a = if has_sf { gran_a } else { 32 },
@@ -112,6 +123,7 @@ fn gemm_body(
         cd_float = cd_is_float as u32,
         cd_elem = cd_elem,
         num_sms = num_sms,
+        with_sf = with_output_sf as u32,
     )
 }
 
@@ -131,6 +143,7 @@ fn run_gemm(
     num_groups: u32,
     expected_m: u32,
     accumulate: bool,
+    output_sf: Option<(&DevBuffer, u32)>,
 ) -> DgResult<()> {
     let dev = ctx.dev;
     if !matches!(dev.arch, crate::device::Arch::Sm100) {
@@ -150,6 +163,32 @@ fn run_gemm(
         return Err(DgError::InvalidArg(
             "FP8/FP4 operands require scale factors".into(),
         ));
+    }
+
+    if let Some((_, _)) = output_sf {
+        // Fused QuantizeToFP8 epilogue (upstream `operators::QuantizeToFP8`).
+        if gemm_type != GemmType::Normal {
+            return Err(DgError::InvalidArg(
+                "fused output-SF quantization supports the Normal GEMM path".into(),
+            ));
+        }
+        if out.dtype != Dtype::Fp8 {
+            return Err(DgError::InvalidArg(
+                "fused output-SF quantization requires an E4M3 D".into(),
+            ));
+        }
+        if accumulate {
+            return Err(DgError::InvalidArg(
+                "fused output-SF quantization requires a direct (non-accumulating) D".into(),
+            ));
+        }
+        if out.cols < 128 || out.cols % 32 != 0 {
+            return Err(DgError::InvalidArg(
+                "fused output-SF quantization requires N >= 128 and N % 32 == 0 \
+                 (a store must cover complete 32-wide SF groups)"
+                    .into(),
+            ));
+        }
     }
 
     // Heuristics
@@ -345,15 +384,26 @@ fn run_gemm(
         gran_b,
         accumulate,
         dev.num_sms,
+        output_sf.is_some(),
     );
     let sig = format!(
         "{:?}",
-        (cfg, gemm_type, a.dtype, b.dtype, out.dtype, gran_a, gran_b, accumulate)
+        (
+            cfg,
+            gemm_type,
+            a.dtype,
+            b.dtype,
+            out.dtype,
+            gran_a,
+            gran_b,
+            accumulate,
+            output_sf.is_some()
+        )
     );
     let func = jit::get_kernel(dev, jit::kernel_src::GEMM_SM100, "gemm_sm100", &sig, &body)?;
 
     let gl_ptr = grouped_layout.map(|b| b.ptr).unwrap_or(0);
-    let args = Args::new()
+    let mut args = Args::new()
         .devptr(gl_ptr)
         .u32(num_groups)
         .u32(out.rows)
@@ -364,6 +414,9 @@ fn run_gemm(
         .tensormap(&tm_sfa)
         .tensormap(&tm_sfb)
         .tensormap(&tm_cd);
+    if let Some((sfd, sfd_stride)) = output_sf {
+        args = args.devptr(sfd.ptr).u32(sfd_stride);
+    }
 
     let launch_cfg = sys::LaunchEx {
         grid: (dev.num_sms, 1, 1),
@@ -413,6 +466,7 @@ pub fn gemm_nt(
         1,
         a.rows,
         accumulate,
+        None,
     )
 }
 
@@ -426,6 +480,58 @@ pub fn fp8_gemm_nt(
     accumulate: bool,
 ) -> DgResult<()> {
     gemm_nt(dev, stream, a, b, out, accumulate)
+}
+
+/// SFD layout for [`fp8_gemm_nt_quant_out`]: `(word_rows, row_stride)` of
+/// the packed UE8M0 scale-factor output, i.e. `[ceil(n/32/4), align(m, 4)]`
+/// `uint32` words (MN-major, TMA-aligned — the same layout the GEMM accepts
+/// as SFA, so the output feeds straight into the next FP8 GEMM).
+pub fn output_sf_layout(n: u32, m: u32) -> (u32, u32) {
+    (n.div_ceil(128), m.div_ceil(4) * 4)
+}
+
+/// FP8 GEMM whose epilogue *fuses* the dynamic-output quantization (upstream
+/// `epilogue::operators::QuantizeToFP8`): the fp32 accumulator is rounded to
+/// BF16, then cast to E4M3 with per-row, per-32-column UE8M0 scale factors
+/// packed into `sfd` — bitwise identical to a BF16 `D` followed by the
+/// standalone cast kernel, without the extra round trip through HBM.
+///
+/// * `out.dtype` must be [`Dtype::Fp8`]; no accumulation; Normal GEMM only.
+/// * `sfd` must hold `output_sf_layout(n, m)` words and be **zeroed by the
+///   caller** (rows/blocks past `shape_m`/`shape_n` stay zero).
+/// * Requires `n >= 128` and `n % 32 == 0`.
+pub fn fp8_gemm_nt_quant_out(
+    dev: &Device,
+    stream: &DevStream,
+    a: &Operand,
+    b: &Operand,
+    out: &mut Output,
+    sfd: &DevBuffer,
+) -> DgResult<()> {
+    let (words_n, stride) = output_sf_layout(out.cols, out.rows);
+    let need = words_n as usize * stride as usize * 4;
+    if sfd.len < need {
+        return Err(DgError::InvalidArg(format!(
+            "sfd buffer too small: {need} bytes required, {} given",
+            sfd.len
+        )));
+    }
+    let ctx = LaunchCtx {
+        dev,
+        stream: stream.raw(),
+    };
+    run_gemm(
+        &ctx,
+        a,
+        b,
+        out,
+        GemmType::Normal,
+        None,
+        1,
+        a.rows,
+        false,
+        Some((sfd, stride)),
+    )
 }
 
 /// Alias of [`gemm_nt`] for packed FP4 operands — the native Blackwell
@@ -490,6 +596,7 @@ pub fn m_grouped_gemm_nt_contiguous(
         num_groups,
         a.rows,
         false,
+        None,
     )
 }
 
@@ -525,6 +632,7 @@ pub fn m_grouped_gemm_nt_masked(
         num_groups,
         expected_m,
         false,
+        None,
     )
 }
 
@@ -552,6 +660,7 @@ pub fn fp8_bmm(
         batch,
         a.rows,
         accumulate,
+        None,
     )
 }
 

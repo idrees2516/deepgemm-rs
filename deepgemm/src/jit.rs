@@ -27,6 +27,7 @@ pub mod kernel_src {
     pub const SPARSE_MQA: &str = include_str!("../kernels/sparse_mqa_sm100.cu");
     pub const HC_PRENORM: &str = include_str!("../kernels/hc_prenorm.cu");
     pub const GEMM_SM90_1D2D: &str = include_str!("../kernels/gemm_sm90_1d2d.cu");
+    pub const LOCALITY_PROBE: &str = include_str!("../kernels/locality_probe.cu");
     pub const WGMMA_H: &str = include_str!("../kernels/wgmma.h");
     pub const GEMM_SM90_CU: &str = include_str!("../kernels/gemm_sm90.cu");
 
@@ -450,6 +451,14 @@ impl Args {
     pub fn tensormap(mut self, m: &sys::TensorMap) -> Self {
         let bytes =
             unsafe { std::slice::from_raw_parts(m as *const sys::TensorMap as *const u8, 128) };
+        self.raw.push(bytes.to_vec());
+        self
+    }
+
+    /// Arbitrary by-value struct argument (e.g. the MegaMoE symmetric-buffer
+    /// descriptor: rank index + per-rank base pointers). The bytes must match
+    /// the device-side struct layout exactly.
+    pub fn raw_bytes(mut self, bytes: &[u8]) -> Self {
         self.raw.push(bytes.to_vec());
         self
     }

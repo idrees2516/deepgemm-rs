@@ -113,19 +113,32 @@ DG_DEVICE void tma_load_2d_sf(const TmaMap* map, Barrier* bar, uint32_t* smem,
 template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t STORE_BLOCK_M, uint32_t STORE_BLOCK_N,
           uint32_t kSwizzleCDMode, uint32_t kNumTMAStoreStages, uint32_t kNumUMMAStoreThreads,
           uint32_t kNumOverlappedTmemCols, GemmType kGemmType, bool kWithAccumulation,
-          bool kCdIsFloat, uint32_t kCdElemSize, typename Smem>
+          bool kCdIsFloat, uint32_t kCdElemSize, bool kWithOutputSF, typename Smem>
 DG_DEVICE void store_cd(Smem& smem, uint32_t& tma_stage_idx, uint32_t tmem_base_addr,
                         uint32_t base_m_idx, uint32_t base_n_idx, uint32_t batch_idx,
                         uint32_t epilogue_warp_idx, uint32_t lane_idx,
                         bool reverse_store_order,
                         const Barrier* tmem_overlap_barrier, const Barrier* tmem_empty_barrier,
-                        const TmaMap& tensor_map_cd) {
+                        const TmaMap& tensor_map_cd,
+                        uint32_t* sfd, uint32_t sfd_stride, uint32_t shape_m, uint32_t shape_n) {
     constexpr uint32_t kNumBankGroupBytes = 16;
     constexpr uint32_t kNumElemsPerBankGroup = kNumBankGroupBytes / kCdElemSize;
     constexpr uint32_t kNumMWaves = BLOCK_M / STORE_BLOCK_M;
     constexpr uint32_t kNumStores = BLOCK_N / STORE_BLOCK_N;
     constexpr uint32_t kNumLoads = STORE_BLOCK_N / kNumElemsPerBankGroup;
     constexpr uint32_t kNumOverlapLoads = (kNumOverlappedTmemCols + kNumElemsPerBankGroup - 1) / kNumElemsPerBankGroup;
+
+    // ---- Fused QuantizeToFP8 (upstream `epilogue::operators::QuantizeToFP8`) ----
+    // Casts the fp32 accumulator to E4M3 with dynamic per-row, per-32-column
+    // UE8M0 scale factors, written packed into `sfd` in the same TMA-aligned
+    // MN-major layout the GEMM accepts for SFA. The accumulator is rounded
+    // into BF16 *before* amax/scale/cast, so the output bitwise matches a
+    // BF16 D followed by the standalone per-token cast kernel.
+    constexpr uint32_t kSFGranN = 32;
+    DG_STATIC_ASSERT(!kWithOutputSF || (kCdElemSize == 1 && !kCdIsFloat && !kWithAccumulation),
+                     "QuantizeToFP8 requires a direct E4M3 D");
+    DG_STATIC_ASSERT(!kWithOutputSF || STORE_BLOCK_N % kSFGranN == 0,
+                     "A store must cover complete SF groups");
 
     for (uint32_t w = 0; w < kNumMWaves; ++w) {
         for (uint32_t s = 0; s < kNumStores; ++s, tma_stage_idx = (tma_stage_idx + 1) % kNumTMAStoreStages) {
@@ -149,6 +162,82 @@ DG_DEVICE void store_cd(Smem& smem, uint32_t& tma_stage_idx, uint32_t tmem_base_
                      + row * (kNumBankGroupBytes * 8) + col * kNumBankGroupBytes;
             };
 
+            if (kWithOutputSF) {
+                // One SF group = 32 consecutive N values = two 16-value bank
+                // groups, both belonging to this lane's row (`lane = row`).
+                // `fg` is the flat SF-group index inside the store; under
+                // `reverse_store_order` groups (and their halves) are loaded
+                // in descending column order so the overlap release points
+                // keep their original issue-order meaning, but values are
+                // assembled and stored by COLUMN index.
+                constexpr uint32_t kNumSFGroupsPerStore = STORE_BLOCK_N / kSFGranN;
+                uint32_t issue_cnt = 0;  // issue-order counter (releases)
+                for (uint32_t g = 0; g < kNumSFGroupsPerStore; ++g) {
+                    const uint32_t fg = reverse_store_order ? (kNumSFGroupsPerStore - 1 - g) : g;
+                    uint32_t vals[kSFGranN];
+                    #pragma unroll
+                    for (uint32_t half = 0; half < 2; ++half) {
+                        const uint32_t i = reverse_store_order
+                            ? (kNumLoads - 1 - (g * 2 + half)) : (fg * 2 + half);
+                        const uint32_t tmem_addr = tmem_base_addr
+                                                 + w * BLOCK_N
+                                                 + store_idx * STORE_BLOCK_N + i * kNumElemsPerBankGroup;
+                        uint32_t raw[16];
+                        tmem_load_32dp32b_x16(tmem_addr, raw);
+                        fence_view_async_tmem_load();
+                        // Assemble by column: odd bank group = upper 16 cols.
+                        const uint32_t dst_base = (i & 1u) ? 16u : 0u;
+                        #pragma unroll
+                        for (uint32_t j = 0; j < 16; ++j) vals[dst_base + j] = raw[j];
+
+                        if (kNumOverlapLoads > 0) {
+                            if (w == 0 && s == 0 && issue_cnt + 1 == kNumOverlapLoads) {
+                                tcgen05_before_thread_sync();
+                                tmem_overlap_barrier->arrive_cluster(0);
+                            }
+                        }
+                        if (w == kNumMWaves - 1 && s == kNumStores - 1 && issue_cnt == kNumLoads - 1) {
+                            tcgen05_before_thread_sync();
+                            tmem_empty_barrier->arrive_cluster(0);
+                        }
+                        ++issue_cnt;
+                    }
+
+                    // Round to BF16 first (the bitwise contract), then amax.
+                    uint32_t packed[16];
+                    #pragma unroll
+                    for (uint32_t j = 0; j < 16; ++j)
+                        packed[j] = cast_bf16_and_pack(vals[2 * j], vals[2 * j + 1]);
+                    uint32_t amax = get_packed_bf16_amax(packed[0]);
+                    #pragma unroll
+                    for (uint32_t j = 1; j < 16; ++j)
+                        amax = hmax2_bf16x2(amax, get_packed_bf16_amax(packed[j]));
+                    const uint32_t sf_exp = get_ue8m0_sf_exp_e4m3(amax);
+                    const uint32_t sf_inv = get_ue8m0_sf_inv_bf16(sf_exp);
+
+                    // Scale + cast: 32 bf16 -> 32 E4M3 bytes (8 packed words).
+                    uint32_t q[8];
+                    #pragma unroll
+                    for (uint32_t j = 0; j < 8; ++j)
+                        q[j] = scale_bf16x2_into_fp8x4(packed[2 * j], packed[2 * j + 1], sf_inv);
+                    // Lower 16 values (q[0..4)) -> bank group fg*2, upper -> fg*2+1.
+                    st_shared_u32x4((uint32_t*)get_swizzled_smem_ptr(fg * 2), q[0], q[1], q[2], q[3]);
+                    st_shared_u32x4((uint32_t*)get_swizzled_smem_ptr(fg * 2 + 1), q[4], q[5], q[6], q[7]);
+
+                    // Store the SF byte (upstream `store_sf`): word index
+                    // `sf_idx/4` in the MN-major SFD, byte lane `sf_idx%4`;
+                    // batches flatten their SF columns along (batch, n).
+                    // Row: this lane's row within the warp's 32-row slab of
+                    // the store block (same mapping as the swizzle atom).
+                    const uint32_t row_idx = m_idx + epilogue_warp_idx * 32 + lane_idx;
+                    const uint32_t group_n_idx = n_idx + fg * kSFGranN;
+                    if (row_idx < shape_m && group_n_idx < shape_n) {
+                        const uint32_t sf_idx = (batch_idx * shape_n + group_n_idx) / kSFGranN;
+                        uint32_t* sf_word_ptr = sfd + (sf_idx / 4) * sfd_stride + row_idx;
+                        ((uint8_t*)sf_word_ptr)[sf_idx % 4] = (uint8_t)sf_exp;
+                    }
+                }
+            } else {
             #pragma unroll
             for (uint32_t i = 0; i < kNumLoads; ++i) {
                 const uint32_t load_idx = reverse_store_order ? kNumLoads - 1 - i : i;
@@ -186,6 +275,7 @@ DG_DEVICE void store_cd(Smem& smem, uint32_t& tma_stage_idx, uint32_t tmem_base_
                                     cast_bf16_and_pack(values[4], values[5]),
                                     cast_bf16_and_pack(values[6], values[7]));
                 }
+            }
             }
 
             tma_store_fence();
@@ -317,7 +407,7 @@ template <uint32_t kMajorA, uint32_t kMajorB,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
           bool kSwapAB, GemmType kGemmType, bool kWithAccumulation,
           bool kCdIsFloat, uint32_t kCdElemSize,
-          uint32_t kNumSMs>
+          uint32_t kNumSMs, bool kWithOutputSF = false>
 DG_GLOBAL void __launch_bounds__(256, 1)
 gemm_sm100_impl(int* grouped_layout, uint32_t num_groups,
                 uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
@@ -325,7 +415,8 @@ gemm_sm100_impl(int* grouped_layout, uint32_t num_groups,
                 const __grid_constant__ TmaMap tensor_map_b,
                 const __grid_constant__ TmaMap tensor_map_sfa,
                 const __grid_constant__ TmaMap tensor_map_sfb,
-                const __grid_constant__ TmaMap tensor_map_cd) {
+                const __grid_constant__ TmaMap tensor_map_cd,
+                uint32_t* sfd = nullptr, uint32_t sfd_stride = 0) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)) || defined(DG_HOST_EDIT)
     constexpr bool kIsMGroupedContig = kGemmType == GemmType::MGroupedContiguous;
     constexpr bool kIsBatched = kGemmType == GemmType::Batched;
@@ -717,6 +808,8 @@ gemm_sm100_impl(int* grouped_layout, uint32_t num_groups,
             const uint32_t base_n_idx = n_block_idx * BLOCK_N;
 
             if (kSwapAB) {
+                DG_STATIC_ASSERT(!kWithOutputSF || !kSwapAB,
+                                 "QuantizeToFP8 is only wired for the non-swapped epilogue");
                 store_cd_swap_ab<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
                                  kSwizzleCDMode, kNumTMAStoreStages, kNumUMMAStoreThreads,
                                  kNumOverlappedTmemCols, kGemmType, kWithAccumulation,
@@ -731,13 +824,14 @@ gemm_sm100_impl(int* grouped_layout, uint32_t num_groups,
                 store_cd<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
                          kSwizzleCDMode, kNumTMAStoreStages, kNumUMMAStoreThreads,
                          kNumOverlappedTmemCols, kGemmType, kWithAccumulation,
-                         kCdIsFloat, kCdElemSize>(
+                         kCdIsFloat, kCdElemSize, kWithOutputSF>(
                     smem, tma_stage_idx, tmem_base_addr, base_m_idx, base_n_idx,
                     scheduler.current_group_idx, epilogue_warp_idx, lane_idx,
                     reverse_store_order,
                     &smem->tmem_overlap_barriers[accum_stage_idx],
                     &smem->tmem_empty_barriers[accum_stage_idx],
-                    tensor_map_cd);
+                    tensor_map_cd,
+                    sfd, sfd_stride, shape_m, shape_n);
             }
         }
     }

@@ -39,6 +39,7 @@ pub mod error;
 pub mod golden;
 pub mod heuristics;
 pub mod jit;
+pub mod locality;
 pub mod moe_layout;
 pub mod runtime;
 pub mod sm90;
