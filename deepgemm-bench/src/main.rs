@@ -137,13 +137,18 @@ fn run_mqa_paged_bench(dev: &Device, stream: &DevStream, iters: u32, warmup: u32
     let weights = DevBuffer::alloc_zeros(dev, (num_tokens * heads) as usize * 2)?;
     let context_lens: Vec<u32> = vec![ctx_len; num_tokens as usize];
     let indices: Vec<u32> = (0..num_tokens).collect::<Vec<u32>>(); // 1 token/req
-    // Per-TOKEN rows: [num_tokens, num_pages_per_req], identity page ids.
+                                                                   // Per-TOKEN rows: [num_tokens, num_pages_per_req], identity page ids.
     let block_table: Vec<u32> = (0..num_tokens * num_pages_per_req).collect::<Vec<u32>>();
     let mut out = DevBuffer::alloc_zeros(dev, (num_tokens * ctx_len) as usize * 2)?;
 
     let q = Operand {
-        dtype: Dtype::Fp8, major: Major::K, rows: q_rows, k: head_dim,
-        outer_stride: head_dim, sf: None, data: q_data,
+        dtype: Dtype::Fp8,
+        major: Major::K,
+        rows: q_rows,
+        k: head_dim,
+        outer_stride: head_dim,
+        sf: None,
+        data: q_data,
     };
     let cl = alloc_and_upload(dev, &context_lens, stream.raw())?;
     let idx = alloc_and_upload(dev, &indices, stream.raw())?;
@@ -151,15 +156,34 @@ fn run_mqa_paged_bench(dev: &Device, stream: &DevStream, iters: u32, warmup: u32
 
     let run_once = |out: &mut DevBuffer| -> DgResult<()> {
         deepgemm::api::mqa_logits_paged(
-            dev, stream, &q, &q_sf, &kv_pages, &kv_sf_pages, &weights,
-            page_kv, num_pages, &cl, &idx, &bt, num_pages_per_req,
-            num_tokens, heads, head_dim, out, ctx_len,
+            dev,
+            stream,
+            &q,
+            &q_sf,
+            &kv_pages,
+            &kv_sf_pages,
+            &weights,
+            page_kv,
+            num_pages,
+            &cl,
+            &idx,
+            &bt,
+            num_pages_per_req,
+            num_tokens,
+            heads,
+            head_dim,
+            out,
+            ctx_len,
         )
     };
-    for _ in 0..warmup { run_once(&mut out)?; }
+    for _ in 0..warmup {
+        run_once(&mut out)?;
+    }
     stream.sync()?;
     let t0 = std::time::Instant::now();
-    for _ in 0..iters { run_once(&mut out)?; }
+    for _ in 0..iters {
+        run_once(&mut out)?;
+    }
     stream.sync()?;
     let elapsed = t0.elapsed().as_secs_f64();
     let tokens = num_tokens as f64;

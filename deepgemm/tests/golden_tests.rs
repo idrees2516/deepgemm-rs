@@ -404,10 +404,16 @@ fn mqa_logits_ref_matches_naive_computation() {
 fn golden_quantize_output_fp8_rne_matches_upstream_formula() {
     // The UE8M0-for-E4M3 exponent + hardware RNE must match golden::.
     use deepgemm::golden;
-    let vals: Vec<f32> = (0..512).map(|i| {
-        let f = (i as f32) * 0.03125 - 8.0;
-        if i % 7 == 0 { f * 0.001 } else { f }
-    }).collect();
+    let vals: Vec<f32> = (0..512)
+        .map(|i| {
+            let f = (i as f32) * 0.03125 - 8.0;
+            if i % 7 == 0 {
+                f * 0.001
+            } else {
+                f
+            }
+        })
+        .collect();
     // amax per 32-group, golden ue8m0-for-e4m3 exponent, then RNE encode.
     for g in 0..16 {
         let grp = &vals[g * 32..(g + 1) * 32];

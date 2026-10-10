@@ -255,9 +255,68 @@ mod runtime_tests {
     #[test]
     fn size_classes_are_2mib_buckets() {
         // (private helper; re-derived here to avoid dead-code warnings)
-        fn cls(b: usize) -> usize { (b.max(1) + (2 << 20) - 1) / (2 << 20) * (2 << 20) }
+        fn cls(b: usize) -> usize {
+            (b.max(1) + (2 << 20) - 1) / (2 << 20) * (2 << 20)
+        }
         assert_eq!(cls(1), 2 << 20);
         assert_eq!(cls(2 << 20), 2 << 20);
         assert_eq!(cls((2 << 20) + 1), 4 << 20);
+    }
+}
+
+#[cfg(test)]
+mod moe_layout_tests {
+    use deepgemm::moe_layout::*;
+
+    #[test]
+    fn pool_tokens_match_upstream_formula() {
+        // num_max_pool_tokens(ranks, per_rank, topk, per_rank_experts):
+        // align(recv * min(topk, epr) + epr*(240-1), 1920)
+        let t = num_max_pool_tokens(2, 128, 8, 32);
+        let recv = 2 * 128;
+        let epr = 32;
+        let want = {
+            let raw = recv * (8u32.min(32)) + epr * 239;
+            (raw + 1919) / 1920 * 1920
+        };
+        assert_eq!(t, want);
+        // Single rank degenerate case.
+        let t1 = num_max_pool_tokens(1, 64, 4, 16);
+        assert!(t1 >= 64 * 4 + 16 * 239);
+    }
+
+    #[test]
+    fn sf_ring_tokens_scale_with_block_m() {
+        assert_eq!(num_sf_ring_tokens(1920, 128), 1920 / 128 * 128);
+        assert_eq!(
+            num_sf_ring_tokens(1920, 240),
+            1920 / 240 * 256 /*align240->256*/
+        );
+    }
+
+    #[test]
+    fn shared_sf_tokens_are_128_padded() {
+        let t = num_max_shared_sf_tokens(100);
+        assert_eq!(t, (100 / 8 + 1) * 128); // ceil(100/8)=13 -> 1664
+    }
+
+    #[test]
+    fn signals_layout_offsets_are_128_aligned_after_head() {
+        let l = MegaMoESignalsLayout::new(8);
+        assert!(l.offset_combine_ready >= 160);
+        assert_eq!(l.offset_combine_ready % 128, 0);
+        assert_eq!(l.offset_peer_grid_idx % 128, 0);
+        assert!(l.total_bytes > 20usize << 20); // ring signals alone = 20MiB
+                                                // Rank count matters only past the 128B padding granularity.
+        let l64 = MegaMoESignalsLayout::new(64);
+        assert!(l64.total_bytes > l.total_bytes);
+    }
+
+    #[test]
+    fn workspace_sizes_single_rank() {
+        let w = MoEWorkspace::new(1, 128, 512, 8);
+        assert_eq!(w.num_experts_per_rank, 128);
+        assert!(w.num_max_pool_tokens >= 512 * 8);
+        assert!(w.signals_bytes > (20usize << 20));
     }
 }

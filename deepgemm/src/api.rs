@@ -952,9 +952,9 @@ pub fn mqa_logits_paged(
     stream: &DevStream,
     q: &Operand,
     q_sf: &SfTensor,
-    kv_pages: &DevBuffer,     // [num_pages, PAGE_KV, head_dim]
-    kv_sf_pages: &DevBuffer,  // [num_pages, PAGE_KV] int32 (word/token)
-    weights: &DevBuffer,      // [num_q_tokens, heads] bf16
+    kv_pages: &DevBuffer,    // [num_pages, PAGE_KV, head_dim]
+    kv_sf_pages: &DevBuffer, // [num_pages, PAGE_KV] int32 (word/token)
+    weights: &DevBuffer,     // [num_q_tokens, heads] bf16
     page_kv: u32,
     num_pages: u32,
     context_lens: &DevBuffer, // [num_q_tokens]
@@ -976,10 +976,14 @@ pub fn mqa_logits_paged(
         return Err(DgError::InvalidArg("head_dim must be 32/64/128".into()));
     }
     if num_heads % 4 != 0 || num_heads > 256 {
-        return Err(DgError::InvalidArg("num_heads must be a multiple of 4 (<= 256)".into()));
+        return Err(DgError::InvalidArg(
+            "num_heads must be a multiple of 4 (<= 256)".into(),
+        ));
     }
     if page_kv == 0 || page_kv % 4 != 0 || 256 % page_kv != 0 {
-        return Err(DgError::InvalidArg("page_kv must divide 256 (multiple of 4)".into()));
+        return Err(DgError::InvalidArg(
+            "page_kv must divide 256 (multiple of 4)".into(),
+        ));
     }
     let is_fp4 = q.dtype == Dtype::Fp4;
     if q.dtype != Dtype::Fp8 && !is_fp4 {
@@ -993,8 +997,17 @@ pub fn mqa_logits_paged(
     // Deeper KV ring so full-ring reuse (num_kv_splits == kNumKVStages) fires.
     let (q_stages, kv_stages, tmem_stages) = (2u32, 4u32, 2u32);
 
-    let tm_q = tma::make_tma_mqa_qk(dev, q.dtype, &q.data, q.rows, head_dim, block_q * num_heads, is_fp4)?;
-    let tm_kv = tma::make_tma_mqa_qk_paged(dev, q.dtype, kv_pages, head_dim, page_kv, num_pages, is_fp4)?;
+    let tm_q = tma::make_tma_mqa_qk(
+        dev,
+        q.dtype,
+        &q.data,
+        q.rows,
+        head_dim,
+        block_q * num_heads,
+        is_fp4,
+    )?;
+    let tm_kv =
+        tma::make_tma_mqa_qk_paged(dev, q.dtype, kv_pages, head_dim, page_kv, num_pages, is_fp4)?;
     let tm_sf_q = tma::make_tma_mqa_sf(dev, &q_sf.buf, q.rows, block_q * num_heads)?;
     let tm_sf_kv = tma::make_tma_mqa_sf_paged(dev, kv_sf_pages, page_kv, num_pages)?;
     let tm_w = tma::make_tma_mqa_weights(dev, weights, num_heads, num_tokens)?;
@@ -1013,7 +1026,13 @@ pub fn mqa_logits_paged(
         block_q = block_q,
     );
     let meta_sig = format!("meta_{block_q}_{split_kv}");
-    let meta_func = jit::get_kernel(dev, jit::kernel_src::MQA_LOGITS, "mqa_meta", &meta_sig, &meta_body)?;
+    let meta_func = jit::get_kernel(
+        dev,
+        jit::kernel_src::MQA_LOGITS,
+        "mqa_meta",
+        &meta_sig,
+        &meta_body,
+    )?;
     let meta_args = Args::new()
         .ptr(context_lens.ptr as *const u8 as *const u32)
         .ptr(indices.ptr as *const u8 as *const u32)
@@ -1071,7 +1090,13 @@ pub fn mqa_logits_paged(
         page_kv = page_kv,
     );
     let sig = format!("mqa_paged_{num_heads}_{head_dim}_{block_q}_{is_fp4}_{page_kv}");
-    let func = jit::get_kernel(dev, jit::kernel_src::MQA_LOGITS, "mqa_logits_paged", &sig, &body)?;
+    let func = jit::get_kernel(
+        dev,
+        jit::kernel_src::MQA_LOGITS,
+        "mqa_logits_paged",
+        &sig,
+        &body,
+    )?;
 
     let qk_bytes_per_token = if is_fp4 { head_dim / 2 } else { head_dim };
     let smem = block_q * num_heads * qk_bytes_per_token * q_stages
@@ -1131,7 +1156,9 @@ pub fn quantize_output_fp8(
     stochastic: bool,
 ) -> DgResult<(DevBuffer, DevBuffer)> {
     if n % 32 != 0 {
-        return Err(DgError::InvalidArg("quantize_output_fp8 needs n % 32 == 0".into()));
+        return Err(DgError::InvalidArg(
+            "quantize_output_fp8 needs n % 32 == 0".into(),
+        ));
     }
     let out = DevBuffer::alloc(dev, (m * n) as usize)?;
     let tma_aligned = heuristics::tma_aligned_size(m, 4);
@@ -1147,7 +1174,13 @@ pub fn quantize_output_fp8(
         stoch = stochastic as u32,
     );
     let sig = format!("qo8_{stochastic}");
-    let func = jit::get_kernel(dev, jit::kernel_src::LAYOUT_QUANT, "quant_out_fp8", &sig, &body)?;
+    let func = jit::get_kernel(
+        dev,
+        jit::kernel_src::LAYOUT_QUANT,
+        "quant_out_fp8",
+        &sig,
+        &body,
+    )?;
     let args = Args::new()
         .devptr(src.ptr)
         .devptr(out.ptr)
