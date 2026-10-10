@@ -369,3 +369,33 @@ pub fn make_tma_mqa_sf(
         0,
     )
 }
+
+/// SM90 1D1D scale-factor map: FP32 scales, one row per 128-K block,
+/// MN-contiguous (col-major TMA-aligned), no swizzle, box [block_mn, 1].
+/// The GMEM layout is `scales[kb][mn]` with row stride `tma_aligned(mn, 4)`
+/// — produced by `api::transpose_sf_fp32` (port of the upstream Python
+/// `get_col_major_tma_aligned_tensor` step).
+#[allow(clippy::too_many_arguments)]
+pub fn make_tma_sf_fp32(
+    dev: &Device,
+    buf: &DevBuffer,
+    rows: u32,     // logical MN
+    k: u32,        // logical K
+    block_mn: u32, // SMEM box along MN (BLOCK_M or BLOCK_N)
+    num_groups: u32,
+) -> DgResult<sys::TensorMap> {
+    let tma_aligned = tma_aligned_size(rows, 4);
+    let sf_rows = ceil_div(k, 128);
+    make_tma_2d(
+        dev,
+        Dtype::F32,
+        false,
+        buf.ptr,
+        tma_aligned,
+        sf_rows * num_groups,
+        block_mn,
+        1,
+        tma_aligned,
+        0,
+    )
+}

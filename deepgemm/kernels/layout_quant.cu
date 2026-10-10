@@ -251,4 +251,29 @@ void dequant_mx_impl(const uint8_t* data, const uint32_t* sf,
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// transpose_sf_fp32: (mn, k/128) row-major FP32 scales  ->  SM90 1D1D layout
+// [kb, tma_aligned(mn)] col-major TMA-aligned (the upstream Python-side
+// `get_col_major_tma_aligned_tensor` step, done on device).  Output rows are
+// padded to 16B (mn % 4 for FP32) so every row is a legal TMA gmem row.
+// ---------------------------------------------------------------------------
+template <uint32_t kNumThreads>
+DG_GLOBAL __launch_bounds__(kNumThreads)
+void transpose_sf_fp32_impl(const float* in, float* out,
+                            uint32_t mn, uint32_t k_blocks, uint32_t tma_aligned_mn) {
+    // Elementwise: out[kb][mn_idx] = in[mn_idx][kb]; pad rows to
+    // tma_aligned_mn with zeros (16B TMA row alignment).
+    const uint64_t total = (uint64_t)k_blocks * tma_aligned_mn;
+    for (uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total;
+         idx += (uint64_t)gridDim.x * blockDim.x) {
+        griddepcontrol_wait();
+        const uint32_t kb = (uint32_t)(idx / tma_aligned_mn);
+        const uint32_t mn_idx = (uint32_t)(idx % tma_aligned_mn);
+        const float v = (mn_idx < mn) ? in[(uint64_t)mn_idx * k_blocks + kb] : 0.0f;
+        out[idx] = v;
+    }
+}
+
 } // namespace dg

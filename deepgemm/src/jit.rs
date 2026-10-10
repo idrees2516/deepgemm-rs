@@ -36,7 +36,8 @@ pub mod kernel_src {
     /// kernels reference the wgmma layer.
     pub fn sm90_unit() -> &'static str {
         static U: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-        U.get_or_init(|| format!("{WGMMA_H}\n{GEMM_SM90_CU}")).as_str()
+        U.get_or_init(|| format!("{WGMMA_H}\n{GEMM_SM90_CU}"))
+            .as_str()
     }
 }
 

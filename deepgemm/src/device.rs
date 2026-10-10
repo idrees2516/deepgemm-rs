@@ -253,3 +253,12 @@ pub fn download<T: bytemuck::Pod + Default + Clone>(
     }
     Ok(out)
 }
+
+/// Zero a buffer viewed as f32 elements, on the given stream (SM90 1D1D
+/// epilogue is TMA reduce-add, so D must start at zero for Normal GEMM).
+pub fn memset_f32(_dev: &Device, stream: &DevStream, buf: &DevBuffer, elems: u32) -> DgResult<()> {
+    if !buf.is_empty() && elems > 0 {
+        sys::memset_d8(buf.ptr, 0, elems as usize * 4, stream.raw())?;
+    }
+    Ok(())
+}

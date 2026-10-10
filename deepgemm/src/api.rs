@@ -57,6 +57,7 @@ fn gemm_body(
         GemmType::MGroupedContiguous => 1,
         GemmType::MGroupedMasked => 2,
         GemmType::Batched => 4,
+        GemmType::KGroupedContiguous => 5,
     };
 
     format!(
@@ -171,6 +172,8 @@ fn run_gemm(
         } else {
             1
         },
+        expected_k: 0,
+        with_accumulation: accumulate,
     };
     let cfg = heuristics::get_best_config(&desc)?;
     let l = &cfg.layout;

@@ -605,3 +605,339 @@ fn e2e_transform_sf_bit_exact_vs_golden() {
         );
     }
 }
+
+// ===========================================================================
+// SM90 (Hopper) e2e — requires --features e2e on an SM90 device.
+// ===========================================================================
+#[cfg(test)]
+mod sm90_e2e {
+    use deepgemm::device::{alloc_and_upload, DevBuffer};
+    use deepgemm::prelude::*;
+    use deepgemm::sm90;
+    use deepgemm::types::{Dtype, Major, Operand, Output};
+
+    fn dev_stream() -> (std::sync::Arc<Device>, DevStream) {
+        let dev = Device::new(0).expect("CUDA device");
+        let stream = DevStream::new(&dev).expect("stream");
+        (dev, stream)
+    }
+
+    fn dl_f32(dev: &Device, buf: &DevBuffer, stream: &DevStream) -> Vec<f32> {
+        deepgemm::device::download(dev, buf, stream.raw()).unwrap()
+    }
+
+    /// Decode e4m3 byte (round-trip of the bench data: we upload raw bytes, so
+    /// reference uses the standard e4m3 decode).
+    fn e4m3(b: u8) -> f32 {
+        let sign = if b & 0x80 != 0 { -1f32 } else { 1f32 };
+        let exp = ((b >> 3) & 0xf) as i32;
+        let man = (b & 7) as f32;
+        match (exp, b & 7) {
+            (0, 0) => 0.0,
+            (0, _) => sign * 2f32.powi(-6) * (1.0 + man / 8.0),
+            (15, 0) => sign * 448.0,
+            (15, _) => 448.0 * sign, // saturating payload; bench data avoids it
+            _ => sign * 2f32.powi(exp - 7) * (1.0 + man / 8.0),
+        }
+    }
+
+    #[test]
+    fn sm90_fp8_gemm_nt_matches_reference() {
+        let (dev, stream) = dev_stream();
+        if !matches!(dev.arch, deepgemm::device::Arch::Sm90) {
+            eprintln!("skip: not SM90");
+            return;
+        }
+        let (m, n, k) = (256u32, 128u32, 512u32);
+        // Random e4m3 codes (avoid NaN/inf patterns 0x7f/0xff).
+        let a_host: Vec<u8> = (0..(m * k))
+            .map(|i| ((i * 2654435761 + 7) % 0x70) as u8)
+            .collect();
+        let b_host: Vec<u8> = (0..(n * k))
+            .map(|i| ((i * 40503 + 3) % 0x70) as u8)
+            .collect();
+        let sfa_host: Vec<f32> = (0..(m * k / 128))
+            .map(|i| 2f32.powi(-3 + (i % 7) as i32))
+            .collect();
+        let sfb_host: Vec<f32> = (0..(n * k / 128))
+            .map(|i| 2f32.powi(-4 + (i % 5) as i32))
+            .collect();
+
+        let a = Operand {
+            dtype: Dtype::Fp8,
+            major: Major::K,
+            rows: m,
+            k,
+            outer_stride: k,
+            sf: None,
+            data: alloc_and_upload(&dev, &a_host, stream.raw()).unwrap(),
+        };
+        let b = Operand {
+            dtype: Dtype::Fp8,
+            major: Major::K,
+            rows: n,
+            k,
+            outer_stride: k,
+            sf: None,
+            data: alloc_and_upload(&dev, &b_host, stream.raw()).unwrap(),
+        };
+        let sfa = sm90::sf_fp32_from_host(&dev, &stream, &sfa_host, m, k / 128).unwrap();
+        let sfb = sm90::sf_fp32_from_host(&dev, &stream, &sfb_host, n, k / 128).unwrap();
+        let out_data = DevBuffer::alloc(&dev, (m * n * 4) as usize).unwrap();
+        let mut out = Output {
+            dtype: Dtype::F32,
+            rows: m,
+            cols: n,
+            stride: n,
+            data: out_data,
+        };
+        sm90::fp8_gemm_nt(&dev, &stream, &a, &sfa, &b, &sfb, &mut out).unwrap();
+        stream.sync().unwrap();
+
+        let got: Vec<f32> = dl_f32(&dev, &out.data, &stream);
+        let mut max_err = 0f64;
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0f64;
+                for kk in 0..k {
+                    acc += e4m3(a_host[(i * k + kk) as usize]) as f64
+                        * e4m3(b_host[(j * k + kk) as usize]) as f64
+                        * sfa_host[(i * k / 128 + kk / 128) as usize] as f64
+                        * sfb_host[(j * k / 128 + kk / 128) as usize] as f64;
+                }
+                let want = acc as f32;
+                let err = (got[(i * n + j) as usize] - want).abs();
+                assert!(
+                    err < 1e-3,
+                    "({i},{j}) got {} want {want}",
+                    got[(i * n + j) as usize]
+                );
+                max_err = max_err.max(err as f64);
+            }
+        }
+        eprintln!("sm90_fp8_nt: max_err {max_err}");
+    }
+
+    #[test]
+    fn sm90_fp8_gemm_kk_matches_reference() {
+        let (dev, stream) = dev_stream();
+        if !matches!(dev.arch, deepgemm::device::Arch::Sm90) {
+            eprintln!("skip: not SM90");
+            return;
+        }
+        let (m, n) = (128u32, 64u32);
+        let ks = [256u32, 128u32, 384u32];
+        let k: u32 = ks.iter().sum();
+        // Stacked tiles: group g is [mn, ks_g] K-major at offset k_start*mn.
+        let a_host: Vec<u8> = (0..(m as usize * k as usize))
+            .map(|i| ((i * 2654435761 + 11) % 0x70) as u8)
+            .collect();
+        let b_host: Vec<u8> = (0..(n as usize * k as usize))
+            .map(|i| ((i * 40503 + 5) % 0x70) as u8)
+            .collect();
+        // NOTE: the flat buffer IS the stacked layout when built group-by-group
+        // with row stride ks_g — a per-group [mn, ks_g] concat equals a plain
+        // [mn, sum] buffer only when every ks_g equals... it does NOT. Build it
+        // properly: for each group, m rows of ks_g.
+        let mut a_stack: Vec<u8> = Vec::with_capacity(a_host.len());
+        let mut b_stack: Vec<u8> = Vec::with_capacity(b_host.len());
+        let mut ref_a: Vec<Vec<f64>> = vec![vec![0.0; k as usize]; m as usize];
+        let mut ref_b: Vec<Vec<f64>> = vec![vec![0.0; k as usize]; n as usize];
+        let mut k_start = 0u32;
+        for &g in &ks {
+            for r in 0..m {
+                for kk in 0..g {
+                    let v = ((r * 31 + kk * 17 + k_start) % 0x70) as u8;
+                    a_stack.push(v);
+                    ref_a[r as usize][(k_start + kk) as usize] = e4m3(v) as f64;
+                }
+            }
+            for r in 0..n {
+                for kk in 0..g {
+                    let v = ((r * 13 + kk * 7 + k_start) % 0x70) as u8;
+                    b_stack.push(v);
+                    ref_b[r as usize][(k_start + kk) as usize] = e4m3(v) as f64;
+                }
+            }
+            k_start += g;
+        }
+        let sfa_host: Vec<f32> = (0..(m * k / 128))
+            .map(|i| 2f32.powi(-3 + (i % 7) as i32))
+            .collect();
+        let sfb_host: Vec<f32> = (0..(n * k / 128))
+            .map(|i| 2f32.powi(-4 + (i % 5) as i32))
+            .collect();
+
+        let a = Operand {
+            dtype: Dtype::Fp8,
+            major: Major::K,
+            rows: m,
+            k,
+            outer_stride: k,
+            sf: None,
+            data: alloc_and_upload(&dev, &a_stack, stream.raw()).unwrap(),
+        };
+        let b = Operand {
+            dtype: Dtype::Fp8,
+            major: Major::K,
+            rows: n,
+            k,
+            outer_stride: k,
+            sf: None,
+            data: alloc_and_upload(&dev, &b_stack, stream.raw()).unwrap(),
+        };
+        let sfa = sm90::sf_fp32_from_host(&dev, &stream, &sfa_host, m, k / 128).unwrap();
+        let sfb = sm90::sf_fp32_from_host(&dev, &stream, &sfb_host, n, k / 128).unwrap();
+        let out_data = DevBuffer::alloc(&dev, (ks.len() as u32 * m * n * 4) as usize).unwrap();
+        let mut out = Output {
+            dtype: Dtype::F32,
+            rows: m,
+            cols: n,
+            stride: n,
+            data: out_data,
+        };
+        sm90::fp8_gemm_kk(&dev, &stream, &a, &sfa, &b, &sfb, &ks, &mut out).unwrap();
+        stream.sync().unwrap();
+        let got: Vec<f32> = dl_f32(&dev, &out.data, &stream);
+
+        let mut max_err = 0f64;
+        for (g, _ks) in ks.iter().enumerate() {
+            for i in 0..m {
+                for j in 0..n {
+                    let mut acc = 0f64;
+                    for kk in 0..k {
+                        acc += ref_a[i as usize][kk as usize]
+                            * ref_b[j as usize][kk as usize]
+                            * sfa_host[(i * k / 128 + kk / 128) as usize] as f64
+                            * sfb_host[(j * k / 128 + kk / 128) as usize] as f64;
+                    }
+                    let want = acc as f32;
+                    let idx = (g as u32 * m * n + i * n + j) as usize;
+                    let err = (got[idx] - want).abs();
+                    assert!(err < 1e-3, "g{g} ({i},{j}) got {} want {want}", got[idx]);
+                    max_err = max_err.max(err as f64);
+                }
+            }
+        }
+        eprintln!("sm90_fp8_kk: max_err {max_err}");
+    }
+
+    #[test]
+    fn sm90_bf16_gemm_nt_matches_reference() {
+        let (dev, stream) = dev_stream();
+        if !matches!(dev.arch, deepgemm::device::Arch::Sm90) {
+            eprintln!("skip: not SM90");
+            return;
+        }
+        let (m, n, k) = (192u32, 96u32, 384u32);
+        let a_host: Vec<u16> = (0..(m * k))
+            .map(|i| deepgemm::golden::f32_to_bf16_bits(((i % 97) as f32) * 0.25 - 8.0))
+            .collect();
+        let b_host: Vec<u16> = (0..(n * k))
+            .map(|i| deepgemm::golden::f32_to_bf16_bits(((i % 89) as f32) * 0.125 - 4.0))
+            .collect();
+        let a = Operand {
+            dtype: Dtype::Bf16,
+            major: Major::K,
+            rows: m,
+            k,
+            outer_stride: k,
+            sf: None,
+            data: alloc_and_upload(&dev, &a_host, stream.raw()).unwrap(),
+        };
+        let b = Operand {
+            dtype: Dtype::Bf16,
+            major: Major::K,
+            rows: n,
+            k,
+            outer_stride: k,
+            sf: None,
+            data: alloc_and_upload(&dev, &b_host, stream.raw()).unwrap(),
+        };
+        let out_data = DevBuffer::alloc(&dev, (m * n * 4) as usize).unwrap();
+        let mut out = Output {
+            dtype: Dtype::F32,
+            rows: m,
+            cols: n,
+            stride: n,
+            data: out_data,
+        };
+        sm90::bf16_gemm_nt(&dev, &stream, &a, &b, &mut out, false).unwrap();
+        stream.sync().unwrap();
+        let got: Vec<f32> = dl_f32(&dev, &out.data, &stream);
+
+        let bf16 = |h: u16| f32::from_bits(((h as u32) << 16));
+        let mut max_err = 0f64;
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0f64;
+                for kk in 0..k {
+                    acc += bf16(a_host[(i * k + kk) as usize]) as f64
+                        * bf16(b_host[(j * k + kk) as usize]) as f64;
+                }
+                let want = acc as f32;
+                let err = (got[(i * n + j) as usize] - want).abs();
+                assert!(
+                    err < 1e-2,
+                    "({i},{j}) got {} want {want}",
+                    got[(i * n + j) as usize]
+                );
+                max_err = max_err.max(err as f64);
+            }
+        }
+        eprintln!("sm90_bf16_nt(fp32 out): max_err {max_err}");
+
+        // BF16 output flavor + accumulation.
+        let out2 = DevBuffer::alloc(&dev, (m * n * 2) as usize).unwrap();
+        let mut out_bf16 = Output {
+            dtype: Dtype::Bf16,
+            rows: m,
+            cols: n,
+            stride: n,
+            data: out2,
+        };
+        sm90::bf16_gemm_nt(&dev, &stream, &a, &b, &mut out_bf16, true).unwrap();
+        stream.sync().unwrap();
+        let got2: Vec<u16> =
+            deepgemm::device::download(&dev, &out_bf16.data, stream.raw()).unwrap();
+        // accumulate=true doubles the reference.
+        let (i, j) = (3u32, 5u32);
+        let mut acc = 0f64;
+        for kk in 0..k {
+            acc += bf16(a_host[(i * k + kk) as usize]) as f64
+                * bf16(b_host[(j * k + kk) as usize]) as f64;
+        }
+        let want = (2.0 * acc) as f32;
+        let gotv = f32::from_bits(((got2[(i * n + j) as usize] as u32) << 16));
+        assert!(
+            (gotv - want).abs() < 0.1,
+            "bf16-out ({i},{j}) got {gotv} want {want}"
+        );
+    }
+
+    #[test]
+    fn sm90_transpose_sf_roundtrip() {
+        let (dev, stream) = dev_stream();
+        if !matches!(dev.arch, deepgemm::device::Arch::Sm90) {
+            eprintln!("skip: not SM90");
+            return;
+        }
+        let (mn, k_blocks) = (130u32, 17u32);
+        let src: Vec<f32> = (0..(mn * k_blocks)).map(|i| i as f32 * 0.5 - 3.0).collect();
+        let buf = alloc_and_upload(&dev, &src, stream.raw()).unwrap();
+        let sf = sm90::transpose_sf_fp32(&dev, &stream, &buf, mn, k_blocks).unwrap();
+        stream.sync().unwrap();
+        let got: Vec<f32> = dl_f32(&dev, &sf.buf, &stream);
+        let ta = deepgemm::heuristics::tma_aligned_size(mn, 4);
+        for kb in 0..k_blocks {
+            for idx in 0..ta {
+                let want = if idx < mn {
+                    src[(idx * k_blocks + kb) as usize]
+                } else {
+                    0.0
+                };
+                assert_eq!(got[(kb * ta + idx) as usize], want, "({kb},{idx})");
+            }
+        }
+    }
+}

@@ -126,9 +126,31 @@ pub struct GemmDesc {
     pub smem_capacity: u32,
     pub expected_m: u32,
     pub expected_num_groups: u32,
+    /// K used by the comparator model (max group K for weight-grad).
+    pub expected_k: u32,
+    /// C += AB (reduce-add epilogue)?
+    pub with_accumulation: bool,
 }
 
 impl GemmDesc {
+    /// BLOCK_K from the element bit width (upstream: 128 * 8 / bits).
+    /// FP8 -> 128, BF16 -> 64, packed FP4 -> 256.
+    pub fn block_k_hint(&self) -> u32 {
+        1024 / self.a_dtype.elem_bits().max(1)
+    }
+
+    pub fn expected_k(&self) -> u32 {
+        if self.expected_k != 0 {
+            self.expected_k
+        } else {
+            self.k
+        }
+    }
+
+    pub fn with_accumulation(&self) -> bool {
+        self.with_accumulation
+    }
+
     pub fn is_mxf4_mma(&self) -> bool {
         self.a_dtype == Dtype::Fp4 && self.b_dtype == Dtype::Fp4
     }
@@ -599,4 +621,303 @@ pub fn tma_aligned_size(size: u32, elem_size: u32) -> u32 {
 /// Number of packed SF rows for a given K and granularity.
 pub fn sf_rows(k: u32, gran: SfGran) -> u32 {
     ceil_div(k, gran.k() * 4)
+}
+
+// ===========================================================================
+// SM90 (Hopper) heuristics — port of csrc/jit_kernels/heuristics/sm90.hpp.
+//
+// Differences vs the SM100 spec above:
+//   * BLOCK_M in {64, 128} (WGMMA::M = 64; 128 -> two math warpgroups).
+//   * BLOCK_N enumerated with a bank-conflict-avoiding start for FP32
+//     outputs (24) instead of the power-friendly 16-multiples.
+//   * TMA multicast cluster <= 2, disabled for >4 K-groups or batched.
+//   * The comparator models *cycles* (L1/L2 bandwidth) instead of waves:
+//     num_cycles = max(l1, l2 cycles) / wave_efficiency, and multicast is
+//     rejected outright when it cannot save a wave.
+// ===========================================================================
+pub mod sm90 {
+    use super::*;
+    use crate::error::DgResult;
+    use crate::types::{Dtype, GemmType};
+
+    const WGMMA_M: u32 = 64;
+    const NUM_MAX_STAGES: u32 = 16;
+
+    /// K-grouped (weight-grad) needs a per-CTA GMEM tensormap scratch:
+    /// 2 descriptors * 128B, per CTA. Upstream budgets 4*sizeof(TmaMap)
+    /// (512B) in smem_extra; the kernel itself places only 2 maps in SMEM.
+    pub const SMEM_TENSORMAP_KGROUPED: u32 = 512;
+
+    pub fn layout_candidates(desc: &GemmDesc) -> Vec<Layout> {
+        // ---- BLOCK_M ----
+        let mut block_m_candidates: Vec<u32> = Vec::new();
+        match desc.gemm_type {
+            GemmType::Normal | GemmType::KGroupedContiguous => {
+                block_m_candidates.extend([64, 128]);
+                // Avoid TMA L2 OOB on tiny M (kept even though the 1D1D SF
+                // assert needs BLOCK_M % 32 == 0; 16/32 die in the kernel
+                // assert, so 1D1D effectively runs {64, 128}).
+                if desc.m <= 16 {
+                    block_m_candidates.push(16);
+                }
+                if desc.m <= 32 {
+                    block_m_candidates.push(32);
+                }
+                // BF16 output supports 256 (register budget is smaller).
+                if desc.cd_dtype != Dtype::F32 {
+                    block_m_candidates.push(256);
+                }
+            }
+            GemmType::MGroupedContiguous => {
+                block_m_candidates.push(mk_alignment_for_contiguous_layout());
+            }
+            GemmType::MGroupedMasked => {
+                block_m_candidates.extend([64, 128]);
+            }
+            _ => {}
+        }
+
+        // ---- BLOCK_N ----
+        let mut block_n_candidates: Vec<u32> = Vec::new();
+        let step = 16u32; // lcm(16, block_n_multiple_of=8)
+        let mut start = step;
+        // 1D1D + FP32 output: bank conflicts -> start at 24 (and add 16).
+        let is_1d1d = desc.a_dtype == Dtype::Fp8 && desc.cd_dtype == Dtype::F32;
+        let end = if is_1d1d { 160 } else { 256 };
+        if is_1d1d {
+            start = 24;
+            block_n_candidates.push(16);
+        }
+        let mut n = start;
+        while n <= end {
+            block_n_candidates.push(n);
+            n += step;
+        }
+
+        // ---- multicast legality ----
+        let disable_multicast =
+            desc.gemm_type == GemmType::KGroupedContiguous && desc.num_groups > 4;
+
+        let mut out: Vec<Layout> = Vec::new();
+        for cluster_m in 1..=(if disable_multicast { 1 } else { 2 }) {
+            for cluster_n in 1..=(if disable_multicast { 1 } else { 2 }) {
+                if cluster_m * cluster_n > 2 {
+                    continue;
+                }
+                if desc.num_sms % (cluster_m * cluster_n) != 0 {
+                    continue;
+                }
+                for &block_m in &block_m_candidates {
+                    for &block_n in &block_n_candidates {
+                        // Register budget: at least one dim below 128.
+                        if block_m > 128 && block_n > 128 {
+                            continue;
+                        }
+                        // The 1D1D kernel requires BLOCK_M % 32 == 0 (SFA TMA
+                        // 128B alignment) and BLOCK_N % 8 == 0 (WGMMA N).
+                        if is_1d1d && (block_m < 64 || block_m % 32 != 0) {
+                            continue;
+                        }
+                        // BF16-output TMA store atom divisibility:
+                        // swizzle(BLOCK_N*2B)/2 must divide BLOCK_N.
+                        if desc.cd_dtype == Dtype::Bf16 {
+                            let swz = get_swizzle_mode(block_n, 2);
+                            let atom = if swz == 0 { block_n } else { swz / 2 };
+                            if block_n % atom != 0 || block_n / atom > 32 || atom % 8 != 0 {
+                                continue;
+                            }
+                        }
+                        let layout = Layout {
+                            swap_ab: false,
+                            block_m,
+                            block_n,
+                            block_k: desc.block_k_hint(),
+                            cluster_m,
+                            cluster_n,
+                        };
+                        let st = storage_config(desc, &layout);
+                        // Swizzle must be at least 64B (32B perf is low).
+                        if st.swizzle_a_mode % 64 != 0 || st.swizzle_b_mode % 64 != 0 {
+                            continue;
+                        }
+                        let pl = pipeline_config(desc, &layout, &st);
+                        if pl.num_stages < 3 {
+                            continue;
+                        }
+                        if block_m * block_n < 128 * 192 && pl.num_stages < 4 {
+                            continue;
+                        }
+                        if pl.smem_size > desc.smem_capacity.max(SMEM_CAPACITY_FALLBACK) {
+                            continue;
+                        }
+                        out.push(layout);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub fn storage_config(_desc: &GemmDesc, layout: &Layout) -> StorageConfig {
+        // Load/store blocks: no swap-AB on SM90 (asserted upstream).
+        let load_block_m = layout.block_m;
+        let load_block_n = layout.block_n;
+        // 1D1D stores a single warp-group (64 rows) per TMA store; bf16
+        // stores the full BLOCK_M tile split into swizzle atoms.
+        let store_block_m = if _desc.a_dtype == Dtype::Fp8 && _desc.cd_dtype == Dtype::F32 {
+            WGMMA_M
+        } else {
+            layout.block_m
+        };
+        let store_block_n = layout.block_n;
+        let swizzle_a_mode = get_swizzle_mode(layout.block_k, _desc.a_dtype.elem_size() as u32);
+        let swizzle_b_mode = get_swizzle_mode(layout.block_k, _desc.b_dtype.elem_size() as u32);
+        let swizzle_cd_mode = if _desc.cd_dtype != Dtype::F32 {
+            get_swizzle_mode(store_block_n, _desc.cd_dtype.elem_size() as u32)
+        } else {
+            0
+        };
+        StorageConfig {
+            load_block_m,
+            load_block_n,
+            store_block_m,
+            store_block_n,
+            swizzle_a_mode,
+            swizzle_b_mode,
+            swizzle_cd_mode,
+        }
+    }
+
+    pub fn pipeline_config(
+        desc: &GemmDesc,
+        layout: &Layout,
+        storage: &StorageConfig,
+    ) -> PipelineConfig {
+        // smem: CD (1024-aligned) + barriers (16*8*2) + SF per stage +
+        // [kgrouped tensormaps] + A/B per stage.
+        let smem_cd = align_up(
+            layout.block_m * layout.block_n * desc.cd_dtype.elem_size() as u32,
+            1024,
+        );
+        let smem_barriers = NUM_MAX_STAGES * 8 * 2;
+        let ea = desc.a_dtype.elem_size() as u32;
+        let eb = desc.b_dtype.elem_size() as u32;
+        let smem_a_per_stage = storage.load_block_m * layout.block_k * ea;
+        let smem_b_per_stage = storage.load_block_n * layout.block_k * eb;
+        // 1D1D FP32 SFs: A rows + B cols per stage, 128B-aligned rows.
+        let is_1d1d = desc.a_dtype == Dtype::Fp8 && desc.cd_dtype == Dtype::F32;
+        let smem_sfa_per_stage = if is_1d1d {
+            align_up(layout.block_m * 4, 128)
+        } else {
+            0
+        };
+        let smem_sfb_per_stage = if is_1d1d {
+            align_up(layout.block_n * 4, 128)
+        } else {
+            0
+        };
+        let smem_tensormap = if desc.gemm_type == GemmType::KGroupedContiguous {
+            SMEM_TENSORMAP_KGROUPED
+        } else {
+            0
+        };
+        let smem_extra = smem_cd + smem_barriers + smem_tensormap;
+        let smem_per_stage =
+            smem_a_per_stage + smem_b_per_stage + smem_sfa_per_stage + smem_sfb_per_stage;
+        let num_stages = ((desc.smem_capacity.max(SMEM_CAPACITY_FALLBACK) - smem_extra)
+            / smem_per_stage)
+            .min(NUM_MAX_STAGES);
+        PipelineConfig {
+            smem_size: smem_extra + num_stages * smem_per_stage,
+            num_stages,
+            num_tma_store_stages: 0,
+        }
+    }
+
+    pub fn launch_config(desc: &GemmDesc, layout: &Layout) -> LaunchConfig {
+        let num_tma_threads = 128;
+        let num_math_threads = if layout.block_m <= 64 { 128 } else { 256 };
+        LaunchConfig {
+            num_sms: desc.num_sms,
+            num_non_epilogue_threads: num_tma_threads,
+            num_epilogue_threads: num_math_threads,
+        }
+    }
+
+    /// Bandwidth-cycle comparator (upstream SM90 `get_layout_info`).
+    struct LayoutInfo90 {
+        num_cycles: u64,
+        layout: Layout,
+    }
+
+    pub fn get_best_config(desc: &GemmDesc) -> DgResult<GemmConfig> {
+        let candidates = layout_candidates(desc);
+        let expected_k = desc.expected_k();
+        let expected_m = desc.expected_m.max(1);
+        let expected_n = desc.n;
+        let elem_ab = desc.a_dtype.elem_size() as u64;
+        let elem_cd = desc.cd_dtype.elem_size() as u64;
+
+        let mut best: Option<LayoutInfo90> = None;
+        for layout in &candidates {
+            let num_blocks = ceil_div(expected_m, layout.block_m)
+                * ceil_div(expected_n, layout.block_n)
+                * desc.expected_num_groups.max(1);
+            let num_waves = ceil_div(num_blocks, desc.num_sms);
+
+            // Bandwidth model (per cycle): L2 = min(64 * num_sms, 8e6/1.3e3)
+            // B/cycle; L1 = 128 * num_sms B/cycle.
+            let l2_bw = (64u64 * desc.num_sms as u64).min(8_000_000u64 / 1300);
+            let l1_bw = 128u64 * desc.num_sms as u64;
+            let num_bytes_l2_ab = expected_k as u64
+                * (layout.block_m / layout.cluster_n + layout.block_n / layout.cluster_m) as u64
+                * elem_ab;
+            let num_bytes_l1_ab =
+                expected_k as u64 * (layout.block_m + layout.block_n) as u64 * elem_ab;
+            let num_bytes_l1_tc =
+                expected_k as u64 * (WGMMA_M.max(layout.block_m) + layout.block_n) as u64 * elem_ab
+                    + (layout.block_m * layout.block_n) as u64 * elem_cd;
+            let with_acc = desc.with_accumulation();
+            let num_bytes_l1_l2_cd =
+                (layout.block_m * layout.block_n) as u64 * elem_cd * if with_acc { 2 } else { 1 };
+            let num_l2_cycles = (num_bytes_l2_ab + num_bytes_l1_l2_cd) * num_blocks as u64 / l2_bw;
+            let num_l1_cycles = (num_bytes_l1_ab + num_bytes_l1_tc + num_bytes_l1_l2_cd)
+                * num_blocks as u64
+                / l1_bw;
+            let wave_eff = num_blocks as f64 / (num_waves as f64 * desc.num_sms as f64);
+            let mut num_cycles =
+                (num_l1_cycles.max(num_l2_cycles) as f64 / wave_eff.max(1e-9)) as u64;
+
+            // Multicast that cannot save a wave is a net loss.
+            if layout.cluster_m * layout.cluster_n > 1 && num_waves <= 1 {
+                num_cycles = u64::MAX;
+            }
+            let info = LayoutInfo90 {
+                num_cycles,
+                layout: *layout,
+            };
+            best = match best {
+                None => Some(info),
+                Some(b) if info.num_cycles < b.num_cycles => Some(info),
+                Some(b) => Some(b),
+            };
+        }
+
+        let layout = best
+            .map(|i| i.layout)
+            .ok_or_else(|| DgError::Unsupported("no viable SM90 layout for shape".into()))?;
+        let storage = storage_config(desc, &layout);
+        let pipeline = pipeline_config(desc, &layout, &storage);
+        let launch = launch_config(desc, &layout);
+        let cfg = GemmConfig {
+            layout,
+            storage,
+            pipeline,
+            launch,
+        };
+        if print_configs_enabled() {
+            eprintln!("[deepgemm-rs] sm90 config: {:?}", cfg);
+        }
+        Ok(cfg)
+    }
 }

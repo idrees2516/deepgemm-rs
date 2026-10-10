@@ -26,6 +26,7 @@
 use clap::{Parser, Subcommand};
 use deepgemm::jit::{self, kernel_src};
 use deepgemm::prelude::*;
+use deepgemm::sm90;
 
 #[derive(Parser)]
 #[command(
@@ -69,6 +70,10 @@ enum Cmd {
 }
 
 const BENCHES: &[&str] = &[
+    "sm90_fp8_nt",
+    "sm90_fp8_kk",
+    "sm90_bf16_nt",
+    "sm90_bf16_m_grouped_masked",
     "fp4_nt_native",
     "fp8_nt",
     "fp8_nt_g128",
@@ -121,7 +126,9 @@ fn run_gemm_bench(
 ) -> DgResult<()> {
     let (a_dt, b_dt, gran) = match name {
         "fp4_nt_native" | "fp4_m_grouped_contiguous" => (Dtype::Fp4, Dtype::Fp4, SfGran::G32),
-        "bf16_nt" => (Dtype::Bf16, Dtype::Bf16, SfGran::G32),
+        "bf16_nt" | "sm90_bf16_nt" | "sm90_bf16_m_grouped_masked" => {
+            (Dtype::Bf16, Dtype::Bf16, SfGran::G32)
+        }
         "fp8_nt_g128" => (Dtype::Fp8, Dtype::Fp8, SfGran::G128),
         _ => (Dtype::Fp8, Dtype::Fp8, SfGran::G32),
     };
@@ -142,6 +149,13 @@ fn run_gemm_bench(
     let b_data = DevBuffer::alloc_zeros(dev, elem_bytes_b.max(16))?;
     let sf_a = make_sf(dev, stream, m, k, gran, 1)?;
     let sf_b = make_sf(dev, stream, n, k, gran, 2)?;
+    // Host FP32 (mn, k/128) scales for the SM90 1D1D benches.
+    let sfa_host: Vec<f32> = (0..(m as usize) * (k as usize / 128))
+        .map(|i| 2f32.powi(-3 + (i.wrapping_mul(2654435761) % 7) as i32))
+        .collect();
+    let sfb_host: Vec<f32> = (0..(n as usize) * (k as usize / 128))
+        .map(|i| 2f32.powi(-3 + (i.wrapping_mul(40503) % 7) as i32))
+        .collect();
 
     let a = Operand {
         dtype: a_dt,
@@ -207,6 +221,113 @@ fn run_gemm_bench(
                 m_grouped_gemm_nt_masked(dev, stream, &a, &b, out, &masked_buf, groups, m)
             }
             "fp8_bmm" => fp8_bmm(dev, stream, &a, &b, out, groups, false),
+            "sm90_fp8_nt" => {
+                let sfa = sm90::sf_fp32_from_host(dev, stream, &sfa_host, m, k / 128)?;
+                let sfb = sm90::sf_fp32_from_host(dev, stream, &sfb_host, n, k / 128)?;
+                let a2 = Operand {
+                    dtype: Dtype::Fp8,
+                    major: Major::K,
+                    rows: m,
+                    k,
+                    outer_stride: k,
+                    sf: None,
+                    data: DevBuffer::alloc_zeros(dev, (m as usize) * (k as usize))?,
+                };
+                let b2 = Operand {
+                    dtype: Dtype::Fp8,
+                    major: Major::K,
+                    rows: n,
+                    k,
+                    outer_stride: k,
+                    sf: None,
+                    data: DevBuffer::alloc_zeros(dev, (n as usize) * (k as usize))?,
+                };
+                sm90::fp8_gemm_nt(dev, stream, &a2, &sfa, &b2, &sfb, out)
+            }
+            "sm90_fp8_kk" => {
+                // Per-group K sizes: k split into `groups` 128-multiples.
+                let per = (k / groups).div_ceil(128) * 128;
+                let mut ks: Vec<u32> = vec![per; groups as usize];
+                *ks.last_mut().unwrap() = k - per * (groups - 1);
+                // Stacked tiles: for each group g, [mn, ks_g] K-major.
+                let a2 = Operand {
+                    dtype: Dtype::Fp8,
+                    major: Major::K,
+                    rows: m,
+                    k,
+                    outer_stride: k,
+                    sf: None,
+                    data: DevBuffer::alloc_zeros(dev, (m as usize) * (k as usize))?,
+                };
+                let b2 = Operand {
+                    dtype: Dtype::Fp8,
+                    major: Major::K,
+                    rows: n,
+                    k,
+                    outer_stride: k,
+                    sf: None,
+                    data: DevBuffer::alloc_zeros(dev, (n as usize) * (k as usize))?,
+                };
+                let sfa = sm90::sf_fp32_from_host(dev, stream, &sfa_host, m, k / 128)?;
+                let sfb = sm90::sf_fp32_from_host(dev, stream, &sfb_host, n, k / 128)?;
+                sm90::fp8_gemm_kk(dev, stream, &a2, &sfa, &b2, &sfb, &ks, out)
+            }
+            "sm90_bf16_nt" => {
+                let a2 = Operand {
+                    dtype: Dtype::Bf16,
+                    major: Major::K,
+                    rows: m,
+                    k,
+                    outer_stride: k,
+                    sf: None,
+                    data: DevBuffer::alloc_zeros(dev, (m as usize) * (k as usize) * 2)?,
+                };
+                let b2 = Operand {
+                    dtype: Dtype::Bf16,
+                    major: Major::K,
+                    rows: n,
+                    k,
+                    outer_stride: k,
+                    sf: None,
+                    data: DevBuffer::alloc_zeros(dev, (n as usize) * (k as usize) * 2)?,
+                };
+                sm90::bf16_gemm_nt(dev, stream, &a2, &b2, out, false)
+            }
+            "sm90_bf16_m_grouped_masked" => {
+                let per = m / groups;
+                let masked: Vec<i32> = (0..groups).map(|_| per as i32).collect();
+                let masked_buf = alloc_and_upload(dev, &masked, stream.raw())?;
+                let per = m / groups;
+                let a2 = Operand {
+                    dtype: Dtype::Bf16,
+                    major: Major::K,
+                    rows: m,
+                    k,
+                    outer_stride: k,
+                    sf: None,
+                    data: DevBuffer::alloc_zeros(dev, (m as usize) * (k as usize) * 2)?,
+                };
+                let b2 = Operand {
+                    dtype: Dtype::Bf16,
+                    major: Major::K,
+                    rows: n,
+                    k,
+                    outer_stride: k,
+                    sf: None,
+                    data: DevBuffer::alloc_zeros(dev, (n as usize) * (k as usize) * 2)?,
+                };
+                sm90::bf16_gemm_nt_m_grouped_masked(
+                    dev,
+                    stream,
+                    &a2,
+                    &b2,
+                    &masked_buf,
+                    m,
+                    groups,
+                    out,
+                    false,
+                )
+            }
             _ => Err(DgError::InvalidArg(format!("unknown bench {name}"))),
         }
     };
@@ -223,7 +344,7 @@ fn run_gemm_bench(
     stream.sync()?;
     let elapsed = t0.elapsed().as_secs_f64();
 
-    let group_mult = if name.contains("grouped") || name.contains("bmm") {
+    let group_mult = if name.contains("grouped") || name.contains("bmm") || name == "sm90_fp8_kk" {
         groups as f64
     } else {
         1.0
@@ -448,35 +569,40 @@ fn kernel_variants(arch: &str) -> Vec<(&'static str, &'static str, String)> {
                 "gemm fp8 nt m128 n256 k128 c2",
                 kernel_src::GEMM_SM100,
                 gemm_wrapper(
-                    0, 0, 32, 32, 1, 0, 0, 0, 1, 1, 128, 256, 128, 128, 128, 128, 12, 2, 0, 0, 0, 0, 148,
+                    0, 0, 32, 32, 1, 0, 0, 0, 1, 1, 128, 256, 128, 128, 128, 128, 12, 2, 0, 0, 0,
+                    0, 148,
                 ),
             ),
             (
                 "gemm fp4 nt m128 n256 k256 c2",
                 kernel_src::GEMM_SM100,
                 gemm_wrapper(
-                    0, 0, 32, 32, 1, 1, 5, 5, 1, 1, 128, 256, 256, 128, 128, 256, 8, 2, 0, 0, 0, 0, 148,
+                    0, 0, 32, 32, 1, 1, 5, 5, 1, 1, 128, 256, 256, 128, 128, 256, 8, 2, 0, 0, 0, 0,
+                    148,
                 ),
             ),
             (
                 "gemm bf16 nt m128 n128 k64 c1",
                 kernel_src::GEMM_SM100,
                 gemm_wrapper(
-                    0, 0, 32, 32, 0, 0, 1, 1, 2, 2, 128, 128, 64, 128, 128, 128, 20, 1, 0, 0, 0, 0, 148,
+                    0, 0, 32, 32, 0, 0, 1, 1, 2, 2, 128, 128, 64, 128, 128, 128, 20, 1, 0, 0, 0, 0,
+                    148,
                 ),
             ),
             (
                 "gemm fp8 swapab masked c2",
                 kernel_src::GEMM_SM100,
                 gemm_wrapper(
-                    1, 1, 32, 32, 1, 0, 0, 0, 1, 1, 128, 128, 128, 128, 128, 128, 12, 2, 1, 1, 2, 0, 148,
+                    1, 1, 32, 32, 1, 0, 0, 0, 1, 1, 128, 128, 128, 128, 128, 128, 12, 2, 1, 1, 2,
+                    0, 148,
                 ),
             ),
             (
                 "gemm fp8 batched c2",
                 kernel_src::GEMM_SM100,
                 gemm_wrapper(
-                    0, 0, 32, 32, 1, 0, 0, 0, 1, 1, 128, 128, 128, 128, 128, 128, 12, 2, 0, 0, 4, 0, 148,
+                    0, 0, 32, 32, 1, 0, 0, 0, 1, 1, 128, 128, 128, 128, 128, 128, 12, 2, 0, 0, 4,
+                    0, 148,
                 ),
             ),
             (
@@ -512,12 +638,16 @@ fn kernel_variants(arch: &str) -> Vec<(&'static str, &'static str, String)> {
             (
                 "sm90 bf16 nt m128 n64 c2",
                 kernel_src::sm90_unit(),
-                sm90_bf16_wrapper(0, 0, 128, 64, 64, 128, 128, 128, 8, 2, true, 0, false, 1, 148),
+                sm90_bf16_wrapper(
+                    0, 0, 128, 64, 64, 128, 128, 128, 8, 2, true, 0, false, 1, 148,
+                ),
             ),
             (
                 "sm90 bf16 merge-stages m64 n32",
                 kernel_src::sm90_unit(),
-                sm90_bf16_wrapper(0, 0, 64, 32, 64, 128, 128, 64, 16, 1, true, 0, false, 1, 148),
+                sm90_bf16_wrapper(
+                    0, 0, 64, 32, 64, 128, 128, 64, 16, 1, true, 0, false, 1, 148,
+                ),
             ),
             (
                 "sm90 bf16 fp32out mnB mgrouped",
@@ -538,7 +668,7 @@ fn sm90_fp8_wrapper(
     stages: u32,
     multicast: u32,
     mc_on_a: bool,
-    gemm_type: u32,  // 0 Normal, 5 KGroupedContiguous (enum value)
+    gemm_type: u32, // 0 Normal, 5 KGroupedContiguous (enum value)
     num_sms: u32,
     shape_m: u32,
     shape_n: u32,

@@ -35,6 +35,7 @@ pub mod error;
 pub mod golden;
 pub mod heuristics;
 pub mod jit;
+pub mod sm90;
 pub mod sys;
 pub mod tma;
 pub mod types;

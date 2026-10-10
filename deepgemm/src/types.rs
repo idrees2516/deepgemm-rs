@@ -54,6 +54,9 @@ pub enum GemmType {
     MGroupedMasked,
     /// Batched GEMM (BMM).
     Batched,
+    /// Weight-grad: A/B stacked along K; `grouped_layout[g]` = K size of
+    /// group g. SM90-only (runtime tensormap patching).
+    KGroupedContiguous,
 }
 
 impl GemmType {
