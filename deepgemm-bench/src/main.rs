@@ -618,6 +618,16 @@ fn kernel_variants(arch: &str) -> Vec<(&'static str, &'static str, String)> {
             r#"extern "C" __global__ void __dg_kernel(const unsigned char* d, const unsigned* sf, unsigned m, unsigned k, unsigned t, float* o) { dg::dequant_mx_impl<0, 32>(d, sf, m, k, t, o); }"#.to_string(),
         ),
         (
+            "quant_out_fp8 rne",
+            kernel_src::LAYOUT_QUANT,
+            r#"extern "C" __global__ void __dg_kernel(const float* in, unsigned char* o, int* sfd, unsigned m, unsigned n, unsigned is_, unsigned os_, unsigned ss_, unsigned ta) { dg::quantize_output_fp8_impl<256, 0>(in, o, sfd, m, n, is_, os_, ss_, ta); }"#.to_string(),
+        ),
+        (
+            "quant_out_fp8 sr",
+            kernel_src::LAYOUT_QUANT,
+            r#"extern "C" __global__ void __dg_kernel(const float* in, unsigned char* o, int* sfd, unsigned m, unsigned n, unsigned is_, unsigned os_, unsigned ss_, unsigned ta) { dg::quantize_output_fp8_impl<256, 1>(in, o, sfd, m, n, is_, os_, ss_, ta); }"#.to_string(),
+        ),
+        (
             "dequant fp4 g32",
             kernel_src::LAYOUT_QUANT,
             r#"extern "C" __global__ void __dg_kernel(const unsigned char* d, const unsigned* sf, unsigned m, unsigned k, unsigned t, float* o) { dg::dequant_mx_impl<1, 32>(d, sf, m, k, t, o); }"#.to_string(),

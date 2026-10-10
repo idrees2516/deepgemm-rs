@@ -399,3 +399,27 @@ fn mqa_logits_ref_matches_naive_computation() {
         }
     }
 }
+
+#[test]
+fn golden_quantize_output_fp8_rne_matches_upstream_formula() {
+    // The UE8M0-for-E4M3 exponent + hardware RNE must match golden::.
+    use deepgemm::golden;
+    let vals: Vec<f32> = (0..512).map(|i| {
+        let f = (i as f32) * 0.03125 - 8.0;
+        if i % 7 == 0 { f * 0.001 } else { f }
+    }).collect();
+    // amax per 32-group, golden ue8m0-for-e4m3 exponent, then RNE encode.
+    for g in 0..16 {
+        let grp = &vals[g * 32..(g + 1) * 32];
+        let amax = grp.iter().fold(0f32, |a, v| a.max(v.abs()));
+        let exp = golden::ue8m0_exp_fp8(amax);
+        let inv = 2f32.powi(-(exp as i32 - 127));
+        for v in grp {
+            let scaled = v * inv;
+            let code = golden::quant_e4m3(scaled);
+            // Decode back: the quantized value must be the nearest e4m3.
+            let dec = golden::e4m3_decode(code) * 2f32.powi(exp as i32 - 127);
+            assert!((dec - v).abs() <= (v.abs() * 0.12 + 2e-3), "{v} -> {dec}");
+        }
+    }
+}

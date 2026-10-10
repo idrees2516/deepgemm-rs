@@ -275,5 +275,89 @@ void transpose_sf_fp32_impl(const float* in, float* out,
         out[idx] = v;
     }
 }
+// ---------------------------------------------------------------------------
+// E4M3 encode helpers (software, on top of the hardware cvt).
+// ---------------------------------------------------------------------------
+DG_DEVICE uint8_t quant_e4m3_rne(float v) {
+    // Hardware RNE + satfinite (matches `cvt.rn.satfinite.e4m3x2.f32`).
+    return (uint8_t)(cvt_e4m3x2_f32(v, v) & 0xff);
+}
+
+// Stochastic e4m3: round UP with probability (x - g_lo)/(g_hi - g_lo) on the
+// E4M3 grid. Both neighbors are exactly RNE(x -+ s/2) (s = local grid step)
+// from the hardware cvt, signs included; only the coin consumes `rnd`.
+// E[SR(x)] == x over calls (unbiased), unlike RNE which biases small tensors.
+DG_DEVICE uint8_t quant_e4m3_stochastic(float v, uint32_t rnd) {
+    const float mag = fabsf(v);
+    if (mag > 448.0f)
+        return quant_e4m3_rne(v);               // satfinite: deterministic
+    const float step = mag < exp2f(-6.0f) ? exp2f(-9.0f)
+                                          : exp2f(floorf(log2f(mag)) - 3.0f);
+    const uint16_t pair = cvt_e4m3x2_f32(v - step * 0.5f, v + step * 0.5f);
+    const uint8_t lo_code = (uint8_t)(pair & 0xff);
+    const uint8_t hi_code = (uint8_t)((pair >> 8) & 0xff);
+    uint32_t l2 = 0, h2 = 0;
+    cvt_f32x2_e4m3x2((uint32_t)lo_code | ((uint32_t)hi_code << 8), l2, h2);
+    const float g_lo = __uint_as_float(l2), g_hi = __uint_as_float(h2);
+    const float span = g_hi - g_lo;
+    const float u = (float)(rnd & 0xffffff) / 16777216.0f;   // [0,1)
+    const bool up = span > 0.0f && (u * span < (v - g_lo));
+    return up ? hi_code : lo_code;
+}
+
+// ---------------------------------------------------------------------------
+// quantize_output_fp8: dynamic-output FP8 cast (upstream `QuantizeToFP8`
+// operator as a standalone kernel — upstream NOTE: the fused epilogue is
+// *specified* to bitwise match this standalone per-token cast).
+//   in : [m, n] fp32 row-major (stride `in_stride`)
+//   out: [m, n] e4m3 (stride `out_stride`)
+//   sfd: UE8M0 scale bytes, packed [ceil(n/32)/4, tma_aligned(m)] int32
+// Per (row, 32-col group): amax -> UE8M0 exp -> x * 2^-exp -> e4m3.
+// kStochastic: stochastic e4m3 (unbiased in expectation); else RNE.
+// ---------------------------------------------------------------------------
+template <uint32_t kNumThreads, bool kStochastic>
+DG_GLOBAL __launch_bounds__(kNumThreads)
+void quantize_output_fp8_impl(const float* in, uint8_t* out,
+                              int32_t* sfd, uint32_t m, uint32_t n,
+                              uint32_t in_stride, uint32_t out_stride,
+                              uint32_t sfd_stride, uint32_t sfd_tma_aligned) {
+    const uint64_t total = (uint64_t)m * (n / 32);
+    for (uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total;
+         idx += (uint64_t)gridDim.x * blockDim.x) {
+        griddepcontrol_wait();
+        const uint32_t row = (uint32_t)(idx / (n / 32));
+        const uint32_t g = (uint32_t)(idx % (n / 32));
+        const uint32_t col = g * 32;
+
+        float amax = 0.0f;
+        #pragma unroll 8
+        for (uint32_t j = 0; j < 32; ++j) {
+            const float v = in[(uint64_t)row * in_stride + col + j];
+            amax = fmaxf(amax, fabsf(v));
+        }
+        // UE8M0 for E4M3 (port of math::get_ue8m0_sf_exp<E4M3>): power-of-two
+        // ceiling keeping |x*sf| <= 448, clamped below ~1e-4.
+        const uint32_t abits = __float_as_uint(amax) >> 23;
+        uint32_t rounded = (abits + 0x7f - 0x60) >> 7;
+        rounded = rounded < (105u + 8u) ? (105u + 8u) : rounded;
+        const uint32_t sf_exp = rounded - 8u;
+
+        uint32_t rnd_state = (uint32_t)(idx * 2654435761u + 40503u) | 1u;
+        const float inv = exp2f((float)(127 - (int)sf_exp));
+        #pragma unroll 8
+        for (uint32_t j = 0; j < 32; ++j) {
+            const uint32_t r = (rnd_state ^= rnd_state << 13,
+                                 rnd_state ^= rnd_state >> 17,
+                                 rnd_state ^= rnd_state << 5);
+            const float x = in[(uint64_t)row * in_stride + col + j] * inv;
+            const uint8_t code = kStochastic ? quant_e4m3_stochastic(x, r)
+                                             : quant_e4m3_rne(x);
+            out[(uint64_t)row * out_stride + col + j] = code;
+        }
+        uint8_t* base = (uint8_t*)(sfd + (uint64_t)(g / 4) * sfd_stride + row);
+        base[g % 4] = (uint8_t)sf_exp;
+    }
+}
 
 } // namespace dg

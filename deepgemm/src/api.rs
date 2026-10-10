@@ -1112,3 +1112,65 @@ pub fn mqa_logits_paged(
         args,
     )
 }
+
+// ---------------------------------------------------------------------------
+// Dynamic-output FP8 quantization (upstream QuantizeToFP8 contract, standalone
+// kernel form: fused epilogues are specified to bitwise match this cast).
+// ---------------------------------------------------------------------------
+/// Quantize an FP32 buffer `[m, n]` (row stride `in_stride`) into E4M3 with
+/// per-(row, 32-col-group) UE8M0 dynamic scales; also emits the packed SF
+/// words `[ceil(n/32)/4, tma_aligned(m)]` (int32).
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_output_fp8(
+    dev: &Device,
+    stream: &DevStream,
+    src: &DevBuffer,
+    m: u32,
+    n: u32,
+    in_stride: u32,
+    stochastic: bool,
+) -> DgResult<(DevBuffer, DevBuffer)> {
+    if n % 32 != 0 {
+        return Err(DgError::InvalidArg("quantize_output_fp8 needs n % 32 == 0".into()));
+    }
+    let out = DevBuffer::alloc(dev, (m * n) as usize)?;
+    let tma_aligned = heuristics::tma_aligned_size(m, 4);
+    let sf_words = (n / 32).div_ceil(4) as usize * tma_aligned as usize;
+    let sfd = DevBuffer::alloc(dev, sf_words * 4)?;
+    let body = format!(
+        r#"extern "C" __global__ void __dg_kernel(
+    const float* in, unsigned char* out, int* sfd,
+    unsigned m, unsigned n, unsigned is_, unsigned os_, unsigned ss_, unsigned ta) {{
+    dg::quantize_output_fp8_impl<256, {stoch}>
+        (in, out, sfd, m, n, is_, os_, ss_, ta);
+}}"#,
+        stoch = stochastic as u32,
+    );
+    let sig = format!("qo8_{stochastic}");
+    let func = jit::get_kernel(dev, jit::kernel_src::LAYOUT_QUANT, "quant_out_fp8", &sig, &body)?;
+    let args = Args::new()
+        .devptr(src.ptr)
+        .devptr(out.ptr)
+        .devptr(sfd.ptr)
+        .u32(m)
+        .u32(n)
+        .u32(in_stride)
+        .u32(n)
+        .u32(tma_aligned)
+        .u32(tma_aligned);
+    let total = (m * (n / 32)) as u32;
+    jit::launch(
+        dev,
+        func,
+        stream.raw(),
+        &sys::LaunchEx {
+            grid: (total.div_ceil(256), 1, 1),
+            block: (256, 1, 1),
+            smem: 0,
+            cluster: None,
+            pdl: false,
+        },
+        args,
+    )?;
+    Ok((out, sfd))
+}
