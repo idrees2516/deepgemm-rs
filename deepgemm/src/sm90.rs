@@ -274,8 +274,7 @@ fn run_fp8_1d1d(
     // Grouped-layout + tensormap scratch for kk.
     let gl_buf;
     let map_buf;
-    
-    
+
     let (gl_ptr, map_ptr) = if is_kk {
         let ks = ks.unwrap();
         gl_buf = alloc_and_upload(
@@ -368,6 +367,8 @@ pub fn fp8_gemm_nt(
 /// `ks[g]` is the K size of group g (each % 128 == 0, sum == a.k).
 /// A/B are "stacked along K": per-group `[mn, ks_g]` K-major tiles,
 /// concatenated (group g at byte offset `prefix_sum(ks)*mn`).
+// Upstream-mirroring signature: one arg per DeepGEMM parameter.
+#[allow(clippy::too_many_arguments)]
 pub fn fp8_gemm_kk(
     dev: &Device,
     stream: &DevStream,
@@ -617,6 +618,8 @@ pub fn bf16_gemm_nt(
 
 /// BF16 m-grouped contiguous (Hopper). `expected_m` is the *padded* M span
 /// (sum of per-group alignments).
+// Upstream-mirroring signature: one arg per DeepGEMM parameter.
+#[allow(clippy::too_many_arguments)]
 pub fn bf16_gemm_nt_m_grouped_contiguous(
     dev: &Device,
     stream: &DevStream,
@@ -643,6 +646,8 @@ pub fn bf16_gemm_nt_m_grouped_contiguous(
 
 /// BF16 m-grouped masked (Hopper). `expected_m` is the per-group M cap;
 /// D is `[num_groups, expected_m, n]`.
+// Upstream-mirroring signature: one arg per DeepGEMM parameter.
+#[allow(clippy::too_many_arguments)]
 pub fn bf16_gemm_nt_m_grouped_masked(
     dev: &Device,
     stream: &DevStream,

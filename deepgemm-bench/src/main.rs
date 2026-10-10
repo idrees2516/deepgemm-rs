@@ -116,7 +116,6 @@ fn make_sf(
 /// cache; measures effective tokens/s (the serving metric) as well as TFLOPS.
 fn run_mqa_paged_bench(dev: &Device, stream: &DevStream, iters: u32, warmup: u32) -> DgResult<()> {
     use deepgemm::device::alloc_and_upload;
-    
 
     let num_requests = 512u32;
     let ctx_len = 512u32;

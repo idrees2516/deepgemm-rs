@@ -66,6 +66,8 @@ fn dtype_of2(dtype: Dtype) -> DgResult<sys::TmDtype> {
     dtype_of(dtype, false)
 }
 
+// Upstream-mirroring signature: one arg per DeepGEMM parameter.
+#[allow(clippy::too_many_arguments)]
 fn make_tma_2d(
     dev: &Device,
     dtype: Dtype,
