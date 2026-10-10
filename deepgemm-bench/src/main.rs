@@ -718,6 +718,54 @@ fn kernel_variants(arch: &str) -> Vec<(&'static str, &'static str, String)> {
                 kernel_src::MQA_LOGITS,
                 r#"extern "C" __global__ void __dg_kernel(const unsigned* cl, const unsigned* idx, unsigned n, unsigned* meta) { dg::mqa_paged_metadata_impl<256, 148, 32, 128>(cl, idx, n, meta); }"#.to_string(),
             ),
+            // Wave-2: sparse MQA (DSA top-k indexer) + hc-prenorm (SM100).
+            (
+                "sparse mqa metadata paged",
+                kernel_src::SPARSE_MQA,
+                deepgemm::api_sparse_mqa::sparse_mqa_metadata_body(true, false, 512, 8, 512, 64, 148),
+            ),
+            (
+                "sparse mqa logits fp8 sb16",
+                kernel_src::SPARSE_MQA,
+                deepgemm::api_sparse_mqa::sparse_mqa_logits_paged_body(
+                    &deepgemm::api_sparse_mqa::SparseMqaConfig::new(
+                        32,
+                        deepgemm::types::Dtype::Fp8,
+                        16,
+                        false,
+                        Some(64),
+                        148,
+                    )
+                    .unwrap(),
+                ),
+            ),
+            (
+                "sparse mqa logits fp4 sb8",
+                kernel_src::SPARSE_MQA,
+                deepgemm::api_sparse_mqa::sparse_mqa_logits_paged_body(
+                    &deepgemm::api_sparse_mqa::SparseMqaConfig::new(
+                        32,
+                        deepgemm::types::Dtype::Fp4,
+                        8,
+                        true,
+                        None,
+                        148,
+                    )
+                    .unwrap(),
+                ),
+            ),
+            (
+                "hc-prenorm sm100 n24 k7168",
+                kernel_src::HC_PRENORM,
+                r#"extern "C" __global__ void __dg_kernel(
+    unsigned shape_m,
+    const __grid_constant__ dg::TmaMap tma_a, const __grid_constant__ dg::TmaMap tma_b,
+    const __grid_constant__ dg::TmaMap tma_d, float* sqr_sum) {
+    dg::hc_prenorm_sm100_impl<24, 7168, 64, 32, 64, 16, 128, 12, 128, 128>
+        (shape_m, tma_a, tma_b, tma_d, sqr_sum);
+}"#
+                .to_string(),
+            ),
         ]);
     } else {
         // sm_90a: wgmma suite. Stage counts verified against the SM90 smem
@@ -756,6 +804,42 @@ fn kernel_variants(arch: &str) -> Vec<(&'static str, &'static str, String)> {
                 "sm90 bf16 fp32out mnB mgrouped",
                 kernel_src::sm90_unit(),
                 sm90_bf16_wrapper(0, 1, 128, 64, 64, 128, 128, 0, 8, 1, true, 1, true, 0, 148),
+            ),
+            // Wave-2: SM90 MQA logits (contig + paged + metadata), 1d2d, hc-prenorm.
+            (
+                "sm90 mqa contig h64 d128",
+                kernel_src::sm90_mqa_unit(),
+                deepgemm::api_sm90_mqa::mqa_logits_sm90_body(64, 128, 132).unwrap(),
+            ),
+            (
+                "sm90 mqa paged n2 h64 d128",
+                kernel_src::sm90_mqa_unit(),
+                deepgemm::api_sm90_mqa::mqa_paged_logits_sm90_body(2, 64, 128).unwrap(),
+            ),
+            (
+                "sm90 mqa paged metadata",
+                kernel_src::sm90_mqa_unit(),
+                deepgemm::api_sm90_mqa::mqa_paged_logits_sm90_metadata_body(32, 132),
+            ),
+            (
+                "sm90 fp8 1d2d nt m128 n256",
+                kernel_src::sm90_1d2d_unit(),
+                deepgemm::api_1d2d::wrapper_body(
+                    &deepgemm::api_1d2d::choose_tiling(4096, 7168, 7168, 132, 232_448).unwrap(),
+                    false,
+                ),
+            ),
+            (
+                "sm90 hc-prenorm n24 k7168",
+                kernel_src::sm90_hc_unit(),
+                r#"extern "C" __global__ void __dg_kernel(
+    unsigned shape_m,
+    const __grid_constant__ dg::TmaMap tma_a, const __grid_constant__ dg::TmaMap tma_b,
+    const __grid_constant__ dg::TmaMap tma_d, float* sqr_sum) {
+    dg::hc_prenorm_sm90_impl<24, 7168, 64, 32, 64, 16, 128, 12, 128, 128>
+        (shape_m, tma_a, tma_b, tma_d, sqr_sum);
+}"#
+                .to_string(),
             ),
         ]);
     }

@@ -73,9 +73,10 @@ cargo run -p deepgemm-bench --release -- smoke   # on a GPU-less machine this
                                                  # auto-falls back to compile-check
 ```
 
-Current status: **14/14 variants, PTX + SASS, in ~4s** (covers every TU and
-code path: mxf4 / mxf8f6f4 / f16 MMAs, UTCCP SF paths, swap-AB, m-grouped
-contiguous+masked, batched, MQA in FP8 and FP4, quant/transform_sf).
+Current status: **22/22 variants (SM100a) + 20/20 (SM90a), PTX + SASS** —
+covers every TU and code path: mxf4 / mxf8f6f4 / f16 MMAs, UTCCP SF paths,
+swap-AB, m-grouped contiguous+masked, batched, MQA in FP8 and FP4 (dense,
+paged, sparse), quant/transform_sf, hc-prenorm, 1d1d/1d2d.
 
 **2. CPU golden model — `cargo test`.** `deepgemm/src/golden.rs` reimplements
 the numeric semantics bit-exactly (E4M3/E2M1/UE8M0, RNE quantization, SF
@@ -215,6 +216,16 @@ Ported with full fidelity (this session's additions marked **new**):
   memoization, zero-copy uploads, stream pool + PDL chains.
 * **new** MegaMoE host-side layout contract (`moe_layout`): pool capacities,
   signal-block layout, per-rank workspace sizing (tested).
+* **new** SM90 MQA logits (contiguous + paged KV) with the cost-balanced paged
+  metadata kernel — Hopper's MLA lightning-indexer scoring path.
+* **new** SM100 sparse MQA logits (DSA top-k indexer): metadata/scheduler
+  kernel (merge-path dedup of the two tokens' selected-block lists, split
+  compression, contiguous + paged schedules) + the sparse scoring kernel
+  (FP8/FP4 KV, blocked top-k KV selection).
+* **new** TF32 hyperconnection pre-norm GEMMs (SM90 + SM100): the hc-prenorm
+  projections with pre-scaled accumulation and `sqr_sum` output.
+* **new** SM90 FP8 1D2D GEMM: 1D FP32 SFA (per token per 128-K) x 2D FP32 SFB
+  (per 128x128 block), register-side SF application.
 
 Not yet ported (PRs welcome — the kernel templates and primitives
 (`tensormap.replace`, release/acquire atomics, TMEM stores, TS-MMA) are all
@@ -224,10 +235,9 @@ in place for these):
   `bf16_mega_moe`, `mega_gate`, `mega_mhc`) — the DeepEP-coupled persistent
   fused act-quant + dispatch + grouped-GEMM + combine launch. The host-side
   contract it needs is frozen and tested in `moe_layout`.
-* SM90 FP8 1D2D variant; SM90 paged MQA; sparse MQA (DSA top-k indexer);
-  hyperconnection pre-norm GEMMs; locality domains; `bmk_bnk` layouts;
-  K-grouped-with-psum-layout; the *fused* in-epilogue QuantizeToFP8 (the
-  standalone kernel in this repo delivers the same bitwise contract).
+* Locality domains; `bmk_bnk` layouts; K-grouped-with-psum-layout; the *fused*
+  in-epilogue QuantizeToFP8 (the standalone kernel in this repo delivers the
+  same bitwise contract).
 
 ## License
 

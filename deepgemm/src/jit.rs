@@ -43,6 +43,26 @@ pub mod kernel_src {
         U.get_or_init(|| format!("{WGMMA_H}\n{GEMM_SM90_CU}"))
             .as_str()
     }
+
+    /// SM90 MQA unit: wgmma.h first, then the MQA logits kernels.
+    pub fn sm90_mqa_unit() -> &'static str {
+        static U: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        U.get_or_init(|| format!("{WGMMA_H}\n{MQA_SM90}")).as_str()
+    }
+
+    /// SM90 1d2d unit: wgmma.h first, then the 1d2d GEMM kernel.
+    pub fn sm90_1d2d_unit() -> &'static str {
+        static U: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        U.get_or_init(|| format!("{WGMMA_H}\n{GEMM_SM90_1D2D}"))
+            .as_str()
+    }
+
+    /// SM90 hc-prenorm unit: wgmma.h + the (dual-arch) hc_prenorm.cu.
+    pub fn sm90_hc_unit() -> &'static str {
+        static U: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        U.get_or_init(|| format!("{WGMMA_H}\n{HC_PRENORM}"))
+            .as_str()
+    }
 }
 
 struct SendPtr<T>(T);
