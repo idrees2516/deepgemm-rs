@@ -195,11 +195,39 @@ deepgemm/            the library crate
 deepgemm-bench/      benchmark CLI (bench / smoke / compile-check / list)
 ```
 
-## Relation to upstream / not-yet-ported
+## Relation to upstream / porting status
 
-Ported with full fidelity: the unified SM100 GEMM (all block-scaled paths), MQA logits (contiguous KV), transform_sf, quant, heuristics.
+Ported with full fidelity (this session's additions marked **new**):
 
-Not yet wired (PRs welcome): SM90 (Hopper WGMMA) kernels, paged-MQA scheduling metadata kernel, MegaMoE/MegaGate (DeepEP-coupled megakernels), k-grouped/psum layouts (weight-grad), FP8 dynamic-output epilogue (QuantizeToFP8), stochastic-rounding epilogue. The kernel templates are parameterized so these slot in without restructuring.
+* Unified SM100 FP8/FP4/BF16 GEMM (tcgen05, all block-scaled paths), m-grouped
+  contiguous/masked, batched, transform_sf, quant/dequant, heuristics.
+* **new** SM90 (Hopper) suite: FP8 1D1D (WGMMA, per-128 FP32 scaling, TMA
+  multicast, persistent) including **K-grouped weight-grad** (runtime
+  tensormap patching, TMA reduce-add epilogue), and BF16 GEMM (stage-merge,
+  STSM-swizzled epilogue, MN-major operands, m-grouped contiguous/masked).
+* **new** Paged MQA logits (SM100): cost-balanced metadata kernel + per-SM
+  paged scheduler, page-gather4 producers, full-ring KV reuse — the decode
+  path for DSv4.x / MiMo serving.
+* **new** Dynamic-output FP8 quantization (`QuantizeToFP8` contract, upstream
+  note: the fused epilogue is *specified* to bitwise match the standalone
+  cast) with an optional stochastic-rounding variant.
+* **new** Rust optimization layer (`runtime`): workspace pooling, config
+  memoization, zero-copy uploads, stream pool + PDL chains.
+* **new** MegaMoE host-side layout contract (`moe_layout`): pool capacities,
+  signal-block layout, per-rank workspace sizing (tested).
+
+Not yet ported (PRs welcome — the kernel templates and primitives
+(`tensormap.replace`, release/acquire atomics, TMEM stores, TS-MMA) are all
+in place for these):
+
+* The MegaMoE **megakernels** themselves (`sm100_fp8_fp4_mega_moe`,
+  `bf16_mega_moe`, `mega_gate`, `mega_mhc`) — the DeepEP-coupled persistent
+  fused act-quant + dispatch + grouped-GEMM + combine launch. The host-side
+  contract it needs is frozen and tested in `moe_layout`.
+* SM90 FP8 1D2D variant; SM90 paged MQA; sparse MQA (DSA top-k indexer);
+  hyperconnection pre-norm GEMMs; locality domains; `bmk_bnk` layouts;
+  K-grouped-with-psum-layout; the *fused* in-epilogue QuantizeToFP8 (the
+  standalone kernel in this repo delivers the same bitwise contract).
 
 ## License
 
