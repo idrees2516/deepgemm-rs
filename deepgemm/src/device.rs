@@ -11,6 +11,8 @@ pub enum Arch {
     Sm90,
     /// Blackwell datacenter (SM100): tcgen05 (B200/GB200).
     Sm100,
+    /// Blackwell Ultra (SM103): tcgen05 (B300/GB300).
+    Sm103,
     /// Blackwell consumer/other — unsupported for tcgen05 kernels.
     Other(i32, i32),
 }
@@ -20,8 +22,14 @@ impl Arch {
         match (major, minor) {
             (9, _) => Arch::Sm90,
             (10, 0) => Arch::Sm100,
+            (10, 3) => Arch::Sm103,
             _ => Arch::Other(major, minor),
         }
+    }
+
+    /// True for the tcgen05-capable datacenter Blackwells (B200 + B300).
+    pub fn is_blackwell_dc(self) -> bool {
+        matches!(self, Arch::Sm100 | Arch::Sm103)
     }
 
     /// NVRTC arch string (`-arch`).
@@ -29,6 +37,7 @@ impl Arch {
         match self {
             Arch::Sm90 => "90a",
             Arch::Sm100 => "100a",
+            Arch::Sm103 => "103a",
             Arch::Other(m, n) => match (*m, *n) {
                 (10, 3) => "103a",
                 (12, 0) => "120a",
@@ -261,4 +270,18 @@ pub fn memset_f32(_dev: &Device, stream: &DevStream, buf: &DevBuffer, elems: u32
         sys::memset_d8(buf.ptr, 0, elems as usize * 4, stream.raw())?;
     }
     Ok(())
+}
+
+/// Cached SM count for host-side heuristics (148 on B200; B300 reports its
+/// own count at runtime). Falls back to 148 when no driver is present
+/// (offline compile-check mode).
+pub fn cached_num_sms() -> u32 {
+    static SMS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *SMS.get_or_init(|| match (sys::init(), sys::device_get(0)) {
+        (Ok(()), Ok(dev)) => match sys::device_get_attribute(dev, sys::ATTR_MULTIPROCESSOR_COUNT) {
+            Ok(n) => n as u32,
+            Err(_) => 148,
+        },
+        _ => 148,
+    })
 }

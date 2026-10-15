@@ -941,3 +941,396 @@ mod sm90_e2e {
         }
     }
 }
+
+// ===========================================================================
+// Megakernel e2e (B200/B300; --features e2e)
+// ===========================================================================
+mod mega_e2e {
+    use super::*;
+    use deepgemm::api::{self, MegaMoEWeights, RoutingSpec};
+    use deepgemm::golden;
+    use deepgemm::types::{Dtype, Major, SfGran};
+
+    fn lcg(seed: &mut u64) -> u32 {
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*seed >> 33) as u32
+    }
+
+    /// Transpose the golden SF words into the per-row-major layout the mega
+    /// kernels consume: [rows][k/128] int32 words (4 UE8M0 bytes each).
+    fn sf_row_major(x: &[f32], rows: u32, k: u32, gran: u32) -> Vec<u32> {
+        let q = golden::quant_mx_host(
+            x,
+            rows,
+            k,
+            Dtype::Fp8,
+            if gran >= 128 {
+                SfGran::G128
+            } else {
+                SfGran::G32
+            },
+        );
+        // golden layout: word-major [word][row]; we need row-major [row][word].
+        let words = (k / 128) as usize;
+        let mut out = vec![0u32; rows as usize * words];
+        for r in 0..rows as usize {
+            for w in 0..words {
+                out[r * words + w] = q.sf[w * q.sf_cols as usize + r];
+            }
+        }
+        out
+    }
+
+    /// Quantize + interleave + SF-transpose the MoE weights for the kernel.
+    fn moe_weights(
+        dev: &Device,
+        stream: &DevStream,
+        w: &[f32],
+        e: u32,
+        n: u32,
+        k: u32,
+    ) -> anyhow_of(MegaMoEWeights) {
+        let data = DevBuffer::from_bytes(dev, &quantize_host(w, k, 32, false).0, stream.raw())?;
+        // SF: row-major words, then UTCCP-transposed on device.
+        let sf_words = sf_row_major(w, e * n, k, 32);
+        let sf = DevBuffer::from_bytes(
+            dev,
+            unsafe {
+                std::slice::from_raw_parts(sf_words.as_ptr() as *const u8, sf_words.len() * 4)
+            },
+            stream.raw(),
+        )?;
+        // interleave gate/up along N + transpose SF pages.
+        let data = api::interleave_weights(dev, stream, &data, e, n, k)?;
+        let sf = api::transpose_sf_utccp(dev, stream, &sf, e, n, k)?;
+        Ok(MegaMoEWeights {
+            data,
+            sf,
+            n,
+            k,
+            is_fp4: false,
+        })
+    }
+
+    type TmResult<T> = Result<T, deepgemm::error::DgError>;
+    fn anyhow_of<T>(t: T) -> T {
+        t
+    }
+
+    #[test]
+    fn mega_moe_e2e_fp8() {
+        let (dev, stream) = test_dev();
+        let (e, i, h, t, topk) = (8u32, 256u32, 512u32, 256u32, 4u32);
+        let mut seed = 42u64;
+        let x_f: Vec<f32> = (0..t * h)
+            .map(|_| (lcg(&mut seed) % 200) as f32 / 100.0 - 1.0)
+            .collect();
+        let w13_f: Vec<f32> = (0..e * 2 * i * h)
+            .map(|_| (lcg(&mut seed) % 200) as f32 / 100.0 - 1.0)
+            .collect();
+        let w2_f: Vec<f32> = (0..e * h * i)
+            .map(|_| (lcg(&mut seed) % 200) as f32 / 100.0 - 1.0)
+            .collect();
+        let topk_idx: Vec<i64> = (0..t * topk).map(|_| (lcg(&mut seed) % e) as i64).collect();
+        let weights: Vec<f32> = vec![0.7; (t * topk) as usize];
+
+        let w13 = moe_weights(&dev, &stream, &w13_f, e, 2 * i, h).unwrap();
+        let w2 = moe_weights(&dev, &stream, &w2_f, e, h, i).unwrap();
+
+        // Sym buffer + input fills.
+        let (total, off) =
+            deepgemm::mega_layout::mega_moe_buffer_layout(1, e, t, topk, h, i, 0, dev.num_sms)
+                .unwrap();
+        let sym = DevBuffer::alloc(&dev, total as usize).unwrap();
+        let base = sym.ptr as u64;
+        let mut put = |o: u64, bytes: &[u8]| -> TmResult<()> {
+            let b = unsafe { DevBuffer::from_bytes(&dev, bytes, stream.raw())? };
+            // copy into the sym view via device-side memcpy? simplest: fill
+            // through a staging buffer + d2d copy.
+            let _ = b;
+            Ok(())
+        };
+        let _ = &mut put;
+        // Fill the input regions with a single host->device upload each.
+        let xq = quantize_host(&x_f, h, 32, false).0;
+        let x_sf = sf_row_major(&x_f, t, h, 32);
+        let x_sf_b =
+            unsafe { std::slice::from_raw_parts(x_sf.as_ptr() as *const u8, x_sf.len() * 4) };
+        let topk_b: Vec<u8> = topk_idx.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let w_b: Vec<u8> = weights.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        // Direct placement: build one host image of the whole input span.
+        let span = off.l1_token - off.input_token;
+        let mut img = vec![0u8; span as usize];
+        img[0..xq.len()].copy_from_slice(&xq);
+        let sf_off = (off.input_sf - off.input_token) as usize;
+        img[sf_off..sf_off + x_sf_b.len()].copy_from_slice(x_sf_b);
+        let tk_off = (off.input_topk_idx - off.input_token) as usize;
+        img[tk_off..tk_off + topk_b.len()].copy_from_slice(&topk_b);
+        let w_off = (off.input_topk_weights - off.input_token) as usize;
+        img[w_off..w_off + w_b.len()].copy_from_slice(&w_b);
+        let _ = put;
+        // Upload: allocate a temporary then memcpy_d2d? Use direct from_host
+        // into the view (DevBuffer::from_bytes allocates; instead reuse
+        // sym + offset with copy_from_host on a view).
+        let view = |o: u64, len: usize| DevBuffer {
+            ptr: (base + o) as _,
+            len,
+        };
+        view(off.input_token, xq.len())
+            .copy_from_host(&dev, &img[0..xq.len()], stream.raw())
+            .unwrap();
+        view(off.input_sf, x_sf_b.len())
+            .copy_from_host(&dev, x_sf_b, stream.raw())
+            .unwrap();
+        view(off.input_topk_idx, topk_b.len())
+            .copy_from_host(&dev, &topk_b, stream.raw())
+            .unwrap();
+        view(off.input_topk_weights, w_b.len())
+            .copy_from_host(&dev, &w_b, stream.raw())
+            .unwrap();
+
+        let mut y = DevBuffer::alloc(&dev, (t * h * 2) as usize).unwrap();
+        api::mega_moe(
+            &dev,
+            &stream,
+            &mut y,
+            &w13,
+            &w2,
+            None,
+            None,
+            &sym,
+            &[sym.ptr as u64],
+            0,
+            t,
+            0,
+            t,
+            topk,
+            h,
+            i,
+            Some(88.0),
+            true,
+            None,
+        )
+        .unwrap();
+        stream.sync().unwrap();
+
+        let mut out = vec![0u8; (t * h * 2) as usize];
+        y.copy_to_host(&dev, &mut out, stream.raw()).unwrap();
+        let bits: Vec<u16> = out
+            .chunks(2)
+            .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+            .collect();
+        assert!(bits.iter().any(|&b| b != 0), "all-zero mega_moe output");
+        // Fraction of NaNs must be zero.
+        let nans = bits.iter().filter(|&&b| (b & 0x7f80) == 0x7f80).count();
+        assert_eq!(nans, 0, "NaNs in mega_moe output");
+    }
+
+    #[test]
+    fn mega_gate_e2e_fp8() {
+        let (dev, stream) = test_dev();
+        let (t, h, e, topk) = (512u32, 512u32, 128u32, 4u32);
+        let mut seed = 7u64;
+        let x_f: Vec<f32> = (0..t * h)
+            .map(|_| (lcg(&mut seed) % 200) as f32 / 100.0 - 1.0)
+            .collect();
+        let w_f: Vec<f32> = (0..e * h)
+            .map(|_| (lcg(&mut seed) % 200) as f32 / 100.0 - 1.0)
+            .collect();
+        let bias: Vec<f32> = (0..e).map(|i| i as f32 * 0.01 - 0.5).collect();
+
+        let xq = quantize_host(&x_f, h, 32, false);
+        let wq = quantize_host(&w_f, h, 32, false);
+        let x_sf = sf_row_major(&x_f, t, h, 32);
+        let w_sf = sf_row_major(&w_f, e, h, 32);
+        let dev_x = DevBuffer::from_bytes(&dev, &xq.0, stream.raw()).unwrap();
+        let dev_xsf = DevBuffer::from_bytes(
+            &dev,
+            unsafe { std::slice::from_raw_parts(x_sf.as_ptr() as *const u8, x_sf.len() * 4) },
+            stream.raw(),
+        )
+        .unwrap();
+        let dev_w = DevBuffer::from_bytes(&dev, &wq.0, stream.raw()).unwrap();
+        let dev_wsf = DevBuffer::from_bytes(
+            &dev,
+            unsafe { std::slice::from_raw_parts(w_sf.as_ptr() as *const u8, w_sf.len() * 4) },
+            stream.raw(),
+        )
+        .unwrap();
+        let dev_bias = DevBuffer::from_bytes(
+            &dev,
+            unsafe { std::slice::from_raw_parts(bias.as_ptr() as *const u8, bias.len() * 4) },
+            stream.raw(),
+        )
+        .unwrap();
+
+        let topk_idx = DevBuffer::alloc(&dev, (t * (topk + 1) * 8) as usize).unwrap();
+        let topk_w = DevBuffer::alloc(&dev, (t * (topk + 1) * 4) as usize).unwrap();
+        let routing = RoutingSpec {
+            to_physical_map: None,
+            logical_count: None,
+            topk_idx,
+            unmapped_topk_idx: None,
+            topk_weights: topk_w,
+            num_routed_experts: e,
+            num_shared_experts: 1,
+            num_duplicate_experts: 1,
+            rank_idx: 0,
+            routed_scaling_factor: 2.5,
+        };
+        let (_scratch, _bars) = api::mega_gate(
+            &dev,
+            &stream,
+            &dev_x,
+            &dev_xsf,
+            &dev_w,
+            &dev_wsf,
+            Some(&dev_bias),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &routing,
+            t,
+            h,
+            topk,
+            false,
+        )
+        .unwrap();
+        stream.sync().unwrap();
+
+        let mut idx_b = vec![0u8; (t * (topk + 1) * 8) as usize];
+        routing
+            .topk_idx
+            .copy_to_host(&dev, &mut idx_b, stream.raw())
+            .unwrap();
+        let mut w_b = vec![0u8; (t * (topk + 1) * 4) as usize];
+        routing
+            .topk_weights
+            .copy_to_host(&dev, &mut w_b, stream.raw())
+            .unwrap();
+        let idx: Vec<i64> = idx_b
+            .chunks(8)
+            .map(|c| i64::from_ne_bytes(c.try_into().unwrap()))
+            .collect();
+        let wt: Vec<f32> = w_b
+            .chunks(4)
+            .map(|c| f32::from_ne_bytes(c.try_into().unwrap()))
+            .collect();
+        for ti in 0..t as usize {
+            for j in 0..topk as usize {
+                let pick = idx[ti * (topk + 1) as usize + j];
+                assert!(pick >= 0 && pick < e as i64, "invalid pick {pick}");
+            }
+            let sum: f32 = (0..topk as usize)
+                .map(|j| wt[ti * (topk + 1) as usize + j])
+                .sum();
+            assert!((sum - 2.5).abs() < 0.15, "weights sum {sum}");
+        }
+    }
+
+    #[test]
+    fn mega_mhc_e2e_shifted_fp8() {
+        let (dev, stream) = test_dev();
+        let (t, h) = (512u32, 512u32);
+        let mut seed = 9u64;
+        let r = |s: &mut u64, n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| (lcg(s) % 200) as f32 / 100.0 - 1.0)
+                .collect()
+        };
+        let x_b: Vec<u16> = r(&mut seed, (t * h) as usize)
+            .iter()
+            .map(|&v| golden::f32_to_bf16_bits(v))
+            .collect();
+        let res_b: Vec<u16> = r(&mut seed, (t * 4 * h) as usize)
+            .iter()
+            .map(|&v| golden::f32_to_bf16_bits(v))
+            .collect();
+        let post = r(&mut seed, (t * 4) as usize);
+        let comb = r(&mut seed, (t * 16) as usize);
+        let prev = r(&mut seed, (t * 4) as usize);
+        let f_n = r(&mut seed, (24 * 4 * h) as usize);
+        let scales = vec![0.5f32, 1.0, 1.5];
+        let bases: Vec<f32> = (0..24).map(|i| (i as f32 - 12.0) / 24.0).collect();
+        let nw: Vec<u16> = (0..h).map(|_| golden::f32_to_bf16_bits(0.9)).collect();
+
+        let up = |b: &[u8]| DevBuffer::from_bytes(&dev, b, stream.raw()).unwrap();
+        let dev_x =
+            up(unsafe { std::slice::from_raw_parts(x_b.as_ptr() as *const u8, x_b.len() * 2) });
+        let dev_res =
+            up(unsafe { std::slice::from_raw_parts(res_b.as_ptr() as *const u8, res_b.len() * 2) });
+        let dev_post =
+            up(unsafe { std::slice::from_raw_parts(post.as_ptr() as *const u8, post.len() * 4) });
+        let dev_comb =
+            up(unsafe { std::slice::from_raw_parts(comb.as_ptr() as *const u8, comb.len() * 4) });
+        let dev_prev =
+            up(unsafe { std::slice::from_raw_parts(prev.as_ptr() as *const u8, prev.len() * 4) });
+        let dev_fn =
+            up(unsafe { std::slice::from_raw_parts(f_n.as_ptr() as *const u8, f_n.len() * 4) });
+        let dev_scales =
+            up(unsafe { std::slice::from_raw_parts(scales.as_ptr() as *const u8, 12) });
+        let dev_bases =
+            up(unsafe { std::slice::from_raw_parts(bases.as_ptr() as *const u8, bases.len() * 4) });
+        let dev_nw =
+            up(unsafe { std::slice::from_raw_parts(nw.as_ptr() as *const u8, nw.len() * 2) });
+
+        let dev_new_res = DevBuffer::alloc(&dev, (t * 4 * h * 2) as usize).unwrap();
+        let dev_npm = DevBuffer::alloc(&dev, (t * 4 * 4) as usize).unwrap();
+        let dev_npost = DevBuffer::alloc(&dev, (t * 4 * 4) as usize).unwrap();
+        let dev_ncomb = DevBuffer::alloc(&dev, (t * 16 * 4) as usize).unwrap();
+        let mut y = DevBuffer::alloc(&dev, (t * h * 2) as usize).unwrap();
+        let y_fp8 = DevBuffer::alloc(&dev, (t * h) as usize).unwrap();
+        let y_psf = DevBuffer::alloc(&dev, (t * (h / 128) * 4) as usize).unwrap();
+        let y_ssf = DevBuffer::alloc(&dev, (t * (h / 128) * 4) as usize).unwrap();
+
+        api::mega_mhc(
+            &dev,
+            &stream,
+            &dev_x,
+            &dev_res,
+            &dev_post,
+            &dev_comb,
+            Some(&dev_prev),
+            &dev_fn,
+            &dev_scales,
+            &dev_bases,
+            1e-6,
+            0.1,
+            1.0,
+            1e-4,
+            3,
+            &dev_nw,
+            1e-6,
+            &dev_new_res,
+            Some(&mut dev_npm),
+            &dev_npost,
+            &dev_ncomb,
+            Some(&mut y),
+            Some(&y_fp8),
+            Some(&y_psf),
+            Some(&y_ssf),
+            (h / 128) as u32 * t,
+            t,
+            128,
+            1.0,
+            t,
+            h,
+        )
+        .unwrap();
+        stream.sync().unwrap();
+
+        let mut yb = vec![0u8; (t * h * 2) as usize];
+        y.copy_to_host(&dev, &mut yb, stream.raw()).unwrap();
+        let bits: Vec<u16> = yb
+            .chunks(2)
+            .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+            .collect();
+        assert!(bits.iter().any(|&b| b != 0), "all-zero mhc output");
+        let nans = bits.iter().filter(|&&b| (b & 0x7f80) == 0x7f80).count();
+        assert_eq!(nans, 0, "NaNs in mhc output");
+    }
+}

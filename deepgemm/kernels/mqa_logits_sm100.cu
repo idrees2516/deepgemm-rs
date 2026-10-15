@@ -498,22 +498,12 @@ struct StagePhase {
 };
 
 template <uint32_t kNumStages>
-struct RingPipeline {
-    uint32_t stage_idx = 0;
-    uint32_t phase = 0;
+// Thin wrapper over the prelude's dg::RingPipeline (identical math), kept
+// for the tuple-returning advance() used throughout this file.
+struct RingPipeline : dg::RingPipelineT<kNumStages> {
     DG_DEVICE StagePhase advance(const uint32_t step = 1) {
-        const StagePhase cur = {stage_idx, phase};
-        uint32_t next = stage_idx + step;
-        if ((kNumStages & (kNumStages - 1)) == 0) {
-            stage_idx = next % kNumStages;
-            phase ^= next / kNumStages;
-        } else {
-            stage_idx = next;
-            if (stage_idx >= kNumStages) {
-                stage_idx -= kNumStages;
-                phase ^= 1u;
-            }
-        }
+        StagePhase cur = {this->stage_idx, this->phase};
+        dg::RingPipelineT<kNumStages>::advance(step);
         return cur;
     }
 };

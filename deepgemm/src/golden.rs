@@ -508,3 +508,380 @@ pub fn f32_to_bf16_bits(v: f32) -> u16 {
     let rounding = 0x7fff + lsb;
     (((bits + rounding) >> 16) as u16) & 0x7fff | ((bits >> 31) as u16) << 15
 }
+
+// ===========================================================================
+// Megakernel golden models
+// ===========================================================================
+
+/// fp8_fp4_mega_moe reference (single rank).
+/// (Signatures mirror the upstream ABI; loops index by row position because
+/// the layouts are the kernel's interleaved/sf-packed views.) Weight layouts are the
+/// KERNEL's views: w13 interleaved gran-8 (gate/up pairs at n = blk*16 + off
+/// | +8), w2 plain. Returns y as bf16 bits [T, H].
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub fn mega_moe_ref(
+    x_fp8: &[u8],
+    x_sf: &[u32],
+    w13_fp8: &[u8],
+    w13_sf: &[u32],
+    w2_fp8: &[u8],
+    w2_sf: &[u32],
+    _e: u32,
+    i: u32,
+    h: u32,
+    topk: &[i64],
+    weights: &[f32],
+    num_tokens: u32,
+    num_topk: u32,
+    clamp: Option<f32>,
+) -> Vec<u16> {
+    let t = num_tokens as usize;
+    let ih = h as usize;
+    let i2 = i as usize;
+    let k_words = ih / 128;
+    let i_words = i2 / 128;
+    let mut y = vec![0u16; t * ih];
+
+    for ti in 0..t {
+        let mut acc = vec![0f64; ih];
+        for slot in 0..num_topk as usize {
+            let e_id = topk[ti * num_topk as usize + slot];
+            if e_id < 0 {
+                continue;
+            }
+            let e_id = e_id as usize;
+            let w = weights[ti * num_topk as usize + slot] as f64;
+
+            // L1: act[n] over the interleaved [2I] layout.
+            let mut act = vec![0f64; 2 * i2];
+            for n in 0..2 * i2 {
+                act[n] = bs_dot_row(
+                    x_fp8,
+                    x_sf,
+                    ti,
+                    w13_fp8,
+                    w13_sf,
+                    e_id * 2 * i2 + n,
+                    ih,
+                    k_words,
+                );
+            }
+            // SwiGLU over interleaved gate/up pairs; clamped in bf16.
+            let mut sw = vec![0f32; i2];
+            for m in 0..i2 {
+                let gate_n = (m / 8) * 16 + m % 8;
+                let up_n = (m / 8) * 16 + 8 + m % 8;
+                let g = bf16_round(clamp_f(act[gate_n] as f32, clamp, false));
+                let u = bf16_round(clamp_f(act[up_n] as f32, clamp, true));
+                let sig = g / (1.0 + (-g).exp());
+                sw[m] = (sig * u) as f32 * w as f32;
+            }
+            // FP8 requant with per-32 UE8M0 SFs (the L1 epilogue contract).
+            let mut l1 = vec![0u8; i2];
+            for g32 in 0..i2 / 32 {
+                let amax: f32 = sw[g32 * 32..(g32 + 1) * 32]
+                    .iter()
+                    .map(|v| v.abs())
+                    .fold(0f32, f32::max);
+                let sf = ue8m0_exp_fp8(amax) as u8;
+                for m in g32 * 32..(g32 + 1) * 32 {
+                    l1[m] = quant_e4m3(sw[m] / ue8m0_decode(sf));
+                }
+                let _ = sf;
+            }
+            // L2: y[.] += w2[e, ., :] @ l1 (fp8 block-scaled, fp32 accum).
+            for n in 0..ih {
+                let mut a = 0f64;
+                for m in 0..i2 {
+                    let g32 = m / 32;
+                    let amax = 1f32; // sf recomputed per group below via amax of sw
+                    let _ = amax;
+                    // SF byte for row-group m/32 along I: kernel quantizes the
+                    // L1 output with per-32 amax; mirror by re-deriving.
+                    let mut mx = 0f32;
+                    for mm in g32 * 32..(g32 + 1) * 32 {
+                        mx = mx.max(sw[mm].abs());
+                    }
+                    let sf = ue8m0_exp_fp8(mx);
+                    let wb = w2_fp8[(e_id * ih + n) * i2 + m];
+                    let wsf = ((w2_sf[(e_id * ih + n) * i_words + m / 128] >> ((m % 128 / 32) * 8))
+                        & 0xff) as u8;
+                    a += e4m3_decode(l1[m]) as f64
+                        * ue8m0_decode(sf) as f64
+                        * e4m3_decode(wb) as f64
+                        * ue8m0_decode(wsf) as f64;
+                }
+                acc[n] += a;
+            }
+        }
+        for n in 0..ih {
+            y[ti * ih + n] = f32_to_bf16_bits(acc[n] as f32);
+        }
+    }
+    y
+}
+
+fn bs_dot_row(
+    x: &[u8],
+    x_sf: &[u32],
+    x_row: usize,
+    w: &[u8],
+    w_sf: &[u32],
+    w_row: usize,
+    k: usize,
+    k_words: usize,
+) -> f64 {
+    let mut acc = 0f64;
+    for kk in 0..k {
+        let xb = x[x_row * k + kk];
+        let xsf = ((x_sf[x_row * k_words + kk / 128] >> ((kk % 128 / 32) * 8)) & 0xff) as u8;
+        let wb = w[w_row * k + kk];
+        let wsf = ((w_sf[w_row * k_words + kk / 128] >> ((kk % 128 / 32) * 8)) & 0xff) as u8;
+        acc += e4m3_decode(xb) as f64
+            * ue8m0_decode(xsf) as f64
+            * e4m3_decode(wb) as f64
+            * ue8m0_decode(wsf) as f64;
+    }
+    acc
+}
+
+fn clamp_f(v: f32, clamp: Option<f32>, up: bool) -> f32 {
+    match clamp {
+        None => v,
+        Some(c) => {
+            if up {
+                v.max(-c).min(c)
+            } else {
+                v.min(c)
+            }
+        }
+    }
+}
+fn bf16_round(v: f32) -> f32 {
+    // The kernel's shared numerical boundary is the BF16 round.
+    let bits = f32_to_bf16_bits(v);
+    (bits as i16 as i32) as f32 * 0.0 + {
+        let b = bits;
+
+        ((b as u32) << 16) as f32
+    }
+}
+
+/// fp8 mega_gate reference (scores -> sqrt-softplus -> top-k -> normalize).
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub fn mega_gate_ref(
+    x_fp8: &[u8],
+    x_sf: &[u32],
+    w_fp8: &[u8],
+    w_sf: &[u32],
+    t: u32,
+    h: u32,
+    e: u32,
+    bias: &[f32],
+    num_topk: u32,
+    routed_scaling: f32,
+    num_shared: u32,
+) -> (Vec<i64>, Vec<f32>) {
+    let kw = h as usize / 128;
+    let mut idx_out = vec![0i64; t as usize * (num_topk + num_shared) as usize];
+    let mut w_out = vec![0f32; t as usize * (num_topk + num_shared) as usize];
+    for ti in 0..t as usize {
+        // Scores with bias (image bias not modeled).
+        let mut cand: Vec<(f64, usize)> = (0..e as usize)
+            .map(|ei| {
+                let s = bs_dot_row(x_fp8, x_sf, ti, w_fp8, w_sf, ei, h as usize, kw);
+                (s + bias[ei] as f64, ei)
+            })
+            .collect();
+        cand.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1)));
+        // sqrt-softplus on the unbiased scores (raw + bias; monotonic either
+        // way — the reference applies it to the biased score).
+        let un: Vec<f64> = (0..num_topk as usize)
+            .map(|j| {
+                let v = cand[j].0 as f32;
+                let sp = if v > 20.0 { v } else { (1.0 + v.exp()).ln() };
+                sp.sqrt() as f64
+            })
+            .collect();
+        let sum: f64 = un.iter().sum::<f64>() + 1e-20;
+        for j in 0..num_topk as usize {
+            idx_out[ti * (num_topk + num_shared) as usize + j] = cand[j].1 as i64;
+            w_out[ti * (num_topk + num_shared) as usize + j] =
+                (un[j] / sum) as f32 * routed_scaling;
+        }
+        for s in 0..num_shared as usize {
+            let at = ti * (num_topk + num_shared) as usize + num_topk as usize + s;
+            idx_out[at] = (e + s as u32) as i64;
+            w_out[at] = 1.0;
+        }
+    }
+    (idx_out, w_out)
+}
+
+/// mHC reference: post/comb/pre coefficients, HC norm, sinkhorn, RMSNorm +
+/// optional FP8 outputs. Mirrors the kernel's numerics (bf16 boundaries).
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[allow(clippy::manual_clamp)]
+pub fn mega_mhc_ref(
+    x_bf16: &[u16],
+    residual_bf16: &[u16],
+    post_mix: &[f32],
+    comb: &[f32],
+    prev: Option<&[f32]>,
+    f_n: &[f32],
+    scales: &[f32],
+    bases: &[f32],
+    hc_norm_eps: f32,
+    hc_pre_eps: f32,
+    hc_post_scale: f32,
+    sinkhorn_eps: f32,
+    iters: u32,
+    norm_w_bf16: &[u16],
+    norm_eps: f32,
+    norm_scale: f32,
+    num_tokens: u32,
+    hidden: u32,
+) -> (Vec<u16>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    // (y_bf16 bits, new_prev_mix, new_post_mix, new_comb)
+    const R: usize = 4;
+    let t = num_tokens as usize;
+    let h = hidden as usize;
+    let bf16 = |b: u16| -> f32 { ((b as u32) << 16) as f32 };
+
+    let mut y = vec![0u16; t * h];
+    let mut new_prev = vec![0f32; t * R];
+    let mut new_post = vec![0f32; t * R];
+    let mut new_comb = vec![0f32; t * R * R];
+
+    for ti in 0..t {
+        // HC outputs (fp32 accum; TF32 in HW): hc[o] = fn[o,:] . nr[:, :]
+        let mut nr = vec![vec![0f32; h]; R]; // new residual per route
+        let mut hc_sqr = 0f64;
+        for r in 0..R {
+            for k in 0..h {
+                let xv = bf16(x_bf16[ti * h + k]);
+                let pv = post_mix[ti * R + r];
+                let mut v = xv * pv;
+                for ri in 0..R {
+                    let rv = bf16(residual_bf16[(ti * R + ri) * h + k]);
+                    v += rv * comb[ti * R * R + ri * R + r];
+                }
+                // BF16 boundary.
+                nr[r][k] = bf16_round_lossless(v);
+            }
+            for k in 0..h {
+                hc_sqr += nr[r][k] as f64 * nr[r][k] as f64;
+            }
+        }
+        // Mix lane math (per token).
+        let hc: Vec<f32> = (0..24)
+            .map(|o| {
+                let mut a = 0f64;
+                for r in 0..R {
+                    for k in 0..h {
+                        a += f_n[o * R * h + r * h + k] as f64 * nr[r][k] as f64;
+                    }
+                }
+                a as f32
+            })
+            .collect();
+        let rms = (hc_sqr as f32 / (R * h) as f32 + hc_norm_eps)
+            .sqrt()
+            .recip();
+        for o in 0..24 {
+            let affine = hc[o]
+                * rms
+                * scales[if o < 4 {
+                    0
+                } else if o < 8 {
+                    1
+                } else {
+                    2
+                }]
+                + bases[o];
+            if o < R {
+                let sig = 1.0f32 / (1.0 + (-affine).exp());
+                new_prev[ti * R + o] = if prev.is_some() {
+                    sig + hc_pre_eps
+                } else {
+                    0.0
+                };
+                new_post[ti * R + o] = sig * hc_post_scale;
+            } else if o < 2 * R {
+                let sig = 1.0f32 / (1.0 + (-affine).exp());
+                new_post[ti * R + (o - R)] = sig * hc_post_scale;
+                if prev.is_none() { /* normal writes post only */ }
+            } else {
+                new_comb[ti * R * R + (o - 2 * R)] = affine; // logits
+            }
+        }
+        // Sinkhorn over the 4x4 comb.
+        {
+            let mut m = vec![0f32; R * R];
+            let base = ti * R * R;
+            for r in 0..R {
+                let row_max = (0..R)
+                    .map(|c| new_comb[base + r * R + c])
+                    .fold(0f32, f32::max);
+                for c in 0..R {
+                    m[r * R + c] = (new_comb[base + r * R + c] - row_max).exp();
+                }
+            }
+            for _it in 0..iters.max(1) {
+                // Row normalize.
+                for r in 0..R {
+                    let s: f32 = (0..R).map(|c| m[r * R + c]).sum::<f32>() + sinkhorn_eps;
+                    for c in 0..R {
+                        m[r * R + c] = m[r * R + c] / s + sinkhorn_eps;
+                    }
+                }
+                // Column normalize.
+                for c in 0..R {
+                    let s: f32 = (0..R).map(|r| m[r * R + c]).sum::<f32>() + sinkhorn_eps;
+                    for r in 0..R {
+                        m[r * R + c] = m[r * R + c] / s + sinkhorn_eps;
+                    }
+                }
+            }
+            new_comb[base..base + R * R].copy_from_slice(&m);
+        }
+        // RMSNorm output (normal: routes weighted by pre; shifted: X1 = prev.nr).
+        let mut x1 = vec![0f32; h];
+        // X1 route coefficients: shifted takes them from the PREVIOUS layer's
+        // stored prev-mix; normal recomputes sig(pre affine) + hc_pre_eps.
+        let pre_coeff: Vec<f32> = (0..R)
+            .map(|r| {
+                match prev {
+                    Some(p) => p[ti * R + r],
+                    None => {
+                        // pre affine = hc[r] * rms * scales[0] + bases[r]
+                        let affine = hc[r] * rms * scales[0] + bases[r];
+                        let sig = 1.0f32 / (1.0 + (-affine).exp());
+                        sig + hc_pre_eps
+                    }
+                }
+            })
+            .collect();
+        for r in 0..R {
+            for k in 0..h {
+                x1[k] += bf16_round_lossless(nr[r][k] * pre_coeff[r]);
+            }
+        }
+        let mut x1_sqr = 0f64;
+        for k in 0..h {
+            x1_sqr += x1[k] as f64 * x1[k] as f64;
+        }
+        let rms_scale = (x1_sqr as f32 / h as f32 + norm_eps).sqrt().recip() * norm_scale;
+        for k in 0..h {
+            let w = bf16(norm_w_bf16[k]);
+            let v = bf16_round_lossless(x1[k] * rms_scale * w);
+            y[ti * h + k] = f32_to_bf16_bits(v);
+        }
+    }
+    (y, new_prev, new_post, new_comb)
+}
+fn bf16_round_lossless(v: f32) -> f32 {
+    ((f32_to_bf16_bits(v) as u32) << 16) as f32
+}

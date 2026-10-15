@@ -1316,3 +1316,644 @@ pub fn quantize_output_fp8(
     )?;
     Ok((out, sfd))
 }
+
+// ===========================================================================
+// Megakernel entry points (mega_moe / mega_gate / mega_mhc)
+// ===========================================================================
+use crate::mega_layout as mlayout;
+
+/// Build the 592-byte by-value SymBuffer param:
+/// base (local slice) + per-rank offsets + rank_idx + num_ranks.
+fn encode_sym_buffer(base: u64, rank_ptrs: &[u64], rank_idx: u32) -> Vec<u8> {
+    let mut b = Vec::with_capacity(592);
+    b.extend_from_slice(&base.to_ne_bytes());
+    for r in 0..mlayout::MAX_RANKS {
+        let off = if r < rank_ptrs.len() {
+            (rank_ptrs[r] as i64) - (base as i64)
+        } else {
+            0i64
+        };
+        b.extend_from_slice(&off.to_ne_bytes());
+    }
+    b.extend_from_slice(&rank_idx.to_ne_bytes());
+    b.extend_from_slice(&(rank_ptrs.len() as u32).to_ne_bytes());
+    b
+}
+
+/// Host-side weight preprocessing (mirror of the Python layer):
+/// gate/up interleave (gran 8) along N for the data plane.
+pub fn interleave_weights(
+    dev: &Device,
+    stream: &DevStream,
+    w: &DevBuffer, // fp8 [G, N, K] K-major
+    g: u32,
+    n: u32,
+    k: u32,
+) -> DgResult<DevBuffer> {
+    let out = DevBuffer::alloc(dev, (g as usize) * (n as usize) * (k as usize))?;
+    let body = r#"extern "C" __global__ void __dg_kernel(
+    const unsigned char* w, unsigned char* out, unsigned G, unsigned N, unsigned K) {
+    dg::mega_moe::interleave_weights_impl(w, out, G, N, K, 8);
+}"#
+    .to_string();
+    let func = jit::get_kernel(
+        dev,
+        jit::kernel_src::MEGA_MOE,
+        "interleave",
+        &format!("iwc_{g}_{n}_{k}"),
+        &body,
+    )?;
+    let args = Args::new()
+        .ptr(w.ptr as *const u8 as *const u32 as *const u8)
+        .ptr(out.ptr as *const u8 as *const u32 as *const u8)
+        .u32(g)
+        .u32(n)
+        .u32(k);
+    let total = (g as u64) * (n as u64) * (k as u64);
+    let block = 256u32;
+    let grid = total.div_ceil(block as u64).max(1) as u32;
+    jit::launch(
+        dev,
+        func,
+        stream.raw(),
+        &sys::LaunchEx {
+            grid: (grid, 1, 1),
+            block: (block, 1, 1),
+            smem: 0,
+            cluster: None,
+            pdl: false,
+        },
+        args,
+    )?;
+    Ok(out)
+}
+
+/// SF 4x32 transposition within each 128-row page (UTCCP consumption).
+pub fn transpose_sf_utccp(
+    dev: &Device,
+    stream: &DevStream,
+    sf: &DevBuffer, // int32 [G, N, K/128]
+    g: u32,
+    n: u32,
+    k: u32,
+) -> DgResult<DevBuffer> {
+    let packed = k / 128;
+    let out = DevBuffer::alloc(dev, (g as usize) * (n as usize) * (packed as usize) * 4)?;
+    let body = r#"extern "C" __global__ void __dg_kernel(
+    const int* sf, int* out, unsigned G, unsigned N, unsigned P) {
+    dg::mega_moe::transpose_sf_impl(sf, out, G, N, P);
+}"#
+    .to_string();
+    let func = jit::get_kernel(
+        dev,
+        jit::kernel_src::MEGA_MOE,
+        "tsf",
+        &format!("tsf_{g}_{n}_{k}"),
+        &body,
+    )?;
+    let args = Args::new()
+        .ptr(sf.ptr as *const u8 as *const u32 as *const u8)
+        .ptr(out.ptr as *const u8 as *const u32 as *const u8)
+        .u32(g)
+        .u32(n)
+        .u32(packed);
+    let total = (g as u64) * (n as u64) * (packed as u64);
+    let block = 256u32;
+    let grid = total.div_ceil(block as u64).max(1) as u32;
+    jit::launch(
+        dev,
+        func,
+        stream.raw(),
+        &sys::LaunchEx {
+            grid: (grid, 1, 1),
+            block: (block, 1, 1),
+            smem: 0,
+            cluster: None,
+            pdl: false,
+        },
+        args,
+    )?;
+    Ok(out)
+}
+
+/// Routing arguments for mega_gate (mirrors upstream `RoutingArgs`).
+#[allow(clippy::too_many_arguments)]
+pub struct RoutingSpec {
+    pub to_physical_map: Option<DevBuffer>, // int32 [logical, duplicates]
+    pub logical_count: Option<DevBuffer>,   // int32 [physical]
+    pub topk_idx: DevBuffer,                // i64 [T, topk+shared]
+    pub unmapped_topk_idx: Option<DevBuffer>, // i64 [T, topk] (stride = topk)
+    pub topk_weights: DevBuffer,            // f32 [T, topk+shared]
+    pub num_routed_experts: u32,
+    pub num_shared_experts: u32,
+    pub num_duplicate_experts: u32,
+    pub rank_idx: u32,
+    pub routed_scaling_factor: f32,
+}
+
+fn encode_routing_args(r: &RoutingSpec, num_topk: u32) -> Vec<u8> {
+    let p = |b: &Option<DevBuffer>| b.as_ref().map(|b| b.ptr).unwrap_or(0);
+    let mut v = Vec::with_capacity(64);
+    v.extend_from_slice(&p(&r.to_physical_map).to_ne_bytes());
+    v.extend_from_slice(&p(&r.logical_count).to_ne_bytes());
+    v.extend_from_slice(&r.topk_idx.ptr.to_ne_bytes());
+    v.extend_from_slice(&p(&r.unmapped_topk_idx).to_ne_bytes());
+    v.extend_from_slice(&r.topk_weights.ptr.to_ne_bytes());
+    v.extend_from_slice(&(num_topk as u64).to_ne_bytes()); // stride
+    v.extend_from_slice(&r.num_routed_experts.to_ne_bytes());
+    v.extend_from_slice(&r.num_shared_experts.to_ne_bytes());
+    v.extend_from_slice(&r.num_duplicate_experts.to_ne_bytes());
+    v.extend_from_slice(&r.rank_idx.to_ne_bytes());
+    let sf = r.routed_scaling_factor.to_bits();
+    v.extend_from_slice(&sf.to_ne_bytes());
+    v
+}
+
+/// fp8 MegaGate: x [T, H] e4m3 + x_sf [T, H/128] int32; weight
+/// [E_aligned, H] e4m3 + weight_sf [E_aligned, H/128] int32 (both K-major,
+/// quantized with our quant_mx/transform path).
+#[allow(clippy::too_many_arguments)]
+pub fn mega_gate(
+    dev: &Device,
+    stream: &DevStream,
+    x: &DevBuffer,
+    x_sf: &DevBuffer,
+    weight: &DevBuffer,
+    weight_sf: &DevBuffer,
+    bias: Option<&DevBuffer>,
+    image_bias: Option<&DevBuffer>,
+    image_token_mask: Option<&DevBuffer>,
+    mask: Option<&DevBuffer>,
+    fix_routing_mask: Option<&DevBuffer>,
+    force_random: Option<&DevBuffer>,
+    routing: &RoutingSpec,
+    num_tokens: u32,
+    hidden: u32,
+    num_topk: u32,
+    deterministic: bool,
+) -> DgResult<(DevBuffer, DevBuffer)> {
+    mlayout::require_blackwell(dev)?;
+    let cfg = heuristics::get_mega_gate_config(
+        num_tokens,
+        hidden,
+        routing.num_routed_experts,
+        dev.num_sms,
+        deterministic,
+    )?;
+    let aligned = mlayout::align_up(routing.num_routed_experts, mlayout::GATE_EXPERT_ALIGNMENT);
+    let token_blocks = mlayout::ceil_div(num_tokens, cfg.block_tokens);
+    let scratch = DevBuffer::alloc(
+        dev,
+        mlayout::gate_scratch_bytes(token_blocks, cfg.num_split_k, cfg.block_tokens, aligned)
+            as usize,
+    )?;
+    // Score barriers: 128B lines, zeroed once (grid tags make resets unneeded).
+    let bars_bytes = (token_blocks as u64).div_ceil(128).max(1) as usize * 128;
+    let bars = mhc::alloc_zeroed(dev, bars_bytes, stream.raw())?;
+
+    let tm_x = tma::make_tma_ab(
+        dev,
+        Dtype::Fp8,
+        Major::K,
+        x,
+        num_tokens,
+        hidden,
+        cfg.load_block_m,
+        mlayout::GATE_BLOCK_K,
+        hidden,
+        1,
+        mlayout::GATE_SWIZZLE,
+        false,
+    )?;
+    let tm_w = tma::make_tma_ab(
+        dev,
+        Dtype::Fp8,
+        Major::K,
+        weight,
+        aligned,
+        hidden,
+        cfg.load_block_n,
+        mlayout::GATE_BLOCK_K,
+        hidden,
+        1,
+        mlayout::GATE_SWIZZLE,
+        false,
+    )?;
+    // SF maps: full-tile SMEM boxes (SF covers the whole block for the MMA).
+    let tm_x_sf = tma::make_tma_sf(
+        dev,
+        x_sf,
+        num_tokens,
+        hidden,
+        32,
+        mlayout::align_up(mlayout::GATE_MAX_BLOCK_TOKENS, 128),
+        hidden / 128,
+        1,
+        0,
+    )?;
+    let tm_w_sf = tma::make_tma_sf(
+        dev,
+        weight_sf,
+        aligned,
+        hidden,
+        32,
+        mlayout::align_up(aligned / cfg.num_expert_groups, 128),
+        hidden / 128,
+        1,
+        0,
+    )?;
+
+    let padded = (routing.num_routed_experts != aligned) as u32;
+    let has_bias = bias.is_some() as u32;
+    let has_img = image_token_mask.is_some() as u32;
+    let has_mask = mask.is_some() as u32;
+    let has_fix = fix_routing_mask.is_some() as u32;
+    let has_rand = force_random.is_some() as u32;
+    let has_map = routing.to_physical_map.is_some() as u32;
+    let has_unmapped = routing.unmapped_topk_idx.is_some() as u32;
+    let sig = format!(
+        "gate_{}_{}_{}_{}_{}_{}_{}{}_{}{}{}{}{}{}{}",
+        hidden,
+        aligned,
+        cfg.num_gate_threads,
+        cfg.num_mma_ctas,
+        cfg.num_split_k,
+        cfg.num_expert_groups,
+        num_topk,
+        padded,
+        has_bias,
+        has_img,
+        has_mask,
+        has_fix,
+        has_rand,
+        has_map,
+        has_unmapped
+    );
+    let body = format!(
+        r#"extern "C" __global__ void __dg_kernel(
+    const __grid_constant__ dg::TmaMap tmx,
+    const __grid_constant__ dg::TmaMap tmw,
+    const __grid_constant__ dg::TmaMap tmxs,
+    const __grid_constant__ dg::TmaMap tmws,
+    const float* bias, const float* image_bias, const bool* image_token_mask,
+    const bool* mask, const bool* fix_routing_mask, const bool* force_random,
+    const __grid_constant__ dg::mega_gate::RoutingArgs ra,
+    void* scratch, void* bars,
+    unsigned num_tokens, unsigned block_tokens, unsigned num_stages,
+    unsigned num_worker_groups, unsigned num_token_blocks) {{
+    dg::mega_gate::fp8_mega_gate_impl<
+        {k}, {e},
+        {gt},
+        {mma}, {sk}, {eg},
+        {topk},
+        {padded}, {hb}, {hi},
+        {hm}, {hf}, {hr},
+        {hmap}, {hu}
+    >(tmx, tmw, tmxs, tmws, bias, image_bias, image_token_mask, mask,
+      fix_routing_mask, force_random, ra, scratch, bars,
+      num_tokens, block_tokens, num_stages, num_worker_groups, num_token_blocks);
+}}"#,
+        k = hidden,
+        e = aligned,
+        gt = cfg.num_gate_threads,
+        mma = cfg.num_mma_ctas,
+        sk = cfg.num_split_k,
+        eg = cfg.num_expert_groups,
+        topk = num_topk,
+        padded = padded,
+        hb = has_bias,
+        hi = has_img,
+        hm = has_mask,
+        hf = has_fix,
+        hr = has_rand,
+        hmap = has_map,
+        hu = has_unmapped
+    );
+    let func = jit::get_kernel(dev, jit::kernel_src::MEGA_GATE, "mega_gate", &sig, &body)?;
+
+    let opt = |b: &Option<&DevBuffer>| b.map(|b| b.ptr).unwrap_or(0);
+    let args = Args::new()
+        .tensormap(&tm_x)
+        .tensormap(&tm_w)
+        .tensormap(&tm_x_sf)
+        .tensormap(&tm_w_sf)
+        .u64(opt(&bias))
+        .u64(opt(&image_bias))
+        .u64(opt(&image_token_mask))
+        .u64(opt(&mask))
+        .u64(opt(&fix_routing_mask))
+        .u64(opt(&force_random))
+        .bytes(encode_routing_args(routing, num_topk))
+        .u64(scratch.ptr as u64)
+        .u64(bars.ptr as u64)
+        .u32(num_tokens)
+        .u32(cfg.block_tokens)
+        .u32(cfg.num_stages)
+        .u32(cfg.num_worker_groups)
+        .u32(token_blocks);
+    jit::launch(
+        dev,
+        func,
+        stream.raw(),
+        &sys::LaunchEx {
+            grid: (cfg.num_launch_sms, 1, 1),
+            block: (128 + cfg.num_gate_threads, 1, 1),
+            smem: cfg.smem_size,
+            cluster: Some((cfg.num_mma_ctas, 1, 1)),
+            pdl: true,
+        },
+        args,
+    )?;
+    Ok((scratch, bars))
+}
+
+/// mHC: full fused connector layer. `shifted_prev_mix == None` selects the
+/// normal (non-shifted) variant. FP8 outputs: `y_fp8` + `y_primary_sf`
+/// (either the TMA-aligned GEMM layout, or routed+shared with SF_BLOCK_M>0).
+#[allow(clippy::too_many_arguments)]
+pub fn mega_mhc(
+    dev: &Device,
+    stream: &DevStream,
+    x: &DevBuffer,                        // bf16 [T, H]
+    residual: &DevBuffer,                 // bf16 [T, R, H]
+    post_mix: &DevBuffer,                 // f32 [T, R]
+    comb_res_mix: &DevBuffer,             // f32 [T, R, R]
+    shifted_prev_mix: Option<&DevBuffer>, // f32 [T, R]
+    fn_weights: &DevBuffer,               // f32 [24, R*H]
+    mix_scales: &DevBuffer,               // f32 [3]
+    mix_bases: &DevBuffer,                // f32 [24]
+    hc_norm_eps: f32,
+    hc_pre_eps: f32,
+    hc_post_scale: f32,
+    sinkhorn_eps: f32,
+    num_sinkhorn_iters: u32,
+    rmsnorm_weight: &DevBuffer, // bf16 [H]
+    rmsnorm_eps: f32,
+    new_residual: &DevBuffer, // bf16 [T, R, H] out
+    new_prev_mix: Option<&DevBuffer>,
+    new_post_mix: &DevBuffer,
+    new_comb_res_mix: &DevBuffer,
+    y_bf16: Option<&mut DevBuffer>,
+    y_fp8: Option<&DevBuffer>,
+    y_primary_sf: Option<&DevBuffer>,
+    y_shared_sf: Option<&DevBuffer>,
+    primary_sf_stride_word: u32,
+    shared_sf_stride_word: u32,
+    shared_sf_block_m: u32,
+    rmsnorm_scale: f32,
+    num_tokens: u32,
+    hidden: u32,
+) -> DgResult<DevBuffer> {
+    mlayout::require_blackwell(dev)?;
+    if num_tokens == 0 {
+        return DevBuffer::alloc(dev, 0);
+    }
+    let is_shifted = shifted_prev_mix.is_some();
+    if y_fp8.is_some() != y_primary_sf.is_some() {
+        return Err(DgError::InvalidArg("y_fp8 requires y_primary_sf".into()));
+    }
+    if y_shared_sf.is_some() != (shared_sf_block_m > 0) {
+        return Err(DgError::InvalidArg(
+            "y_shared_sf requires shared_sf_block_m > 0".into(),
+        ));
+    }
+
+    let num_splits = heuristics::mhc_splits(num_tokens, hidden, dev.num_sms, false);
+    let m_blocks = mlayout::mhc_num_m_blocks(num_tokens);
+    let scratch = DevBuffer::alloc(
+        dev,
+        mlayout::mhc_scratch_bytes(m_blocks, num_splits) as usize,
+    )?;
+    let split_bars = mhc::shared_split_bars(dev, stream.raw())?;
+    // Snapshot the optional outputs (the &mut is consumed by encode below).
+    let y_bf16_buf: Option<&DevBuffer> = y_bf16.as_deref();
+    let _has_y_bf16 = y_bf16.is_some();
+
+    let tm_res = tma::make_tma_mhc_residual(dev, residual, hidden, num_tokens)?;
+    let tm_x = tma::make_tma_mhc_hidden(dev, x, hidden, num_tokens)?;
+    let tm_fn = tma::make_tma_mhc_fn(dev, fn_weights, hidden)?;
+    let tm_post = tma::make_tma_mhc_coeff(
+        dev,
+        post_mix,
+        mlayout::NUM_DEVICE_LOCALITY_DOMAINS.min(4),
+        num_tokens,
+        0,
+    )?;
+    let tm_comb = tma::make_tma_mhc_coeff(dev, comb_res_mix, 16, num_tokens, 64)?;
+    let tm_prev =
+        tma::make_tma_mhc_coeff(dev, shifted_prev_mix.unwrap_or(post_mix), 4, num_tokens, 0)?;
+    let tm_new_res = tma::make_tma_mhc_residual(dev, new_residual, hidden, num_tokens)?;
+    let tm_y = tma::make_tma_mhc_hidden(dev, y_bf16_buf.unwrap_or(x), hidden, num_tokens)?;
+
+    // Snapshot the optional outputs (the &mut is consumed by encode below).
+    let _y_bf16_buf: Option<&DevBuffer> = y_bf16.as_deref();
+    let has_y_bf16 = y_bf16.is_some();
+    // MixArgs + NormArgs by-value payloads.
+    let ma = mhc::encode_mix_args(
+        dev,
+        mix_scales,
+        mix_bases,
+        new_prev_mix,
+        new_post_mix,
+        new_comb_res_mix,
+        hc_norm_eps,
+        hc_pre_eps,
+        hc_post_scale,
+        sinkhorn_eps,
+        num_sinkhorn_iters,
+    );
+    let na = mhc::encode_norm_args(
+        dev,
+        num_tokens,
+        rmsnorm_weight,
+        new_residual,
+        rmsnorm_eps,
+        rmsnorm_scale,
+        y_bf16,
+        y_fp8,
+        y_primary_sf,
+        primary_sf_stride_word,
+        y_shared_sf,
+        shared_sf_stride_word,
+    );
+
+    let sb = is_shifted as u32;
+    let bf16o = has_y_bf16 as u32;
+    let fp8o = y_fp8.is_some() as u32;
+    let sig = format!(
+        "mhc_{}_{}_{}_{}{}{}_{shared_sf_block_m}",
+        hidden, num_splits, dev.num_sms, sb, bf16o, fp8o
+    );
+    let body = format!(
+        r#"extern "C" __global__ void __dg_kernel(
+    const __grid_constant__ dg::TmaMap tmr,
+    const __grid_constant__ dg::TmaMap tmx,
+    const __grid_constant__ dg::TmaMap tmf,
+    const __grid_constant__ dg::TmaMap tmp,
+    const __grid_constant__ dg::TmaMap tmc,
+    const __grid_constant__ dg::TmaMap tppv,
+    const __grid_constant__ dg::TmaMap tmnr,
+    const __grid_constant__ dg::TmaMap tmy,
+    const __grid_constant__ dg::mega_mhc::MixArgs ma,
+    const __grid_constant__ dg::mega_mhc::NormArgs na,
+    void* scratch, unsigned long long* bars) {{
+    dg::mega_mhc::mega_mhc_impl<
+        {h}, {s}, {sms},
+        {sh}, {b16}, {f8}, {sfm}
+    >(tmr, tmx, tmf, tmp, tmc, tppv, tmnr, tmy, ma, na, scratch, bars);
+}}"#,
+        h = hidden,
+        s = num_splits,
+        sms = dev.num_sms,
+        sh = sb,
+        b16 = bf16o,
+        f8 = fp8o,
+        sfm = shared_sf_block_m
+    );
+    let func = jit::get_kernel(dev, jit::kernel_src::MEGA_MHC, "mega_mhc", &sig, &body)?;
+
+    let args = Args::new()
+        .tensormap(&tm_res)
+        .tensormap(&tm_x)
+        .tensormap(&tm_fn)
+        .tensormap(&tm_post)
+        .tensormap(&tm_comb)
+        .tensormap(&tm_prev)
+        .tensormap(&tm_new_res)
+        .tensormap(&tm_y)
+        .bytes(ma)
+        .bytes(na)
+        .u64(scratch.ptr)
+        .u64(split_bars.ptr as u64);
+    jit::launch(
+        dev,
+        func,
+        stream.raw(),
+        &sys::LaunchEx {
+            grid: (dev.num_sms, 1, 1),
+            block: (768, 1, 1),
+            smem: mhc::shared_storage_bytes(),
+            cluster: None,
+            pdl: true,
+        },
+        args,
+    )?;
+    Ok(scratch)
+}
+
+/// mHC host-side helpers (smem sizing, split-barrier storage, ABI payloads).
+pub mod mhc {
+    use super::*;
+
+    /// Zeroed device buffer (stream-ordered cuMemsetD8Async).
+    pub fn alloc_zeroed(dev: &Device, bytes: usize, stream: sys::Stream) -> DgResult<DevBuffer> {
+        let b = DevBuffer::alloc(dev, bytes)?;
+        if bytes > 0 {
+            dev.bind()?;
+            sys::memset_d8(b.ptr, 0, bytes, stream)?;
+        }
+        Ok(b)
+    }
+
+    /// Split-barrier storage (grid tags need no reset after first zeroing).
+    pub fn shared_split_bars(dev: &Device, stream: sys::Stream) -> DgResult<DevBuffer> {
+        alloc_zeroed(
+            dev,
+            crate::mega_layout::mhc_split_barrier_bytes() as usize,
+            stream,
+        )
+    }
+
+    /// sizeof(SharedStorage) — placement mirrors the kernel struct exactly.
+    pub fn shared_storage_bytes() -> u32 {
+        const ALIGN: u32 = 1024;
+        const SWZ: u32 = 128;
+        let mut off = 0u32;
+        let mut place = |n: u32, a: u32| -> u32 {
+            off = off.div_ceil(a) * a;
+            let base = off;
+            off += n;
+            base
+        };
+        // residual[4][64*32] u16 + x[64*32] u16 (1024-aligned each)
+        place(4 * 64 * 32 * 2, ALIGN);
+        place(64 * 32 * 2, ALIGN);
+        // fn[2][2][4][24*32] f32
+        place(2 * 2 * 4 * 24 * 32 * 4, ALIGN);
+        // coeffs (128-aligned)
+        place(2 * 64 * 4 * 4, SWZ); // pre
+        place(2 * 64 * 4 * 4, SWZ); // post
+        place(2 * 64 * 16 * 4, SWZ); // comb
+                                     // stats + scratch
+        place(2 * 64 * 4, SWZ); // hc_norm_sqr_sums
+        place(2 * 64 * 4, SWZ); // x1_sqr_sums
+        place(64 * 4, SWZ); // normal_scratch
+                            // barriers: 12 io + 4 fn + 8 a + 4 accum + 4 coeff + 2 stats + 1 mix
+        place(35 * 8, 8);
+        place(8, 4); // tmem_base + ticket
+        off
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_mix_args(
+        dev: &Device,
+        scales: &DevBuffer,
+        bases: &DevBuffer,
+        new_prev: Option<&DevBuffer>,
+        new_post: &DevBuffer,
+        new_comb: &DevBuffer,
+        hc_norm_eps: f32,
+        hc_pre_eps: f32,
+        hc_post_scale: f32,
+        sinkhorn_eps: f32,
+        iters: u32,
+    ) -> Vec<u8> {
+        let _ = dev;
+        let mut v = Vec::with_capacity(48);
+        v.extend_from_slice(&scales.ptr.to_ne_bytes());
+        v.extend_from_slice(&bases.ptr.to_ne_bytes());
+        v.extend_from_slice(&(new_prev.map(|b| b.ptr).unwrap_or(0)).to_ne_bytes());
+        v.extend_from_slice(&new_post.ptr.to_ne_bytes());
+        v.extend_from_slice(&new_comb.ptr.to_ne_bytes());
+        for f in [hc_norm_eps, hc_pre_eps, hc_post_scale, sinkhorn_eps] {
+            v.extend_from_slice(&f.to_bits().to_ne_bytes());
+        }
+        v.extend_from_slice(&iters.to_ne_bytes());
+        v
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_norm_args(
+        dev: &Device,
+        num_tokens: u32,
+        weight: &DevBuffer,
+        new_residual: &DevBuffer,
+        eps: f32,
+        scale: f32,
+        y_bf16: Option<&mut DevBuffer>,
+        y_fp8: Option<&DevBuffer>,
+        y_primary_sf: Option<&DevBuffer>,
+        primary_stride_word: u32,
+        y_shared_sf: Option<&DevBuffer>,
+        shared_stride_word: u32,
+    ) -> Vec<u8> {
+        let _ = dev;
+        let _p = |o: &Option<&DevBuffer>| o.map(|b| b.ptr).unwrap_or(0);
+        let mut v = Vec::with_capacity(96);
+        v.extend_from_slice(&num_tokens.to_ne_bytes());
+        v.extend_from_slice(&weight.ptr.to_ne_bytes());
+        v.extend_from_slice(&new_residual.ptr.to_ne_bytes());
+        v.extend_from_slice(&eps.to_bits().to_ne_bytes());
+        v.extend_from_slice(&scale.to_bits().to_ne_bytes());
+        v.extend_from_slice(&(y_bf16.as_ref().map(|b| b.ptr).unwrap_or(0)).to_ne_bytes());
+        let pf8 = y_fp8.map(|b| b.ptr).unwrap_or(0);
+        let psf = y_primary_sf.map(|b| b.ptr).unwrap_or(0);
+        v.extend_from_slice(&pf8.to_ne_bytes());
+        v.extend_from_slice(&psf.to_ne_bytes());
+        v.extend_from_slice(&(primary_stride_word as u64).to_ne_bytes());
+        let pshared = y_shared_sf.map(|b| b.ptr).unwrap_or(0);
+        v.extend_from_slice(&pshared.to_ne_bytes());
+        v.extend_from_slice(&(shared_stride_word as u64).to_ne_bytes());
+        v
+    }
+}

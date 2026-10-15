@@ -921,3 +921,351 @@ pub mod sm90 {
         Ok(cfg)
     }
 }
+
+// ===========================================================================
+// Megakernel heuristics (ports of csrc/jit_kernels/heuristics/mega_*.hpp)
+// ===========================================================================
+use crate::mega_layout as mlayout;
+
+/// MegaMoE tiling (get_block_config_for_mega_moe + pipeline, fp8xfp4 path).
+#[derive(Clone, Debug)]
+pub struct MegaMoEConfig {
+    pub block_m: u32,
+    pub block_n: u32,
+    pub block_k: u32,
+    pub load_block_m: u32,
+    pub load_block_n: u32,
+    pub store_block_m_l1: u32,
+    pub store_block_m_l2: u32,
+    pub sf_block_m: u32,
+    pub sf_block_n: u32,
+    pub num_ring_tokens: u32,
+    pub num_sf_ring_tokens: u32,
+    pub num_stages: u32,
+    pub smem_size: u32,
+    pub num_bytes_per_pull: u32,
+    pub num_dispatch_threads: u32,
+    pub num_non_epilogue_threads: u32,
+    pub num_epilogue_threads: u32,
+}
+
+const MEGA_MOE_BLOCK_N: u32 = 128;
+const MEGA_MOE_GRAN_K: u32 = 32;
+
+pub fn mega_moe_block_config(
+    num_ranks: u32,
+    num_experts: u32,
+    num_tokens: u32,
+    num_topk: u32,
+) -> (u32, u32, u32) {
+    // Expected tokens per expert + one-sigma routing margin.
+    let expected = num_tokens as f64 * num_ranks as f64 * num_topk as f64 / num_experts as f64;
+    let covered = expected + expected.sqrt();
+
+    // Fewest blocks per expert, smallest tile covering them.
+    let mut block_m = if expected <= 10.0 { 16 } else { 32 };
+    if expected > 24.0 {
+        let mut blocks = (covered / 240.0).ceil() as u32;
+        if blocks == 1 && covered > 192.0 && num_experts / num_ranks < 14 {
+            blocks = 2;
+        }
+        for &c in &[64u32, 128, 192, 240] {
+            block_m = c;
+            if blocks as f64 * c as f64 >= covered {
+                break;
+            }
+        }
+    }
+    // Asymmetric store blocks save smem for TMA depth at fp8xfp4 prefill.
+    let store_l1 = if block_m <= 16 {
+        8
+    } else if block_m <= 64 {
+        16
+    } else if block_m <= 192 {
+        32
+    } else {
+        24
+    };
+    let store_l2 = if block_m == 240 { 8 } else { store_l1 };
+    (block_m, store_l1, store_l2)
+}
+
+pub fn get_mega_moe_config(
+    _num_sms: u32,
+    num_ranks: u32,
+    num_experts: u32,
+    _num_max_tokens_per_rank: u32,
+    num_tokens: u32,
+    num_topk: u32,
+    hidden: u32,
+    _intermediate_hidden: u32,
+    num_ring_tokens: u32,
+) -> DgResult<MegaMoEConfig> {
+    let (block_m, store_l1, store_l2) =
+        mega_moe_block_config(num_ranks, num_experts, num_tokens, num_topk);
+    if num_ring_tokens % block_m != 0 {
+        return Err(DgError::InvalidArg("num_ring_tokens % block_m != 0".into()));
+    }
+    if !mlayout::CANDIDATE_BLOCK_MS.contains(&block_m) {
+        return Err(DgError::InvalidArg("block_m not in candidates".into()));
+    }
+    let block_n = MEGA_MOE_BLOCK_N;
+    let load_block_m = block_m / 2; // always multicast on A
+    let load_block_n = block_n;
+    let sf_block_m = mlayout::align_up(block_m, 128);
+    let sf_block_n = block_n;
+    let block_k = 128; // fp8 elem = 1 byte
+    let num_sf_ring = mlayout::mega_moe_num_sf_ring_tokens(num_ring_tokens, block_m);
+
+    // Threads: 2 epilogue warpgroups (2*128), dispatch 128, mma 128.
+    let num_dispatch_threads = 128u32;
+    let num_non_epilogue_threads = 128u32;
+    let num_epilogue_threads = 256u32;
+    let num_dispatch_warps = num_dispatch_threads / 32;
+    let num_epilogue_warps = num_epilogue_threads / 32;
+    let num_epilogue_wgs = num_epilogue_threads / 128;
+
+    // Pull chunk: halve token bytes until <= 8192.
+    let mut pull = hidden; // fp8: 1B/elem
+    while pull > 8192 {
+        if pull % 2 != 0 {
+            return Err(DgError::InvalidArg("hidden not divisible by pull".into()));
+        }
+        pull /= 2;
+    }
+
+    // Pipeline smem budget (mirror of get_pipeline_config_for_mega_moe).
+    const ALIGN: u32 = 1024;
+    const EPI_STAGES: u32 = 2;
+    const TMA_STORE_STAGES: u32 = 2;
+    let smem_capacity = SMEM_CAPACITY_FALLBACK;
+    let smem_expert = mlayout::align_up(num_experts * 4, ALIGN);
+    let smem_send = mlayout::align_up(num_dispatch_warps * pull, ALIGN);
+    let smem_cd_l1 = num_epilogue_wgs * store_l1 * (block_n / 2) * TMA_STORE_STAGES;
+    let smem_cd_l2 = num_epilogue_wgs * store_l2 * block_n * 2;
+    let smem_cd = mlayout::align_up(smem_cd_l1.max(smem_cd_l2), ALIGN);
+    let smem_task = 2 * 32; // 2 stages x TaskInfo (32B)
+    let smem_barriers = (num_dispatch_warps + EPI_STAGES * 2 + num_epilogue_warps * 2 + 2 * 2) * 8;
+    let smem_amax = store_l1 * num_epilogue_warps * 4;
+    let smem_tmem_ptr = 4;
+    let smem_sfa = sf_block_m * (block_k / MEGA_MOE_GRAN_K) * 4;
+    let smem_sfb = sf_block_n * (block_k / MEGA_MOE_GRAN_K) * 4;
+    let a_stage = mlayout::align_up(load_block_m * block_k, ALIGN);
+    let b_stage = mlayout::align_up(load_block_n * block_k, ALIGN);
+    let per_stage = a_stage + b_stage + smem_sfa + smem_sfb + 16;
+    let fixed =
+        smem_expert + smem_send + smem_cd + smem_amax + smem_barriers + smem_task + smem_tmem_ptr;
+    let mut num_stages = (smem_capacity.saturating_sub(fixed)) / per_stage;
+    if num_stages < 2 {
+        return Err(DgError::InvalidArg(
+            "mega moe smem underflow (num_stages < 2)".into(),
+        ));
+    }
+    num_stages = num_stages.min(32);
+    let smem_size = fixed + num_stages * per_stage;
+
+    Ok(MegaMoEConfig {
+        block_m,
+        block_n,
+        block_k,
+        load_block_m,
+        load_block_n,
+        store_block_m_l1: store_l1,
+        store_block_m_l2: store_l2,
+        sf_block_m,
+        sf_block_n,
+        num_ring_tokens,
+        num_sf_ring_tokens: num_sf_ring,
+        num_stages,
+        smem_size,
+        num_bytes_per_pull: pull,
+        num_dispatch_threads,
+        num_non_epilogue_threads,
+        num_epilogue_threads,
+    })
+}
+
+/// MegaGate tiling (candidate enumeration + comparator; fp8 cap 240 tokens).
+#[derive(Clone, Debug)]
+pub struct MegaGateConfig {
+    pub num_expert_groups: u32,
+    pub num_mma_ctas: u32,
+    pub num_split_k: u32,
+    pub num_logical_ctas: u32,
+    pub block_tokens: u32,
+    pub load_block_m: u32,
+    pub load_block_n: u32,
+    pub num_worker_groups: u32,
+    pub num_launch_sms: u32,
+    pub num_waves: u32,
+    pub num_token_cols: u32,
+    pub num_gate_threads: u32,
+    pub num_stages: u32,
+    pub smem_size: u32,
+}
+
+const GATE_MAX_WGS: u32 = 7;
+const GATE_TRANSPOSE_COLS: u32 = 8;
+const GATE_TOPK_TOKENS_PER_WG: u32 = 4;
+const GATE_MAX_SPLIT_K: u32 = 8;
+const GATE_MAX_EXTRA_WAVES: u32 = 2;
+
+fn gate_select_wave_block_tokens(num_tokens: u32, worker_groups: u32) -> u32 {
+    let waves = mlayout::ceil_div(
+        mlayout::ceil_div(num_tokens, mlayout::GATE_MAX_BLOCK_TOKENS),
+        worker_groups,
+    );
+    mlayout::GATE_MAX_BLOCK_TOKENS.min(mlayout::align_up(
+        mlayout::ceil_div(num_tokens, waves * worker_groups),
+        mlayout::GATE_MIN_BLOCK_TOKENS,
+    ))
+}
+fn gate_num_waves(num_tokens: u32, worker_groups: u32) -> u32 {
+    mlayout::ceil_div(
+        mlayout::ceil_div(
+            num_tokens,
+            gate_select_wave_block_tokens(num_tokens, worker_groups),
+        ),
+        worker_groups,
+    )
+}
+fn gate_token_cols(block_tokens: u32, experts_per_group: u32, mma_ctas: u32) -> u32 {
+    if experts_per_group == mlayout::GATE_EXPERT_ALIGNMENT {
+        block_tokens / mma_ctas
+    } else {
+        block_tokens
+    }
+}
+fn balanced_warpgroups(units: u32) -> u32 {
+    mlayout::ceil_div(units, mlayout::ceil_div(units, GATE_MAX_WGS))
+}
+
+pub fn get_mega_gate_config(
+    num_tokens: u32,
+    hidden: u32,
+    num_routed_experts: u32,
+    num_sms: u32,
+    deterministic: bool,
+) -> DgResult<MegaGateConfig> {
+    let aligned = mlayout::align_up(num_routed_experts, mlayout::GATE_EXPERT_ALIGNMENT);
+    let mut candidates: Vec<MegaGateConfig> = Vec::new();
+    for eg in 1..=aligned / mlayout::GATE_EXPERT_ALIGNMENT {
+        if aligned % (mlayout::GATE_EXPERT_ALIGNMENT * eg) != 0 {
+            continue;
+        }
+        let epg = aligned / eg;
+        if epg > 2 * mlayout::GATE_EXPERT_ALIGNMENT {
+            continue;
+        }
+        for mma in 1..=2u32 {
+            if epg > mlayout::GATE_EXPERT_ALIGNMENT && mma != 2 {
+                continue;
+            }
+            let mut split_k = 1;
+            while split_k <= (if deterministic { 1 } else { GATE_MAX_SPLIT_K }) {
+                if hidden % (split_k * mlayout::GATE_BLOCK_K) != 0 {
+                    split_k *= 2;
+                    continue;
+                }
+                if mma == 2 && split_k == GATE_MAX_SPLIT_K {
+                    split_k *= 2;
+                    continue;
+                }
+                let logical = eg * mma * split_k;
+                if logical > num_sms || logical >= mlayout::GATE_MAX_LOGICAL_CTAS {
+                    split_k *= 2;
+                    continue;
+                }
+                let worker_groups = num_sms / logical;
+                let block_tokens = gate_select_wave_block_tokens(num_tokens, worker_groups);
+                let token_blocks = mlayout::ceil_div(num_tokens, block_tokens);
+                // Doubling filter: skip candidates a cheap doubling dominates.
+                let doubled = logical * 2;
+                let dominates = doubled <= num_sms
+                    && doubled < mlayout::GATE_MAX_LOGICAL_CTAS
+                    && ((mma == 1
+                        && split_k != GATE_MAX_SPLIT_K
+                        && gate_num_waves(num_tokens, num_sms / doubled)
+                            <= gate_num_waves(num_tokens, worker_groups) + GATE_MAX_EXTRA_WAVES)
+                        || (mma == 2
+                            && split_k == 1
+                            && gate_select_wave_block_tokens(num_tokens, num_sms / doubled)
+                                == block_tokens
+                            && !deterministic));
+                if !dominates {
+                    candidates.push(MegaGateConfig {
+                        num_expert_groups: eg,
+                        num_mma_ctas: mma,
+                        num_split_k: split_k,
+                        num_logical_ctas: logical,
+                        block_tokens,
+                        load_block_m: block_tokens / mma,
+                        load_block_n: epg / mma,
+                        num_worker_groups: worker_groups.min(token_blocks),
+                        num_launch_sms: worker_groups.min(token_blocks) * logical,
+                        num_waves: mlayout::ceil_div(token_blocks, worker_groups),
+                        num_token_cols: gate_token_cols(block_tokens, epg, mma)
+                            .min(GATE_MAX_WGS * GATE_TRANSPOSE_COLS),
+                        num_gate_threads: 0,
+                        num_stages: 0,
+                        smem_size: 0,
+                    });
+                }
+                split_k *= 2;
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Err(DgError::InvalidArg("no mega gate config".into()));
+    }
+    // Comparator: longer transposes > more SMs > CTA pairs > fewer splits >
+    // fewer waves.
+    let mut best = candidates
+        .into_iter()
+        .rev()
+        .max_by(|a, b| {
+            a.num_token_cols
+                .cmp(&b.num_token_cols)
+                .then(a.num_launch_sms.cmp(&b.num_launch_sms))
+                .then(a.num_mma_ctas.cmp(&b.num_mma_ctas))
+                .then(b.num_split_k.cmp(&a.num_split_k))
+                .then(b.num_waves.cmp(&a.num_waves))
+        })
+        .unwrap();
+
+    // Gate warpgroups: balance transpose + topk units; all 7 for multi-wave.
+    let epg = aligned / best.num_expert_groups;
+    let transpose_units = mlayout::ceil_div(
+        gate_token_cols(best.block_tokens, epg, best.num_mma_ctas),
+        GATE_TRANSPOSE_COLS,
+    );
+    let topk_units = mlayout::ceil_div(
+        best.block_tokens,
+        GATE_TOPK_TOKENS_PER_WG * best.num_logical_ctas,
+    );
+    let wgs = if best.num_waves > 1 {
+        GATE_MAX_WGS
+    } else {
+        balanced_warpgroups(transpose_units).max(balanced_warpgroups(topk_units))
+    };
+    best.num_gate_threads = wgs * 128;
+
+    // Pipeline: x/weight stages (fp8 1B/elem) + SF tiles (full blocks).
+    let stage_bytes = (best.load_block_m + best.load_block_n) * mlayout::GATE_BLOCK_K;
+    let sf_bytes = (mlayout::align_up(epg, 128)
+        + mlayout::align_up(mlayout::GATE_MAX_BLOCK_TOKENS, 128))
+        * (hidden / 128)
+        * 4;
+    let fixed = 1024 + sf_bytes;
+    best.num_stages = ((SMEM_CAPACITY_FALLBACK.saturating_sub(fixed)) / stage_bytes)
+        .min(mlayout::GATE_MAX_STAGES)
+        .max(2);
+    best.smem_size = mlayout::align_up(fixed + best.num_stages * stage_bytes, 1024);
+    Ok(best)
+}
+
+/// mHC split selection (apis/mega_mhc.hpp port).
+pub fn mhc_splits(num_tokens: u32, hidden: u32, num_sms: u32, deterministic: bool) -> u32 {
+    let m_blocks = mlayout::mhc_num_m_blocks(num_tokens);
+    mlayout::mhc_num_splits(m_blocks, hidden, num_sms, deterministic)
+}

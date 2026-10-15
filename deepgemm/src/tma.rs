@@ -464,3 +464,174 @@ pub fn make_tma_mqa_sf_paged(
         0,
     )
 }
+
+// ===========================================================================
+// Megakernel tensor maps (mega_moe / mega_gate / mega_mhc)
+// ===========================================================================
+use crate::mega_layout as mlayout;
+
+/// Routed expert weights [E, N, K] (K-major fp8/fp4) -> 4D map
+/// (K, N/domain, domains=2, experts); box (block_k, load_block_n, 1, 1).
+/// Matches upstream `make_tma_weights_3d_desc` with num_domains = 2.
+#[allow(clippy::too_many_arguments)]
+pub fn make_tma_moe_weights_3d(
+    dev: &Device,
+    dtype: Dtype,
+    buf: &DevBuffer,
+    num_experts: u32,
+    n: u32,
+    k: u32,
+    block_k: u32,
+    load_block_n: u32,
+    swizzle_mode: u32,
+    fp4_unpacked: bool,
+) -> DgResult<sys::TensorMap> {
+    const DOMAINS: u32 = mlayout::NUM_DEVICE_LOCALITY_DOMAINS;
+    let elem = if fp4_unpacked {
+        1
+    } else {
+        dtype.elem_size() as u32
+    };
+    let n_per_domain = n / DOMAINS;
+    let gmem0 = k; // logical elements (fp4 gmem rows are packed)
+    let gmem1 = n_per_domain;
+    let gmem2 = DOMAINS;
+    let gmem3 = num_experts;
+    let stride0 = k as u64 * elem as u64; // dim1 stride: one N row
+    let stride1 = n_per_domain as u64 * k as u64 * elem as u64; // dim2: domain slice
+    let stride2 = n as u64 * k as u64 * elem as u64; // dim3: expert batch
+    dev.bind()?;
+    sys::tensor_map_encode_tiled(
+        dtype_of(dtype, fp4_unpacked)?,
+        4,
+        buf.ptr as *mut _,
+        &[gmem0 as u64, gmem1 as u64, gmem2 as u64, gmem3 as u64],
+        &[stride0, stride1, stride2],
+        &[block_k, load_block_n, 1, 1],
+        &[1, 1, 1, 1],
+        sys::tm_interleave_none(),
+        sys::tm_swizzle(swizzle_mode),
+        sys::tm_l2_256b(),
+        sys::tm_oob_fill_none(),
+    )
+}
+
+/// Shared-expert weights [N, K] -> 4D map (K, N/domain, domains=2, 1).
+#[allow(clippy::too_many_arguments)]
+pub fn make_tma_moe_weights_2d(
+    dev: &Device,
+    dtype: Dtype,
+    buf: &DevBuffer,
+    n: u32,
+    k: u32,
+    block_k: u32,
+    load_block_n: u32,
+    swizzle_mode: u32,
+    fp4_unpacked: bool,
+) -> DgResult<sys::TensorMap> {
+    make_tma_moe_weights_3d(
+        dev,
+        dtype,
+        buf,
+        1,
+        n,
+        k,
+        block_k,
+        load_block_n,
+        swizzle_mode,
+        fp4_unpacked,
+    )
+}
+
+/// mHC hidden 2D map: x/y [T, H] bf16, box (BLOCK_K, BLOCK_M), 128B swizzle.
+pub fn make_tma_mhc_hidden(
+    dev: &Device,
+    buf: &DevBuffer,
+    hidden: u32,
+    num_tokens: u32,
+) -> DgResult<sys::TensorMap> {
+    make_tma_2d(
+        dev,
+        Dtype::Bf16,
+        false,
+        buf.ptr,
+        hidden,
+        num_tokens,
+        mlayout::MHC_BLOCK_K,
+        mlayout::MHC_BLOCK_M,
+        hidden,
+        mlayout::MHC_SWIZZLE,
+    )
+}
+
+/// mHC residual 3D map: [T, R, H] -> dims (H, T, R); box (BLOCK_K, BLOCK_M, R).
+pub fn make_tma_mhc_residual(
+    dev: &Device,
+    buf: &DevBuffer,
+    hidden: u32,
+    num_tokens: u32,
+) -> DgResult<sys::TensorMap> {
+    dev.bind()?;
+    let elem = 2u64; // bf16
+    sys::tensor_map_encode_tiled(
+        crate::tma::dtype_of(Dtype::Bf16, false)?,
+        3,
+        buf.ptr as *mut _,
+        &[
+            hidden as u64,
+            num_tokens as u64,
+            mlayout::NUM_DEVICE_LOCALITY_DOMAINS.min(4) as u64,
+        ],
+        &[
+            hidden as u64 * elem,
+            hidden as u64 * mlayout::NUM_DEVICE_LOCALITY_DOMAINS.min(4) as u64 * elem,
+        ],
+        &[mlayout::MHC_BLOCK_K, mlayout::MHC_BLOCK_M, 4],
+        &[1, 1, 1],
+        sys::tm_interleave_none(),
+        sys::tm_swizzle(mlayout::MHC_SWIZZLE),
+        sys::tm_l2_256b(),
+        sys::tm_oob_fill_none(),
+    )
+}
+
+/// mHC fn 3D map: fn [24, R*H] fp32 -> dims (H, 24, R); strides (4H, H).
+pub fn make_tma_mhc_fn(dev: &Device, buf: &DevBuffer, hidden: u32) -> DgResult<sys::TensorMap> {
+    dev.bind()?;
+    let routes = 4u64;
+    sys::tensor_map_encode_tiled(
+        crate::tma::dtype_of(Dtype::F32, false)?,
+        3,
+        buf.ptr as *mut _,
+        &[hidden as u64, mlayout::MHC_NUM_HC_OUTPUTS as u64, routes],
+        &[(routes * hidden as u64) * 4, (hidden as u64) * 4],
+        &[mlayout::MHC_BLOCK_K, mlayout::MHC_NUM_HC_OUTPUTS, 4],
+        &[1, 1, 1],
+        sys::tm_interleave_none(),
+        sys::tm_swizzle(mlayout::MHC_SWIZZLE),
+        sys::tm_l2_256b(),
+        sys::tm_oob_fill_none(),
+    )
+}
+
+/// mHC coefficient 2D map: [T, channels] fp32; box (channels, BLOCK_M).
+pub fn make_tma_mhc_coeff(
+    dev: &Device,
+    buf: &DevBuffer,
+    channels: u32,
+    num_tokens: u32,
+    swizzle_mode: u32,
+) -> DgResult<sys::TensorMap> {
+    make_tma_2d(
+        dev,
+        Dtype::F32,
+        false,
+        buf.ptr,
+        channels,
+        num_tokens,
+        channels,
+        mlayout::MHC_BLOCK_M,
+        channels,
+        swizzle_mode,
+    )
+}

@@ -55,3 +55,5 @@ pub mod prelude {
     pub use crate::golden;
     pub use crate::types::{Dtype, GemmType, Major, Operand, Output, SfGran, SfTensor};
 }
+
+pub mod mega_layout;
