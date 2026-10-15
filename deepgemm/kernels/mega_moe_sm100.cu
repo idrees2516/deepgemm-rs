@@ -80,7 +80,6 @@ namespace dg {
 // 0. Local PTX helpers (not in prelude.h; NVRTC-safe)
 // ===========================================================================
 
-constexpr uint64_t kEvictFirstHint = 0x12f0000000000000ull;
 
 // `barrier.sync` (unaligned form) vs prelude's `bar.sync`: the dispatch and
 // epilogue regions meet at 384 threads (3 warpgroups) — arrival is
@@ -94,7 +93,6 @@ DG_DEVICE void sync_aligned(uint32_t num_threads, uint32_t barrier_idx) {
 }
 
 // Full cluster sync (aligned arrive) — prelude only has the relaxed flavor.
-DG_DEVICE void cluster_arrive() { asm volatile("barrier.cluster.arrive;" ::: "memory"); }
 DG_DEVICE void cluster_sync_full() { cluster_arrive(); cluster_wait(); }
 
 // redux.sync wrappers (upstream uses the __reduce_*_sync intrinsics).
@@ -156,7 +154,7 @@ DG_DEVICE void st_async_cluster_16b(uint32_t dst_smem_cluster_addr,
 }
 
 // 4D TMA load for a 2-CTA cluster (weights are 4D: K x N/2 x 2-die x expert).
-DG_DEVICE void tma_load_4d_2sm(const TmaMap* map, Barrier* bar, void* smem,
+DG_DEVICE void tma_load_4d_2sm_dom(const TmaMap* map, Barrier* bar, void* smem,
                                uint64_t cache_hint,
                                uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3) {
     asm volatile(
@@ -172,15 +170,6 @@ DG_DEVICE void tma_load_4d_2sm(const TmaMap* map, Barrier* bar, void* smem,
 // must be 64-bit before PTX ISA 9.0 and the address a 64-bit shared window
 // value; prelude.h's 32-bit-operand variant is rejected by ptxas (arguments
 // mismatch) — kept local to this TU, matching upstream's encoding.
-DG_DEVICE uint64_t cvta_shared_to_u64(const void* ptr) {
-    uint64_t r;
-    asm volatile("cvta.to.shared.u64 %0, %1;" : "=l"(r) : "l"(ptr));
-    return r;
-}
-DG_DEVICE void st_shared_bulk(void* smem, uint32_t num_bytes) {
-    asm volatile("st.bulk.weak.shared::cta [%0], %1, 0;"
-                 :: "l"(cvta_shared_to_u64(smem)), "l"((uint64_t)num_bytes) : "memory");
-}
 
 // `tma::copy` (2D, cta_group::2): split the box's inner extent into swizzle
 // atoms; consecutive atoms land at `BLOCK_OUTER * atom_bytes` smem offsets.
@@ -210,7 +199,7 @@ DG_DEVICE void tma_copy_4d_2sm(const TmaMap* map, Barrier* bar, void* smem,
     const uint32_t atom_elems = atom_bytes / wire_elem_bytes;
     #pragma unroll 4
     for (uint32_t i = 0; i < num_atoms; ++i) {
-        tma_load_4d_2sm(map, bar, (uint8_t*)smem + i * block_outer * atom_bytes,
+        tma_load_4d_2sm_dom(map, bar, (uint8_t*)smem + i * block_outer * atom_bytes,
                         kEvictNormalHint, k_idx + i * atom_elems, n_idx, dom_idx, expert_idx);
     }
 }
@@ -224,14 +213,6 @@ DG_DEVICE float exchange_f32(float v, uint32_t src_lane_idx) {
 }
 
 // Warp inclusive prefix sum (upstream math::warp_inclusive_sum).
-DG_DEVICE uint32_t warp_inclusive_sum_u32(uint32_t value, uint32_t lane_idx) {
-    #pragma unroll
-    for (uint32_t offset = 1; offset < 32; offset <<= 1) {
-        const uint32_t synced = __shfl_up_sync(0xffffffff, value, (int)offset);
-        if (lane_idx >= offset) value += synced;
-    }
-    return value;
-}
 
 // Full-warp f32 max reduce (upstream math::warp_reduce<4, true, ReduceMax>:
 // xor 1/2/4/8/16 — the intergroup-reduce flavor over 4-lane groups).
@@ -242,11 +223,6 @@ DG_DEVICE float warp_reduce_max_f32(float value) {
     return value;
 }
 
-DG_DEVICE float fast_rcp_f32(float x) {
-    float r;
-    asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
-    return r;
-}
 // `hmax2_bf16x2` lives in prelude.h (auto-prepended by the JIT engine).
 DG_DEVICE uint32_t hmin2_bf16x2(uint32_t a, uint32_t b) {
     uint32_t r;
@@ -276,14 +252,6 @@ DG_DEVICE uint32_t get_ue8m0_sf_exp_f32(float amax) {
 }
 DG_DEVICE float get_ue8m0_sf_inv_f32(uint32_t sf_exp) {
     return __uint_as_float((254u - sf_exp) << 23);
-}
-DG_DEVICE void red_add_i32(int32_t* p, int32_t v) {
-    asm volatile("red.gpu.global.add.s32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
-}
-DG_DEVICE int32_t ld_acq_sys_i32(const int32_t* p) {
-    int32_t v;
-    asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(v) : "l"(p));
-    return v;
 }
 
 // Device-side assert that never touches the host runtime (trap only).

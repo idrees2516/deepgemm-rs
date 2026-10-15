@@ -215,6 +215,21 @@ impl DevBuffer {
         Ok(())
     }
 
+    /// A zero-cost view of the same allocation (aliasing sym-buffer regions).
+    pub fn clone_view(&self) -> DevBuffer {
+        DevBuffer {
+            ptr: self.ptr,
+            len: self.len,
+        }
+    }
+
+    /// Allocate and fill from host bytes on the given stream.
+    pub fn from_bytes(dev: &Device, src: &[u8], stream: sys::Stream) -> DgResult<DevBuffer> {
+        let buf = DevBuffer::alloc(dev, src.len())?;
+        buf.copy_from_host(dev, src, stream)?;
+        Ok(buf)
+    }
+
     pub fn copy_to_host(&self, dev: &Device, dst: &mut [u8], stream: sys::Stream) -> DgResult<()> {
         assert!(
             dst.len() <= self.len,

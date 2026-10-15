@@ -132,6 +132,8 @@ fn compile_ptx_nocache(source: &str, arch: &str) -> DgResult<String> {
     let options: Vec<Vec<u8>> = vec![
         format!("--gpu-architecture=compute_{arch}").into_bytes(),
         b"--std=c++17".to_vec(),
+        // Megakernel TUs (Workspace/Buffer/Scheduler members) need it in JIT mode.
+        b"--device-as-default-execution-space".to_vec(),
     ];
     unsafe {
         nvrtc_result::compile_program(prog, &options).map_err(|e| {
@@ -361,6 +363,8 @@ fn compile_cubin_nocache(source: &str, arch: &str) -> DgResult<Vec<u8>> {
     let options: Vec<Vec<u8>> = vec![
         format!("--gpu-architecture=sm_{arch}").into_bytes(),
         b"--std=c++17".to_vec(),
+        // Megakernel TUs (Workspace/Buffer/Scheduler members) need it in JIT mode.
+        b"--device-as-default-execution-space".to_vec(),
     ];
     unsafe {
         nvrtc_result::compile_program(prog, &options).map_err(|e| {
@@ -448,6 +452,11 @@ impl Args {
     /// Raw pointer (e.g. a global-memory address to be dereferenced in-kernel).
     pub fn ptr<T>(mut self, p: *const T) -> Self {
         self.raw.push((p as u64).to_ne_bytes().to_vec());
+        self
+    }
+    /// Arbitrary by-value struct param (SymBuffer / RoutingArgs / MixArgs...).
+    pub fn bytes(mut self, b: Vec<u8>) -> Self {
+        self.raw.push(b);
         self
     }
     /// TMA descriptor passed by value (128 bytes, 64-byte aligned).

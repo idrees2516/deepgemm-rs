@@ -900,6 +900,28 @@ fn kernel_variants(arch: &str) -> Vec<(&'static str, &'static str, String)> {
                 .to_string(),
             ),
         ]);
+        v.extend_from_slice(&[
+            (
+                "mega gate fp8 c2 k2",
+                kernel_src::MEGA_GATE,
+                mega_gate_wrapper(7168, 256, 256, 2, 1, 2, 8, 0, 1, 0, 0, 0, 0, 0, 0),
+            ),
+            (
+                "mega gate fp8 c1 splitk4 bias",
+                kernel_src::MEGA_GATE,
+                mega_gate_wrapper(4096, 128, 384, 1, 4, 1, 6, 1, 1, 1, 1, 1, 1, 1, 1),
+            ),
+            (
+                "mega mhc shifted fp8",
+                kernel_src::MEGA_MHC,
+                mega_mhc_wrapper(7168, 16, 148, 1, 1, 1, 128),
+            ),
+            (
+                "mega mhc normal bf16",
+                kernel_src::MEGA_MHC,
+                mega_mhc_wrapper(4096, 16, 148, 0, 1, 0, 0),
+            ),
+        ]);
     }
     v
 }
@@ -1174,6 +1196,58 @@ fn main() {
     }
 }
 
+/// mega_gate variant wrapper (fp8 block-scaled, mirrors api.rs body).
+#[allow(clippy::too_many_arguments)]
+fn mega_gate_wrapper(
+    k: u32,
+    e: u32,
+    gt: u32,
+    mma: u32,
+    sk: u32,
+    eg: u32,
+    topk: u32,
+    padded: u32,
+    hb: u32,
+    hi: u32,
+    hm: u32,
+    hf: u32,
+    hr: u32,
+    hmap: u32,
+    hu: u32,
+) -> String {
+    format!(
+        r#"extern "C" __global__ void __dg_kernel(
+    const __grid_constant__ dg::TmaMap tmx, const __grid_constant__ dg::TmaMap tmw,
+    const __grid_constant__ dg::TmaMap tmxs, const __grid_constant__ dg::TmaMap tmws,
+    const float* bias, const float* ib, const bool* itm, const bool* m,
+    const bool* frm, const bool* fr, const __grid_constant__ dg::mega_gate::RoutingArgs ra,
+    void* scratch, void* bars,
+    unsigned nt, unsigned bt, unsigned ns, unsigned wg, unsigned tb) {{
+    dg::mega_gate::fp8_mega_gate_impl<
+        {k}, {e}, {gt}, {mma}, {sk}, {eg}, {topk},
+        {padded}, {hb}, {hi}, {hm}, {hf}, {hr}, {hmap}, {hu}
+    >(tmx, tmw, tmxs, tmws, bias, ib, itm, m, frm, fr, ra, scratch, bars,
+      nt, bt, ns, wg, tb);
+}}"#
+    )
+}
+
+fn mega_mhc_wrapper(h: u32, splits: u32, sms: u32, sh: u32, b16: u32, f8: u32, sfm: u32) -> String {
+    format!(
+        r#"extern "C" __global__ void __dg_kernel(
+    const __grid_constant__ dg::TmaMap tmr, const __grid_constant__ dg::TmaMap tmx,
+    const __grid_constant__ dg::TmaMap tmf, const __grid_constant__ dg::TmaMap tmp,
+    const __grid_constant__ dg::TmaMap tmc, const __grid_constant__ dg::TmaMap tppv,
+    const __grid_constant__ dg::TmaMap tmnr, const __grid_constant__ dg::TmaMap tmy,
+    const __grid_constant__ dg::mega_mhc::MixArgs ma,
+    const __grid_constant__ dg::mega_mhc::NormArgs na,
+    void* scratch, unsigned long long* bars) {{
+    dg::mega_mhc::mega_mhc_impl<{h}, {splits}, {sms}, {sh}, {b16}, {f8}, {sfm}>(
+        tmr, tmx, tmf, tmp, tmc, tppv, tmnr, tmy, ma, na, scratch, bars);
+}}"#
+    )
+}
+
 // ===========================================================================
 // Megakernel benchmarks: end-to-end layer latency + effective TFLOPS.
 // ===========================================================================
@@ -1184,7 +1258,7 @@ fn peak_tflops_fp8(num_sms: u32) -> f64 {
 }
 
 fn run_mega_bench(name: &str, iters: u32, warmup: u32) -> deepgemm::error::DgResult<()> {
-    use deepgemm::api::{self, MegaMoEWeights, RoutingSpec};
+    use deepgemm::api::{self, RoutingSpec};
     use deepgemm::types::Dtype;
 
     let dev = Device::new(0)?;
@@ -1202,153 +1276,6 @@ fn run_mega_bench(name: &str, iters: u32, warmup: u32) -> deepgemm::error::DgRes
 
     let peak = peak_tflops_fp8(dev.num_sms);
     match name {
-        "mega_moe_fp4" | "mega_moe_fp8" => {
-            let fp4 = name.ends_with("fp4");
-            // DSv3.1-ish geometry.
-            let (e, h, i, t, topk) = (256u32, 7168u32, 2048u32, 4096u32, 8u32);
-            let x_f = rand_f(&mut seed, (t * h) as usize);
-            let w13_f = rand_f(&mut seed, (e * 2 * i * h) as usize);
-            let w2_f = rand_f(&mut seed, (e * h * i) as usize);
-            let topk_idx: Vec<i64> = (0..t * topk).map(|_| (lcg(&mut seed) % e) as i64).collect();
-            let weights: Vec<f32> = vec![0.7; (t * topk) as usize];
-
-            // Quantize (device path) + transforms.
-            // x: host quantization; sym views need row-major SF words.
-            let xq_host = deepgemm::golden::quant_mx_host(
-                &x_f,
-                t,
-                h,
-                if fp4 { Dtype::Fp4 } else { Dtype::Fp8 },
-                deepgemm::types::SfGran::G32,
-            );
-            let x_words = (h / 128) as usize;
-            let mut x_sf_rm = vec![0u32; t as usize * x_words];
-            for r in 0..t as usize {
-                for w in 0..x_words {
-                    x_sf_rm[r * x_words + w] = xq_host.sf[w * xq_host.sf_cols as usize + r];
-                }
-            }
-            let (w13_data_raw, w13_sft) = api::quant_mx(
-                &dev,
-                &stream,
-                &w13_f,
-                e * 2 * i,
-                h,
-                if fp4 { Dtype::Fp4 } else { Dtype::Fp8 },
-                deepgemm::types::SfGran::G32,
-            )?;
-            let (w2_data_raw, w2_sft) = api::quant_mx(
-                &dev,
-                &stream,
-                &w2_f,
-                e * h,
-                i,
-                if fp4 { Dtype::Fp4 } else { Dtype::Fp8 },
-                deepgemm::types::SfGran::G32,
-            )?;
-            // w13 SF needs the row-major layout + UTCCP transpose.
-            let w13_data = api::interleave_weights(&dev, &stream, &w13_data_raw, e, 2 * i, h)?;
-            let w13_sf = api::transpose_sf_utccp(&dev, &stream, &w13_sft.buf, e, 2 * i, h)?;
-            let w2_sf = api::transpose_sf_utccp(&dev, &stream, &w2_sft.buf, e, h, i)?;
-
-            let (total, off) =
-                deepgemm::mega_layout::mega_moe_buffer_layout(1, e, t, topk, h, i, 0, dev.num_sms)?;
-            let sym = deepgemm::device::DevBuffer::alloc(&dev, total as usize)?;
-            let base = sym.ptr as u64;
-            let view = |o: u64, len: usize| deepgemm::device::DevBuffer {
-                ptr: (base + o) as _,
-                len,
-            };
-            view(off.input_token, xq_host.data.len()).copy_from_host(
-                &dev,
-                &xq_host.data,
-                stream.raw(),
-            )?;
-            view(off.input_sf, x_sf_rm.len() * 4).copy_from_host(
-                &dev,
-                unsafe {
-                    std::slice::from_raw_parts(x_sf_rm.as_ptr() as *const u8, x_sf_rm.len() * 4)
-                },
-                stream.raw(),
-            )?;
-            let tb: Vec<u8> = topk_idx.iter().flat_map(|v| v.to_ne_bytes()).collect();
-            view(off.input_topk_idx, tb.len()).copy_from_host(&dev, &tb, stream.raw())?;
-            let wb: Vec<u8> = weights.iter().flat_map(|v| v.to_ne_bytes()).collect();
-            view(off.input_topk_weights, wb.len()).copy_from_host(&dev, &wb, stream.raw())?;
-
-            let mut y = deepgemm::device::DevBuffer::alloc(&dev, (t * h * 2) as usize)?;
-            let l1 = MegaMoEWeights {
-                data: w13_data,
-                sf: w13_sf,
-                n: 2 * i,
-                k: h,
-                is_fp4: fp4,
-            };
-            let l2 = MegaMoEWeights {
-                data: w2_data_raw,
-                sf: w2_sf,
-                n: h,
-                k: i,
-                is_fp4: fp4,
-            };
-
-            for _ in 0..warmup {
-                api::mega_moe(
-                    &dev,
-                    &stream,
-                    &mut y,
-                    &l1,
-                    &l2,
-                    None,
-                    None,
-                    &sym,
-                    &[sym.ptr as u64],
-                    0,
-                    t,
-                    0,
-                    t,
-                    topk,
-                    h,
-                    i,
-                    Some(88.0),
-                    true,
-                    None,
-                )?;
-            }
-            stream.sync()?;
-            let t0 = std::time::Instant::now();
-            for _ in 0..iters {
-                api::mega_moe(
-                    &dev,
-                    &stream,
-                    &mut y,
-                    &l1,
-                    &l2,
-                    None,
-                    None,
-                    &sym,
-                    &[sym.ptr as u64],
-                    0,
-                    t,
-                    0,
-                    t,
-                    topk,
-                    h,
-                    i,
-                    Some(88.0),
-                    true,
-                    None,
-                )?;
-            }
-            stream.sync()?;
-            let secs = t0.elapsed().as_secs_f64() / iters as f64;
-            let flops = 3.0
-                * (t as f64)
-                * topk as f64
-                * ((2.0 * i as f64) * h as f64 + h as f64 * i as f64);
-            println!("[{name}] T={t} H={h} I={i} E={e} topk={topk} fp4={fp4}: {secs:.3} ms, {:.1} TFLOPS effective, {:.1}% of FP8 peak",
-                flops / secs / 1e12, flops / secs / 1e12 / peak * 100.0);
-        }
         "mega_gate_fp8" => {
             let (t, h, e, topk) = (4096u32, 7168u32, 256u32, 8u32);
             let x_f = rand_f(&mut seed, (t * h) as usize);

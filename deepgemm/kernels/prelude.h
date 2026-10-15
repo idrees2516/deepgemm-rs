@@ -1575,9 +1575,6 @@ DG_DEVICE uint64_t cvta_shared_to_u64(const void* ptr) {
 }
 
 // ----- SM / grid identification -----
-DG_DEVICE uint32_t get_sm_idx() {
-    uint32_t v; asm ("mov.u32 %0, %%smid;" : "=r"(v)); return v;
-}
 DG_DEVICE uint64_t get_grid_idx() {
     uint64_t v; asm volatile("mov.u64 %0, %%gridid;" : "=l"(v)); return v;
 }
@@ -1629,9 +1626,6 @@ DG_DEVICE float warp_reduce_max_f32(float v, uint32_t width) {
     return v;
 }
 // Whole-warp redux instructions (SM90+): one instruction, no butterfly.
-DG_DEVICE float redux_max_f32(float v) {
-    float r; asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(r) : "f"(v)); return r;
-}
 DG_DEVICE uint32_t redux_add_u32(uint32_t v) {
     uint32_t r; asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(r) : "r"(v)); return r;
 }
@@ -1692,7 +1686,6 @@ DG_DEVICE uint32_t mapa_shared_u32(const void* ptr, uint32_t cta_id) {
     asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(mapped) : "r"(cvta_shared_to_u32(ptr)), "r"(cta_id));
     return mapped;
 }
-DG_DEVICE void fence_acq_rel_cta() { asm volatile("fence.acq_rel.cta;" ::: "memory"); }
 
 // ----- STSM: FP8x4 (m16n8 x1 trans, .b8 elements) — mega_moe L1 epilogue -----
 // Packs 4 e4m3 values in one 32-bit register; a single .b8 stmatrix transposes
@@ -1729,23 +1722,14 @@ DG_DEVICE uint32_t ld_acq_gpu_u32(const uint32_t* p) {
 DG_DEVICE uint64_t ld_acq_gpu_u64(const uint64_t* p) {
     uint64_t r; asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(r) : "l"(p) : "memory"); return r;
 }
-DG_DEVICE uint32_t ld_acq_sys_u32(const uint32_t* p) {
-    uint32_t r; asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(r) : "l"(p) : "memory"); return r;
-}
 DG_DEVICE int ld_acq_sys_i32(const int* p) {
     int r; asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(r) : "l"(p) : "memory"); return r;
-}
-DG_DEVICE uint64_t ld_acq_sys_u64(const uint64_t* p) {
-    uint64_t r; asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(r) : "l"(p) : "memory"); return r;
 }
 DG_DEVICE void st_relaxed_sys_u64(uint64_t* p, uint64_t v) {
     asm volatile("st.L1::no_allocate.relaxed.sys.global.u64 [%0], %1;" :: "l"(p), "l"(v));
 }
 DG_DEVICE void st_rel_gpu_u64(uint64_t* p, uint64_t v) {
     asm volatile("st.release.gpu.global.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
-}
-DG_DEVICE void st_rel_sys_u64(uint64_t* p, uint64_t v) {
-    asm volatile("st.release.sys.global.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
 }
 DG_DEVICE uint32_t atomic_add_u32(uint32_t* p, uint32_t v) {
     uint32_t r; asm volatile("atom.global.add.u32 %0, [%1], %2;" : "=r"(r) : "l"(p), "r"(v)); return r;
@@ -1761,14 +1745,8 @@ DG_DEVICE uint32_t atomic_add_rel_u32(uint32_t* p, uint32_t v) {
                              : "=r"(r) : "l"(p), "r"(v) : "memory"); return r;
 }
 // Fire-and-forget reductions (no return value; may complete asynchronously).
-DG_DEVICE void red_add_u32(uint32_t* p, uint32_t v) {
-    asm volatile("red.gpu.global.add.u32 [%0], %1;" :: "l"(p), "r"(v));
-}
 DG_DEVICE void red_add_i32(int* p, int v) {
     asm volatile("red.gpu.global.add.s32 [%0], %1;" :: "l"(p), "r"(v));
-}
-DG_DEVICE void red_add_rel_u32(uint32_t* p, uint32_t v) {
-    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
 }
 // `red.async` retires asynchronously (SM100): the CTA continues while the
 // reduction drains — used by the split/score grid-tag barriers.
@@ -1776,9 +1754,6 @@ DG_DEVICE void red_async_inc_rel_u64(uint64_t* p) {
     asm volatile("red.async.release.gpu.global.add.u64 [%0], 1;" :: "l"(p) : "memory");
 }
 // XOR reduction toggles readiness bits (L2 K-block dependency masks).
-DG_DEVICE void red_xor_rel_u64(uint64_t* p, uint64_t v) {
-    asm volatile("red.release.gpu.global.xor.b64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
-}
 // Streaming load: no L1 allocate, evict-first in L2 (Norm's BF16 rereads).
 DG_DEVICE uint4 ld_evict_first_u128(const uint4* p) {
     uint4 v;
@@ -1866,23 +1841,8 @@ DG_DEVICE float fast_rcp_f32(float x) {
     float r; asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x)); return r;
 }
 // Tree-reduce the amax of 4 packed bf16x2 (uint4) -> scalar bf16 amax bits.
-DG_DEVICE uint32_t get_packed_bf16_amax(const uint32_t v[4]) {
-    uint32_t t0 = hmax2_bf16(habs2_bf16(v[0]), habs2_bf16(v[2]));
-    uint32_t t1 = hmax2_bf16(habs2_bf16(v[1]), habs2_bf16(v[3]));
-    uint32_t p = hmax2_bf16(t0, t1);
-    return hmax_bf16(p & 0xffffu, p >> 16);
-}
 // Scale two bf16 pairs by pow-2 bf16 sf_invs (exact) and pack 4 fp8 (e4m3).
 // Software path: bf16 mul (exact for pow-2) -> widen to f32 -> RNE e4m3 pair.
-DG_DEVICE uint32_t scale_bf16x2_into_fp8x4(uint32_t lower, uint32_t upper,
-                                           uint32_t sf_inv_lower, uint32_t sf_inv_upper) {
-    const uint32_t lo = hmul2_bf16(lower, sf_inv_lower);
-    const uint32_t up = hmul2_bf16(upper, sf_inv_upper);
-    float l0, l1, u0, u1;
-    bf16x2_to_f32x2(lo, l0, l1);
-    bf16x2_to_f32x2(up, u0, u1);
-    return cvt_e4m3x2_f32(l0, l1) | (cvt_e4m3x2_f32(u0, u1) << 16);
-}
 
 // ----- TMEM: 16dp256b x2 load (MHC workspace epilogue) + 16dp256b x4 store -----
 // Post workers *store* into TMEM (tcgen05.st) — the only writer besides MMA.
@@ -1978,27 +1938,7 @@ DG_DEVICE void tma_load_1d_hint(void* smem, const void* gmem, Barrier* bar,
         :: "r"(cvta_shared_to_u32(smem)), "l"(gmem), "r"(num_bytes),
            "r"(cvta_shared_to_u32(&bar->barrier_)), "l"(hint) : "memory");
 }
-DG_DEVICE void tma_store_1d(void* gmem, const void* smem, uint32_t num_bytes,
-                             uint64_t hint = kEvictNormalHint) {
-    asm volatile(
-        "cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint [%0], [%1], %2, %3;"
-        :: "l"(gmem), "r"(cvta_shared_to_u32(smem)), "r"(num_bytes), "l"(hint) : "memory");
-}
 // 2D/3D stores with cache hint (MHC new_residual EVICT_LAST etc.).
-DG_DEVICE void tma_store_2d_hint(const TmaMap* map, const void* smem,
-                                  uint32_t c0, uint32_t c1, uint64_t hint) {
-    asm volatile(
-        "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group.L2::cache_hint"
-        " [%0, {%2, %3}], [%1], %4;"
-        :: "l"((uint64_t)map), "r"(cvta_shared_to_u32(smem)), "r"(c0), "r"(c1), "l"(hint) : "memory");
-}
-DG_DEVICE void tma_store_3d_hint(const TmaMap* map, const void* smem,
-                                  uint32_t c0, uint32_t c1, uint32_t c2, uint64_t hint) {
-    asm volatile(
-        "cp.async.bulk.tensor.3d.global.shared::cta.bulk_group.L2::cache_hint"
-        " [%0, {%2, %3, %4}], [%1], %5;"
-        :: "l"((uint64_t)map), "r"(cvta_shared_to_u32(smem)), "r"(c0), "r"(c1), "r"(c2), "l"(hint) : "memory");
-}
 // mbarrier wait that flips the caller's phase variable in place.
 DG_DEVICE void mbarrier_wait_flip(Barrier* bar, uint32_t& phase) {
     asm volatile(
