@@ -990,6 +990,7 @@ pub fn mega_moe_block_config(
     (block_m, store_l1, store_l2)
 }
 
+#[allow(clippy::too_many_arguments)] // upstream-mirroring signature
 pub fn get_mega_moe_config(
     _num_sms: u32,
     num_ranks: u32,
@@ -1258,8 +1259,7 @@ pub fn get_mega_gate_config(
         * 4;
     let fixed = 1024 + sf_bytes;
     best.num_stages = ((SMEM_CAPACITY_FALLBACK.saturating_sub(fixed)) / stage_bytes)
-        .min(mlayout::GATE_MAX_STAGES)
-        .max(2);
+        .clamp(2, mlayout::GATE_MAX_STAGES);
     best.smem_size = mlayout::align_up(fixed + best.num_stages * stage_bytes, 1024);
     Ok(best)
 }

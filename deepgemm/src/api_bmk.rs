@@ -128,7 +128,15 @@ struct BmkTile {
     grid_x: u32,
 }
 
-fn bmk_tile(s: u32, m: u32, n: u32, k: u32, num_sms: u32, smem_capacity: u32, sm100: bool) -> DgResult<BmkTile> {
+fn bmk_tile(
+    s: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+    num_sms: u32,
+    smem_capacity: u32,
+    sm100: bool,
+) -> DgResult<BmkTile> {
     if k % BLOCK_K != 0 {
         return Err(DgError::InvalidArg(format!(
             "bmk_bnk: k = {k} must be a multiple of {BLOCK_K}"
@@ -169,7 +177,8 @@ fn bmk_tile(s: u32, m: u32, n: u32, k: u32, num_sms: u32, smem_capacity: u32, sm
         };
         let smem_cd = if sm100 { BLOCK_M * SWIZZLE_CD * 2 } else { 0 };
         let smem_tmem_ptr = if sm100 { 4 } else { 0 };
-        smem_size = smem_cd + (smem_a_per_stage + smem_b_per_stage) * num_stages + barriers + smem_tmem_ptr;
+        smem_size =
+            smem_cd + (smem_a_per_stage + smem_b_per_stage) * num_stages + barriers + smem_tmem_ptr;
         if smem_size <= smem_capacity || num_stages == 1 {
             break;
         }
@@ -257,7 +266,15 @@ pub fn psum_body(
 // ---------------------------------------------------------------------------
 
 /// Validate the shared bmk operand contract (upstream `einsum::bmk_bnk_mn`).
-fn validate_bmk(a: &Operand, b: &Operand, d: &Output, s: u32, m: u32, n: u32, k: u32) -> DgResult<()> {
+fn validate_bmk(
+    a: &Operand,
+    b: &Operand,
+    d: &Output,
+    s: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> DgResult<()> {
     if a.dtype != Dtype::Bf16 || b.dtype != Dtype::Bf16 {
         return Err(DgError::InvalidArg("bmk_bnk: A/B must be BF16".into()));
     }
@@ -332,19 +349,56 @@ fn run_bmk(
     }
 
     // A: [k, s*m] K-major box [BLOCK_K, BLOCK_M]; B: [k, s*n]; D: [n, m].
-    let stride_a = if a.outer_stride != 0 { a.outer_stride } else { k };
-    let stride_b = if b.outer_stride != 0 { b.outer_stride } else { k };
+    let stride_a = if a.outer_stride != 0 {
+        a.outer_stride
+    } else {
+        k
+    };
+    let stride_b = if b.outer_stride != 0 {
+        b.outer_stride
+    } else {
+        k
+    };
     let tm_a = tma::make_tma_ab(
-        dev, Dtype::Bf16, Major::K, &a.data, s * m, k, BLOCK_M, BLOCK_K, stride_a, 1,
-        SWIZZLE_AB, false,
+        dev,
+        Dtype::Bf16,
+        Major::K,
+        &a.data,
+        s * m,
+        k,
+        BLOCK_M,
+        BLOCK_K,
+        stride_a,
+        1,
+        SWIZZLE_AB,
+        false,
     )?;
     let tm_b = tma::make_tma_ab(
-        dev, Dtype::Bf16, Major::K, &b.data, s * n, k, BLOCK_N, BLOCK_K, stride_b, 1,
-        SWIZZLE_AB, false,
+        dev,
+        Dtype::Bf16,
+        Major::K,
+        &b.data,
+        s * n,
+        k,
+        BLOCK_N,
+        BLOCK_K,
+        stride_b,
+        1,
+        SWIZZLE_AB,
+        false,
     )?;
     let row_stride = if d.stride != 0 { d.stride } else { d.cols };
     let tm_d = tma::make_tma_cd(
-        dev, Dtype::F32, &d.data, m, n, BLOCK_M, SWIZZLE_CD / 4, row_stride, 1, SWIZZLE_CD,
+        dev,
+        Dtype::F32,
+        &d.data,
+        m,
+        n,
+        BLOCK_M,
+        SWIZZLE_CD / 4,
+        row_stride,
+        1,
+        SWIZZLE_CD,
     )?;
 
     let (body, tag, threads) = if sm100 {
@@ -598,25 +652,69 @@ pub fn bf16_m_grouped_gemm_nt_psum(
         );
     }
 
-    let stride_a = if a.outer_stride != 0 { a.outer_stride } else { k };
-    let stride_b = if b.outer_stride != 0 { b.outer_stride } else { k };
+    let stride_a = if a.outer_stride != 0 {
+        a.outer_stride
+    } else {
+        k
+    };
+    let stride_b = if b.outer_stride != 0 {
+        b.outer_stride
+    } else {
+        k
+    };
     let tm_a = tma::make_tma_ab(
-        dev, Dtype::Bf16, Major::K, &a.data, m_psum, k, BLOCK_M, BLOCK_K, stride_a, 1,
-        SWIZZLE_AB, false,
+        dev,
+        Dtype::Bf16,
+        Major::K,
+        &a.data,
+        m_psum,
+        k,
+        BLOCK_M,
+        BLOCK_K,
+        stride_a,
+        1,
+        SWIZZLE_AB,
+        false,
     )?;
     // B is per-group: the group offset rides the outer dim (g * n + n_idx).
     let tm_b = tma::make_tma_ab(
-        dev, Dtype::Bf16, Major::K, &b.data, n, k, BLOCK_N, BLOCK_K, stride_b, num_groups,
-        SWIZZLE_AB, false,
+        dev,
+        Dtype::Bf16,
+        Major::K,
+        &b.data,
+        n,
+        k,
+        BLOCK_N,
+        BLOCK_K,
+        stride_b,
+        num_groups,
+        SWIZZLE_AB,
+        false,
     )?;
     let cd_elem = d.dtype.elem_size() as u32;
     let row_stride = if d.stride != 0 { d.stride } else { d.cols };
     let tm_cd = tma::make_tma_cd(
-        dev, d.dtype, &d.data, m_psum, n, BLOCK_M, SWIZZLE_CD / cd_elem, row_stride, 1,
+        dev,
+        d.dtype,
+        &d.data,
+        m_psum,
+        n,
+        BLOCK_M,
+        SWIZZLE_CD / cd_elem,
+        row_stride,
+        1,
         SWIZZLE_CD,
     )?;
 
-    let body = psum_body(5, num_groups, num_stages, false, d.dtype == Dtype::F32, BLOCK_M, dev.num_sms);
+    let body = psum_body(
+        5,
+        num_groups,
+        num_stages,
+        false,
+        d.dtype == Dtype::F32,
+        BLOCK_M,
+        dev.num_sms,
+    );
     let sig = format!(
         "{:?}",
         (5, num_groups, num_stages, d.dtype == Dtype::F32, k, n)
@@ -723,20 +821,56 @@ pub fn bf16_k_grouped_gemm_tn_psum(
 
     // MN-major operands: inner = MN, outer = K; the group offset rides the
     // outer (K) coordinate via the scheduler's `current_k_start`.
-    let stride_a = if a.outer_stride != 0 { a.outer_stride } else { m };
-    let stride_b = if b.outer_stride != 0 { b.outer_stride } else { n };
+    let stride_a = if a.outer_stride != 0 {
+        a.outer_stride
+    } else {
+        m
+    };
+    let stride_b = if b.outer_stride != 0 {
+        b.outer_stride
+    } else {
+        n
+    };
     let tm_a = tma::make_tma_ab(
-        dev, Dtype::Bf16, Major::Mn, &a.data, m, sum_k, BLOCK_M, BLOCK_K, stride_a, 1,
-        SWIZZLE_AB, false,
+        dev,
+        Dtype::Bf16,
+        Major::Mn,
+        &a.data,
+        m,
+        sum_k,
+        BLOCK_M,
+        BLOCK_K,
+        stride_a,
+        1,
+        SWIZZLE_AB,
+        false,
     )?;
     let tm_b = tma::make_tma_ab(
-        dev, Dtype::Bf16, Major::Mn, &b.data, n, sum_k, BLOCK_N, BLOCK_K, stride_b, 1,
-        SWIZZLE_AB, false,
+        dev,
+        Dtype::Bf16,
+        Major::Mn,
+        &b.data,
+        n,
+        sum_k,
+        BLOCK_N,
+        BLOCK_K,
+        stride_b,
+        1,
+        SWIZZLE_AB,
+        false,
     )?;
     let cd_elem = d.dtype.elem_size() as u32;
     let row_stride = if d.stride != 0 { d.stride } else { d.cols };
     let tm_cd = make_tma_cd_3d_groups(
-        dev, d.dtype, &d.data, m, n, BLOCK_M, SWIZZLE_CD / cd_elem, row_stride, num_groups,
+        dev,
+        d.dtype,
+        &d.data,
+        m,
+        n,
+        BLOCK_M,
+        SWIZZLE_CD / cd_elem,
+        row_stride,
+        num_groups,
         SWIZZLE_CD,
     )?;
 

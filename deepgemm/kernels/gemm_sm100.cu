@@ -110,17 +110,36 @@ DG_DEVICE void tma_load_2d_sf(const TmaMap* map, Barrier* bar, uint32_t* smem,
 // ---------------------------------------------------------------------------
 // Epilogues
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Alpha scaling (upstream `epilogue::operators::ScaleByAlpha`): multiply the
+// FP32 accumulator words of the product term (BLAS `D = alpha * A@B + beta*C`)
+// right after the TMEM load, before any BF16/FP32 conversion. Exclusive with
+// the fused QuantizeToFP8 epilogue, which derives its own output scale from
+// the (unmultiplied) values.
+// ---------------------------------------------------------------------------
+template <bool kWithAlpha>
+DG_DEVICE void scale_accum_values(uint32_t* values, uint32_t n, float alpha) {
+    if constexpr (kWithAlpha) {
+        #pragma unroll 8
+        for (uint32_t i = 0; i < n; ++i) {
+            float v = __uint_as_float(values[i]);
+            values[i] = __float_as_uint(v * alpha);
+        }
+    }
+}
+
 template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t STORE_BLOCK_M, uint32_t STORE_BLOCK_N,
           uint32_t kSwizzleCDMode, uint32_t kNumTMAStoreStages, uint32_t kNumUMMAStoreThreads,
           uint32_t kNumOverlappedTmemCols, GemmType kGemmType, bool kWithAccumulation,
-          bool kCdIsFloat, uint32_t kCdElemSize, bool kWithOutputSF, typename Smem>
+          bool kCdIsFloat, uint32_t kCdElemSize, bool kWithAlpha, bool kWithOutputSF, typename Smem>
 DG_DEVICE void store_cd(Smem& smem, uint32_t& tma_stage_idx, uint32_t tmem_base_addr,
                         uint32_t base_m_idx, uint32_t base_n_idx, uint32_t batch_idx,
                         uint32_t epilogue_warp_idx, uint32_t lane_idx,
                         bool reverse_store_order,
                         const Barrier* tmem_overlap_barrier, const Barrier* tmem_empty_barrier,
                         const TmaMap& tensor_map_cd,
-                        uint32_t* sfd, uint32_t sfd_stride, uint32_t shape_m, uint32_t shape_n) {
+                        uint32_t* sfd, uint32_t sfd_stride, uint32_t shape_m, uint32_t shape_n,
+                        float alpha) {
     constexpr uint32_t kNumBankGroupBytes = 16;
     constexpr uint32_t kNumElemsPerBankGroup = kNumBankGroupBytes / kCdElemSize;
     constexpr uint32_t kNumMWaves = BLOCK_M / STORE_BLOCK_M;
@@ -137,6 +156,8 @@ DG_DEVICE void store_cd(Smem& smem, uint32_t& tma_stage_idx, uint32_t tmem_base_
     constexpr uint32_t kSFGranN = 32;
     DG_STATIC_ASSERT(!kWithOutputSF || (kCdElemSize == 1 && !kCdIsFloat && !kWithAccumulation),
                      "QuantizeToFP8 requires a direct E4M3 D");
+    DG_STATIC_ASSERT(!kWithAlpha || !kWithOutputSF,
+                     "alpha scaling and the fused FP8 output are exclusive");
     DG_STATIC_ASSERT(!kWithOutputSF || STORE_BLOCK_N % kSFGranN == 0,
                      "A store must cover complete SF groups");
 
@@ -185,6 +206,7 @@ DG_DEVICE void store_cd(Smem& smem, uint32_t& tma_stage_idx, uint32_t tmem_base_
                         uint32_t raw[16];
                         tmem_load_32dp32b_x16(tmem_addr, raw);
                         fence_view_async_tmem_load();
+                        scale_accum_values<kWithAlpha>(raw, 16, alpha);
                         // Assemble by column: odd bank group = upper 16 cols.
                         const uint32_t dst_base = (i & 1u) ? 16u : 0u;
                         #pragma unroll
@@ -253,6 +275,9 @@ DG_DEVICE void store_cd(Smem& smem, uint32_t& tma_stage_idx, uint32_t tmem_base_
                                          values[4], values[5], values[6], values[7]);
                 }
                 fence_view_async_tmem_load();
+                // Product-term scaling happens BEFORE the C reduce-add, so the
+                // accumulated C is never scaled (BLAS semantics).
+                scale_accum_values<kWithAlpha>(values, kNumElemsPerBankGroup, alpha);
 
                 if (kNumOverlapLoads > 0) {
                     if (w == 0 && s == 0 && i + 1 == kNumOverlapLoads) {
@@ -281,7 +306,7 @@ DG_DEVICE void store_cd(Smem& smem, uint32_t& tma_stage_idx, uint32_t tmem_base_
             tma_store_fence();
             named_barrier_sync(kNumUMMAStoreThreads, 8);
             if (epilogue_warp_idx == 0 && elect_one_sync()) {
-                if (kGemmType == GemmType::Batched) {
+                if (kGemmType == GemmType::Batched || gemm_type_is_k_grouped(kGemmType)) {
                     if (kWithAccumulation) tma_reduce_add_3d(&tensor_map_cd, smem_base_ptr, n_idx, m_idx, batch_idx);
                     else tma_store_3d(&tensor_map_cd, smem_base_ptr, n_idx, m_idx, batch_idx);
                 } else {
@@ -298,13 +323,13 @@ DG_DEVICE void store_cd(Smem& smem, uint32_t& tma_stage_idx, uint32_t tmem_base_
 template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t STORE_BLOCK_M, uint32_t STORE_BLOCK_N,
           uint32_t kSwizzleCDMode, uint32_t kNumTMAStoreStages, uint32_t kNumUMMAStoreThreads,
           uint32_t kNumOverlappedTmemCols, GemmType kGemmType, bool kWithAccumulation,
-          bool kCdIsFloat, uint32_t kCdElemSize, typename Smem>
+          bool kCdIsFloat, uint32_t kCdElemSize, bool kWithAlpha, typename Smem>
 DG_DEVICE void store_cd_swap_ab(Smem& smem, uint32_t& tma_stage_idx, uint32_t tmem_base_addr,
                                 uint32_t base_m_idx, uint32_t base_n_idx, uint32_t batch_idx,
                                 uint32_t epilogue_warp_idx, uint32_t lane_idx,
                                 bool reverse_store_order,
                                 const Barrier* tmem_overlap_barrier, const Barrier* tmem_empty_barrier,
-                                const TmaMap& tensor_map_cd) {
+                                const TmaMap& tensor_map_cd, float alpha) {
     constexpr uint32_t kNumBankGroupBytes = 16;
     constexpr uint32_t kNumSwizzleAtomRows = 8;
     constexpr uint32_t STORE_BLOCK_N_ATOM = kSwizzleCDMode / kCdElemSize;
@@ -332,6 +357,7 @@ DG_DEVICE void store_cd_swap_ab(Smem& smem, uint32_t& tma_stage_idx, uint32_t tm
                 tmem_load_16dp256b_x1(tmem_addr | 0x00100000u, values[4], values[5], values[6], values[7]);
                 fence_view_async_tmem_load();
             }
+            scale_accum_values<kWithAlpha>(values, kNumSwizzleAtomRows, alpha);
 
             if (kNumOverlapLoads > 0) {
                 const uint32_t num_loads_before_arrive = dg_min(kNumOverlapLoads, num_stores * kNumTmemLoads);
@@ -407,7 +433,12 @@ template <uint32_t kMajorA, uint32_t kMajorB,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
           bool kSwapAB, GemmType kGemmType, bool kWithAccumulation,
           bool kCdIsFloat, uint32_t kCdElemSize,
-          uint32_t kNumSMs, bool kWithOutputSF = false>
+          uint32_t kNumSMs, bool kWithAlpha = false, bool kWithOutputSF = false,
+          // K-grouped (weight-grad) only: `kKAlignment` is the layout's K
+          // padding unit (must be a multiple of BLOCK_K); `kSFKSpan =
+          // gran_k * 4` is the K span of one packed SF row. Defaults are
+          // inert for every other GemmType.
+          uint32_t kKAlignment = 128, uint32_t kSFKSpan = 128>
 DG_GLOBAL void __launch_bounds__(256, 1)
 gemm_sm100_impl(int* grouped_layout, uint32_t num_groups,
                 uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
@@ -416,7 +447,8 @@ gemm_sm100_impl(int* grouped_layout, uint32_t num_groups,
                 const __grid_constant__ TmaMap tensor_map_sfa,
                 const __grid_constant__ TmaMap tensor_map_sfb,
                 const __grid_constant__ TmaMap tensor_map_cd,
-                uint32_t* sfd = nullptr, uint32_t sfd_stride = 0) {
+                uint32_t* sfd = nullptr, uint32_t sfd_stride = 0,
+                float alpha = 1.0f) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)) || defined(DG_HOST_EDIT)
     constexpr bool kIsMGroupedContig = kGemmType == GemmType::MGroupedContiguous;
     constexpr bool kIsBatched = kGemmType == GemmType::Batched;
@@ -508,6 +540,7 @@ gemm_sm100_impl(int* grouped_layout, uint32_t num_groups,
 
     const uint32_t shape_sfa_k = ceil_div_u32(shape_k, kGranKA * 4);
     const uint32_t shape_sfb_k = ceil_div_u32(shape_k, kGranKB * 4);
+    static_cast<void>(shape_sfa_k); static_cast<void>(shape_sfb_k);
 
     if (warp_idx == 1 && elect_one_sync()) {
         #pragma unroll
@@ -532,7 +565,7 @@ gemm_sm100_impl(int* grouped_layout, uint32_t num_groups,
 
     griddepcontrol_wait();
 
-    using Sched = Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumMulticast, kIsMulticastOnA, kNumSMs>;
+    using Sched = Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumMulticast, kIsMulticastOnA, kNumSMs, kKAlignment, kSFKSpan>;
     Sched scheduler(shape_m, shape_n, shape_k, grouped_layout);
     scheduler.kNumGroupsRuntime = num_groups;
 
@@ -556,8 +589,13 @@ gemm_sm100_impl(int* grouped_layout, uint32_t num_groups,
                 constexpr bool kBWithGroupMNOffset = (kMajorB == MAJOR_K) &&
                     (kIsMGroupedContig || kGemmType == GemmType::MGroupedMasked);
                 uint32_t n_idx = scheduler.template get_global_idx<kBWithGroupMNOffset, Sched::IndexType::MN>(shape_n, BLOCK_N, n_block_idx, m_block_idx);
-                constexpr bool kAWithGroupKOffset = (kMajorA == MAJOR_MN);
-                constexpr bool kBWithGroupKOffset = (kMajorB == MAJOR_MN);
+                // K-grouped A/B read a shared K arena: the group's physical
+                // start (`current_k_start`) offsets the K index regardless of
+                // majorness (upstream folds `is_k_grouped_contiguous` into
+                // both offset flags). MN-major operands additionally stack
+                // their (m-grouped) groups along the K dim.
+                constexpr bool kAWithGroupKOffset = gemm_type_is_k_grouped(kGemmType) || (kMajorA == MAJOR_MN);
+                constexpr bool kBWithGroupKOffset = gemm_type_is_k_grouped(kGemmType) || (kMajorB == MAJOR_MN);
                 uint32_t k_a_idx = scheduler.template get_global_idx<kAWithGroupKOffset, Sched::IndexType::K>(shape_k, BLOCK_K, k_block_idx, m_block_idx);
                 uint32_t k_b_idx = scheduler.template get_global_idx<kBWithGroupKOffset, Sched::IndexType::K>(shape_k, BLOCK_K, k_block_idx, m_block_idx);
 
@@ -803,7 +841,9 @@ gemm_sm100_impl(int* grouped_layout, uint32_t num_groups,
 
             const uint32_t tmem_base_addr = accum_stage_idx * (UMMA_N - kNumOverlappedTmemCols);
             const bool reverse_store_order = kNumOverlappedTmemCols > 0 && accum_stage_idx == 0;
-            constexpr bool kCDWithGroupOffset = !kIsMGroupedContig;
+            // K-grouped CDs are 3D `[groups, m, n]` slices like Batched: the
+            // group offset rides the map's batch dim, never the M index.
+            constexpr bool kCDWithGroupOffset = !(kIsMGroupedContig || gemm_type_is_k_grouped(kGemmType));
             const uint32_t base_m_idx = scheduler.template get_global_idx<kCDWithGroupOffset, Sched::IndexType::MN>(shape_m, BLOCK_M, m_block_idx);
             const uint32_t base_n_idx = n_block_idx * BLOCK_N;
 
@@ -813,25 +853,25 @@ gemm_sm100_impl(int* grouped_layout, uint32_t num_groups,
                 store_cd_swap_ab<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
                                  kSwizzleCDMode, kNumTMAStoreStages, kNumUMMAStoreThreads,
                                  kNumOverlappedTmemCols, kGemmType, kWithAccumulation,
-                                 kCdIsFloat, kCdElemSize>(
+                                 kCdIsFloat, kCdElemSize, kWithAlpha>(
                     smem, tma_stage_idx, tmem_base_addr, base_m_idx, base_n_idx,
                     scheduler.current_group_idx, epilogue_warp_idx, lane_idx,
                     reverse_store_order,
                     &smem->tmem_overlap_barriers[accum_stage_idx],
                     &smem->tmem_empty_barriers[accum_stage_idx],
-                    tensor_map_cd);
+                    tensor_map_cd, alpha);
             } else {
                 store_cd<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
                          kSwizzleCDMode, kNumTMAStoreStages, kNumUMMAStoreThreads,
                          kNumOverlappedTmemCols, kGemmType, kWithAccumulation,
-                         kCdIsFloat, kCdElemSize, kWithOutputSF>(
+                         kCdIsFloat, kCdElemSize, kWithAlpha, kWithOutputSF>(
                     smem, tma_stage_idx, tmem_base_addr, base_m_idx, base_n_idx,
                     scheduler.current_group_idx, epilogue_warp_idx, lane_idx,
                     reverse_store_order,
                     &smem->tmem_overlap_barriers[accum_stage_idx],
                     &smem->tmem_empty_barriers[accum_stage_idx],
                     tensor_map_cd,
-                    sfd, sfd_stride, shape_m, shape_n);
+                    sfd, sfd_stride, shape_m, shape_n, alpha);
             }
         }
     }

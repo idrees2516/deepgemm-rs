@@ -65,7 +65,7 @@ fn mega_moe_layout_monotonic() {
     assert!(total > 0);
     // The signals header must match the kernel struct exactly (derived in
     // scripts; see the kernel banner for the field map).
-    assert_eq!(off.workspace_end >= 21_140_864, true);
+    assert!(off.workspace_end >= 21_140_864);
 }
 
 #[test]
@@ -91,9 +91,9 @@ fn mega_gate_config_bounds() {
     let cfg = deepgemm::heuristics::get_mega_gate_config(4096, 7168, 256, 148, false)
         .expect("gate config");
     assert!(cfg.block_tokens <= 240, "fp8 cap: {}", cfg.block_tokens);
-    assert!(cfg.block_tokens % 16 == 0);
+    assert!(cfg.block_tokens.is_multiple_of(16));
     assert!(cfg.num_logical_ctas <= 148);
-    assert!(cfg.num_gate_threads % 128 == 0);
+    assert!(cfg.num_gate_threads.is_multiple_of(128));
     assert!(cfg.num_stages >= 2);
     assert!(cfg.smem_size <= 232448 + 1024);
     // Deterministic never splits K.
@@ -105,7 +105,7 @@ fn mega_gate_config_bounds() {
 fn mhc_splits_range() {
     for &t in &[64u32, 512, 4096] {
         let s = deepgemm::heuristics::mhc_splits(t, 7168, 148, false);
-        assert!(s >= 1 && s <= 64, "splits {s} for T={t}");
+        assert!((1..=64).contains(&s), "splits {s} for T={t}");
         assert!(7168 / 64 % s == 0 || s <= 16);
     }
     let d = deepgemm::heuristics::mhc_splits(4096, 7168, 148, true);
@@ -116,6 +116,7 @@ fn mhc_splits_range() {
 // golden self-consistency (tiny shapes; the reference must agree with a
 // straightforward f64 reimplementation of the same contract)
 // ---------------------------------------------------------------------------
+#[allow(clippy::type_complexity)]
 fn tiny_moe_inputs(
     e: u32,
     i: u32,
@@ -140,28 +141,23 @@ fn tiny_moe_inputs(
             .wrapping_add(1442695040888963407);
         (seed >> 33) as u32
     };
+    #[allow(clippy::type_complexity)]
     let mut mk_fp8 = |rows: u32, k: u32| -> (Vec<u8>, Vec<u32>) {
         let mut d = Vec::with_capacity((rows * k) as usize);
         let mut sf = Vec::with_capacity((rows * k / 128) as usize);
-        for r in 0..rows {
+        for _r in 0..rows {
             let mut amax = 0f32;
             let mut row = vec![0u8; k as usize];
-            for kk in 0..k as usize {
+            for slot in row.iter_mut() {
                 let v = ((next() % 200) as i32 - 100) as f32 / 25.0;
                 amax = amax.max(v.abs());
-                row[kk] = golden::quant_e4m3(v);
+                *slot = golden::quant_e4m3(v);
             }
             let sfv = golden::ue8m0_exp_fp8(amax) as u32;
-            let mut word = 0u32;
-            for g in 0..k / 128 {
-                word = 0;
-                for b in 0..4 {
-                    word |= (sfv as u32) << (b * 8);
-                }
-                let _ = g;
-                break;
-            }
-            for g in 0..k / 128 {
+            // One packed word = 4 identical UE8M0 bytes; every 128-K group
+            // of this row reuses the row's amax scale.
+            let word = sfv | (sfv << 8) | (sfv << 16) | (sfv << 24);
+            for _g in 0..k / 128 {
                 sf.push(word);
             }
             d.extend_from_slice(&row);
@@ -171,7 +167,7 @@ fn tiny_moe_inputs(
     let (x, x_sf) = mk_fp8(t, h);
     let (w13, w13_sf) = mk_fp8(e * 2 * i, h);
     let (w2, w2_sf) = mk_fp8(e * h, i);
-    let topk_idx: Vec<i64> = (0..t * topk).map(|j| (next() % e) as i64).collect();
+    let topk_idx: Vec<i64> = (0..t * topk).map(|_j| (next() % e) as i64).collect();
     let weights: Vec<f32> = (0..t * topk).map(|_| 0.7).collect();
     (x, x_sf, w13, w13_sf, w2, w2_sf, topk_idx, weights)
 }
@@ -228,6 +224,7 @@ fn mega_moe_golden_self_consistent() {
 
 #[test]
 fn mega_gate_golden_self_consistent() {
+    #[allow(clippy::type_complexity)]
     let (x, x_sf, w, _w_sf, _t, _h, _e, _topk, _w2, weights): (
         Vec<u8>,
         Vec<u32>,

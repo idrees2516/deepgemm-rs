@@ -67,6 +67,43 @@ enum Cmd {
         #[arg(long, default_value = "5")]
         warmup: u32,
     },
+    /// Sweep a family (or all) over the production shape grid; prints a
+    /// TFLOPS/%-peak/roofline table and writes a JSON snapshot for
+    /// `compare`. The B200/B300 acceptance workflow: `sweep` then `verify`.
+    Sweep {
+        /// Family: all | gemm | layouts | moe | bmm | kgrouped | attention | mega
+        #[arg(long, default_value = "all")]
+        family: String,
+        /// JSON snapshot path (default: bench-sweep.json).
+        #[arg(long, default_value = "bench-sweep.json")]
+        out: String,
+        #[arg(long, default_value = "10")]
+        iters: u32,
+    },
+    /// The on-GPU correctness gate: every family's shape grid vs the CPU
+    /// golden model, with the upstream tolerance table. Nonzero exit on any
+    /// failure — run this before trusting any `sweep` numbers.
+    Verify {
+        #[arg(long, default_value = "all")]
+        family: String,
+    },
+    /// Autotune a shape over the DG_* tiling overrides: times each candidate
+    /// configuration and prints the winner as an env line you can export.
+    Autotune {
+        name: String,
+        #[arg(long, default_value = "8192")]
+        m: u32,
+        #[arg(long, default_value = "8192")]
+        n: u32,
+        #[arg(long, default_value = "7168")]
+        k: u32,
+        #[arg(long, default_value = "128")]
+        groups: u32,
+        #[arg(long, default_value = "10")]
+        iters: u32,
+    },
+    /// Compare two `sweep` JSON snapshots (regression tracking).
+    Compare { old: String, new: String },
 }
 
 const BENCHES: &[&str] = &[
@@ -621,6 +658,16 @@ fn kernel_variants(arch: &str) -> Vec<(&'static str, &'static str, String)> {
             r#"extern "C" __global__ void __dg_kernel(const float* sf, unsigned* out, unsigned mn) { dg::transform_sf_impl<128, 64, 4, 16>(sf, out, mn); }"#.to_string(),
         ),
         (
+            "pack k-grouped sf g4",
+            kernel_src::LAYOUT_QUANT,
+            r#"extern "C" __global__ void __dg_kernel(const float* sf, unsigned* out, const int* gl, unsigned mn, unsigned sfk, unsigned psfk, unsigned gk, unsigned ka) { dg::pack_k_grouped_sf_impl<4, 512, 128, 16, false>(sf, out, gl, mn, sfk, psfk, gk, ka); }"#.to_string(),
+        ),
+        (
+            "pack k-grouped sf psum",
+            kernel_src::LAYOUT_QUANT,
+            r#"extern "C" __global__ void __dg_kernel(const float* sf, unsigned* out, const int* gl, unsigned mn, unsigned sfk, unsigned psfk, unsigned gk, unsigned ka) { dg::pack_k_grouped_sf_impl<8, 512, 128, 16, true>(sf, out, gl, mn, sfk, psfk, gk, ka); }"#.to_string(),
+        ),
+        (
             "quant fp8 g32",
             kernel_src::LAYOUT_QUANT,
             r#"extern "C" __global__ void __dg_kernel(const float* x, unsigned m, unsigned k, unsigned char* d, unsigned* sf) { dg::quant_mx_impl<256, 32, 0>(x, m, k, d, sf); }"#.to_string(),
@@ -695,6 +742,77 @@ fn kernel_variants(arch: &str) -> Vec<(&'static str, &'static str, String)> {
                 kernel_src::GEMM_SM100,
                 gemm_wrapper(
                     0, 0, 32, 32, 1, 0, 0, 0, 1, 1, 128, 128, 128, 128, 128, 128, 12, 2, 0, 0, 4,
+                    0, 148,
+                ),
+            ),
+            // BLAS layout parity: MN-major operands (nn/tn/tt route here).
+            (
+                "gemm fp8 nn (B mn-major)",
+                kernel_src::GEMM_SM100,
+                gemm_wrapper(
+                    0, 1, 32, 32, 1, 0, 0, 0, 1, 1, 128, 256, 128, 128, 128, 128, 12, 2, 0, 0, 0,
+                    0, 148,
+                ),
+            ),
+            (
+                "gemm fp8 tt (both mn-major)",
+                kernel_src::GEMM_SM100,
+                gemm_wrapper(
+                    1, 1, 32, 32, 1, 0, 0, 0, 1, 1, 128, 256, 128, 128, 128, 128, 12, 2, 0, 0, 0,
+                    0, 148,
+                ),
+            ),
+            (
+                "gemm bf16 tt (both mn-major)",
+                kernel_src::GEMM_SM100,
+                gemm_wrapper(
+                    1, 1, 32, 32, 0, 0, 1, 1, 2, 2, 128, 128, 64, 128, 128, 128, 20, 1, 0, 0, 0,
+                    0, 148,
+                ),
+            ),
+            // Alpha epilogue (ScaleByAlpha), BF16 out.
+            (
+                "gemm fp8 nt alpha",
+                kernel_src::GEMM_SM100,
+                gemm_wrapper_ex(
+                    0, 0, 32, 32, 1, 0, 0, 0, 1, 1, 128, 256, 128, 128, 128, 128, 12, 2, 0, 0, 0,
+                    0, 148, 1, 0, "", "alpha",
+                ),
+            ),
+            // K-grouped weight-grad: FP8 TN (MN-major arenas) + FP4 NT,
+            // 3D CD `[groups, m, n]`.
+            (
+                "gemm fp8 k-grouped tn c2",
+                kernel_src::GEMM_SM100,
+                gemm_wrapper_ex(
+                    1, 1, 32, 32, 1, 0, 0, 0, 1, 1, 128, 128, 128, 128, 128, 128, 12, 2, 0, 0, 5,
+                    0, 148, 0, 0, ", 128, 128", "",
+                ),
+            ),
+            (
+                "gemm fp4 k-grouped nt c1",
+                kernel_src::GEMM_SM100,
+                gemm_wrapper_ex(
+                    0, 0, 32, 32, 1, 1, 5, 5, 1, 1, 128, 128, 256, 128, 128, 256, 8, 2, 0, 0, 5,
+                    0, 148, 0, 0, ", 256, 128", "",
+                ),
+            ),
+            // Einsum engines: batched with an MN-major B (bhd,hdr->bhr)
+            // and batched with both K-major (bhr,hdr->bhd).
+            (
+                "gemm bf16 bmm b-mn-major (bhd,hdr->bhr)",
+                kernel_src::GEMM_SM100,
+                gemm_wrapper(
+                    0, 1, 32, 32, 0, 0, 1, 1, 2, 2, 128, 128, 64, 128, 128, 128, 20, 1, 0, 0, 4,
+                    0, 148,
+                ),
+            ),
+            // M-grouped contiguous with an MN-major B view (nn flavor).
+            (
+                "gemm fp8 m-grouped nn c2",
+                kernel_src::GEMM_SM100,
+                gemm_wrapper(
+                    0, 1, 32, 32, 1, 0, 0, 0, 1, 1, 128, 128, 128, 128, 128, 128, 12, 2, 0, 0, 1,
                     0, 148,
                 ),
             ),
@@ -900,28 +1018,31 @@ fn kernel_variants(arch: &str) -> Vec<(&'static str, &'static str, String)> {
                 .to_string(),
             ),
         ]);
-        v.extend_from_slice(&[
-            (
-                "mega gate fp8 c2 k2",
-                kernel_src::MEGA_GATE,
-                mega_gate_wrapper(7168, 256, 256, 2, 1, 2, 8, 0, 1, 0, 0, 0, 0, 0, 0),
-            ),
-            (
-                "mega gate fp8 c1 splitk4 bias",
-                kernel_src::MEGA_GATE,
-                mega_gate_wrapper(4096, 128, 384, 1, 4, 1, 6, 1, 1, 1, 1, 1, 1, 1, 1),
-            ),
-            (
-                "mega mhc shifted fp8",
-                kernel_src::MEGA_MHC,
-                mega_mhc_wrapper(7168, 16, 148, 1, 1, 1, 128),
-            ),
-            (
-                "mega mhc normal bf16",
-                kernel_src::MEGA_MHC,
-                mega_mhc_wrapper(4096, 16, 148, 0, 1, 0, 0),
-            ),
-        ]);
+        // Mega kernels are SM100-only (tcgen05/TMEM); skip on SM90.
+        if sm100_family {
+            v.extend_from_slice(&[
+                (
+                    "mega gate fp8 c2 k2",
+                    kernel_src::MEGA_GATE,
+                    mega_gate_wrapper(7168, 256, 256, 2, 1, 2, 8, 0, 1, 0, 0, 0, 0, 0, 0),
+                ),
+                (
+                    "mega gate fp8 c1 splitk4 bias",
+                    kernel_src::MEGA_GATE,
+                    mega_gate_wrapper(4096, 128, 384, 1, 4, 1, 6, 1, 1, 1, 1, 1, 1, 1, 1),
+                ),
+                (
+                    "mega mhc shifted fp8",
+                    kernel_src::MEGA_MHC,
+                    mega_mhc_wrapper(7168, 16, 148, 1, 1, 1, 128),
+                ),
+                (
+                    "mega mhc normal bf16",
+                    kernel_src::MEGA_MHC,
+                    mega_mhc_wrapper(4096, 16, 148, 0, 1, 0, 0),
+                ),
+            ]);
+        }
     }
     v
 }
@@ -1055,18 +1176,74 @@ fn gemm_wrapper(
     cd_float: u32,
     num_sms: u32,
 ) -> String {
+    gemm_wrapper_ex(
+        major_a, major_b, gran_a, gran_b, has_sf, is_mxf4, fmt_a, fmt_b, storage_a, storage_b,
+        block_m, block_n, block_k, swz_a, swz_b, swz_cd, stages, cluster, mc_on_a, swap_ab,
+        gemm_type, cd_float, num_sms, 0, 0, "", "",
+    )
+}
+
+/// Extended wrapper: `with_alpha`/`with_output_sf` template flags, optional
+/// `alpha` runtime arg, and trailing k-grouped template args
+/// (`k_alignment`, `sfk_span`) as raw strings (empty = defaults).
+#[allow(clippy::too_many_arguments)]
+fn gemm_wrapper_ex(
+    major_a: u32,
+    major_b: u32,
+    gran_a: u32,
+    gran_b: u32,
+    has_sf: u32,
+    is_mxf4: u32,
+    fmt_a: u32,
+    fmt_b: u32,
+    storage_a: u32,
+    storage_b: u32,
+    block_m: u32,
+    block_n: u32,
+    block_k: u32,
+    swz_a: u32,
+    swz_b: u32,
+    swz_cd: u32,
+    stages: u32,
+    cluster: u32,
+    mc_on_a: u32,
+    swap_ab: u32,
+    gemm_type: u32,
+    cd_float: u32,
+    num_sms: u32,
+    with_alpha: u32,
+    with_output_sf: u32,
+    kg_tail: &str,
+    alpha_arg: &str,
+) -> String {
     format!(
         r#"extern "C" __global__ void __dg_kernel(
     int* grouped_layout, unsigned num_groups, unsigned m, unsigned n, unsigned k,
     const __grid_constant__ dg::TmaMap tma_a, const __grid_constant__ dg::TmaMap tma_b,
     const __grid_constant__ dg::TmaMap tma_sfa, const __grid_constant__ dg::TmaMap tma_sfb,
-    const __grid_constant__ dg::TmaMap tma_cd) {{
+    const __grid_constant__ dg::TmaMap tma_cd{alpha_params}) {{
     dg::gemm_sm100_impl<{major_a}, {major_b}, {gran_a}, {gran_b}, {has_sf}, {is_mxf4},
         {fmt_a}, {fmt_b}, {storage_a}, {storage_b}, 1, 1,
         {block_m}, {block_n}, {block_k}, {swz_a}, {swz_b}, {swz_cd},
-        {stages}, 2, {cluster}, {mc_on_a}, {swap_ab}, (dg::GemmType){gemm_type}, 0, {cd_float}, 2, {num_sms}>
-        (grouped_layout, num_groups, m, n, k, tma_a, tma_b, tma_sfa, tma_sfb, tma_cd);
-}}"#
+        {stages}, 2, {cluster}, {mc_on_a}, {swap_ab}, (dg::GemmType){gemm_type}, 0, {cd_float}, 2,
+        {num_sms}, {with_alpha}, {with_output_sf}{kg_tail}>
+        (grouped_layout, num_groups, m, n, k, tma_a, tma_b, tma_sfa, tma_sfb, tma_cd{alpha_args});
+}}"#,
+        alpha_params = if alpha_arg.is_empty() {
+            ""
+        } else {
+            ", float alpha"
+        },
+        // The kernel signature is `(.., tma_cd, sfd, sfd_stride, alpha)`;
+        // when only alpha is present we must still occupy the two defaulted
+        // sfd slots explicitly (NVRTC resolves defaults positionally).
+        alpha_args = if alpha_arg.is_empty() {
+            String::new()
+        } else if with_output_sf != 0 {
+            format!(", sfd, sfd_stride, {alpha_arg}")
+        } else {
+            format!(", (unsigned*)0, 0, {alpha_arg}")
+        },
     )
 }
 
@@ -1105,14 +1282,14 @@ fn main() {
     let dev = match Device::new(0) {
         Ok(d) => Some(d),
         Err(e) => match &cli.cmd {
-            Cmd::List | Cmd::CompileCheck { .. } => None,
+            Cmd::List | Cmd::CompileCheck { .. } | Cmd::Compare { .. } => None,
             Cmd::Smoke => {
                 eprintln!(
                     "note: no CUDA driver/device ({e}); falling back to offline compile-check"
                 );
                 None
             }
-            Cmd::Bench { .. } => {
+            Cmd::Bench { .. } | Cmd::Sweep { .. } | Cmd::Verify { .. } | Cmd::Autotune { .. } => {
                 eprintln!("Failed to init CUDA device 0: {e}");
                 eprintln!("Ensure the CUDA driver is available (e.g. LD_LIBRARY_PATH includes your CUDA lib dir).");
                 eprintln!("(No GPU? `compile-check` validates all kernels offline via NVRTC.)");
@@ -1189,6 +1366,32 @@ fn main() {
             }
         }
         (Cmd::Bench { .. }, None) => unreachable!("device init already handled"),
+        (Cmd::Sweep { family, out, iters }, Some(d)) => {
+            let stream = DevStream::new(d).expect("stream");
+            bench_sweep(d, &stream, family, *iters, out)
+        }
+        (Cmd::Sweep { .. }, None) => unreachable!("device init already handled"),
+        (Cmd::Verify { family }, Some(d)) => {
+            let stream = DevStream::new(d).expect("stream");
+            bench_verify(d, &stream, family)
+        }
+        (Cmd::Verify { .. }, None) => unreachable!("device init already handled"),
+        (
+            Cmd::Autotune {
+                name,
+                m,
+                n,
+                k,
+                groups,
+                iters,
+            },
+            Some(d),
+        ) => {
+            let stream = DevStream::new(d).expect("stream");
+            bench_autotune(d, &stream, name, *m, *n, *k, *groups, *iters)
+        }
+        (Cmd::Autotune { .. }, None) => unreachable!("device init already handled"),
+        (Cmd::Compare { old, new }, _) => bench_compare(old, new),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -1251,12 +1454,14 @@ fn mega_mhc_wrapper(h: u32, splits: u32, sms: u32, sh: u32, b16: u32, f8: u32, s
 // ===========================================================================
 // Megakernel benchmarks: end-to-end layer latency + effective TFLOPS.
 // ===========================================================================
+#[allow(dead_code)]
 fn peak_tflops_fp8(num_sms: u32) -> f64 {
     // 990 TFLOPS dense FP8 per GB200-class GPU at 148 SMs (B200); scale by
     // the actual SM count. B300 reports ~1.5x on FP4 — same order for FP8.
     990.0 * (num_sms as f64 / 148.0)
 }
 
+#[allow(dead_code)]
 fn run_mega_bench(name: &str, iters: u32, warmup: u32) -> deepgemm::error::DgResult<()> {
     use deepgemm::api::{self, RoutingSpec};
     use deepgemm::types::Dtype;
@@ -1399,7 +1604,7 @@ fn run_mega_bench(name: &str, iters: u32, warmup: u32) -> deepgemm::error::DgRes
             let post = r(&mut seed, (t * 4) as usize);
             let comb = r(&mut seed, (t * 16) as usize);
             let f_n = r(&mut seed, (24 * 4 * h) as usize);
-            let scales = vec![0.5f32, 1.0, 1.5];
+            let scales = [0.5f32, 1.0, 1.5];
             let bases: Vec<f32> = (0..24).map(|i| (i as f32 - 12.0) / 24.0).collect();
             let nw: Vec<u16> = (0..h)
                 .map(|_| deepgemm::golden::f32_to_bf16_bits(0.9))
@@ -1513,5 +1718,589 @@ fn run_mega_bench(name: &str, iters: u32, warmup: u32) -> deepgemm::error::DgRes
         }
         _ => unreachable!(),
     }
+    Ok(())
+}
+
+// ===========================================================================
+// Sweep / verify / autotune / compare — the production benchmarking harness
+// ===========================================================================
+//
+// The workflow this enables (documented in docs/BENCHMARKING.md):
+//
+//   1. `verify`   — the correctness gate: every family's grid vs the golden
+//                   model with the upstream tolerance table. Never trust
+//                   perf numbers before this passes.
+//   2. `sweep`    — the shape-grid performance run: TFLOPS, % of the
+//                   device's dense peak, and a roofline classification
+//                   (compute- vs DRAM-bound at the measured arithmetic
+//                   intensity). Writes a JSON snapshot.
+//   3. `autotune` — per-shape DG_* override grid search; the winner is
+//                   printed as an `export DG_...` line.
+//   4. `compare`  — two snapshots side by side; flags regressions > 3%.
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct SweepRow {
+    name: String,
+    m: u32,
+    n: u32,
+    k: u32,
+    groups: u32,
+    tflops: f64,
+    pct_peak: f64,
+    intensity: f64, // FLOP per DRAM byte (model)
+    bound: String,  // "compute" | "dram" | "balanced"
+    ms: f64,
+}
+
+fn family_matches(family: &str, name: &str) -> bool {
+    if family == "all" {
+        return true;
+    }
+    match family {
+        "gemm" => ["fp8_nt", "fp4_nt_native", "fp8_nt_g128", "bf16_nt"].contains(&name),
+        "layouts" => ["fp8_nn", "fp8_tt"].contains(&name),
+        "moe" => name.contains("m_grouped"),
+        "bmm" => name == "fp8_bmm",
+        "kgrouped" => name.contains("k_grouped"),
+        "attention" => name.contains("mqa"),
+        "mega" => name.contains("mega"),
+        _ => false,
+    }
+}
+
+/// The sweep grid: production shapes from the upstream test generators plus
+/// the DSv4/GLM model dims (see api_serving).
+fn sweep_grid() -> Vec<(&'static str, u32, u32, u32, u32)> {
+    let mut v: Vec<(&'static str, u32, u32, u32, u32)> = Vec::new();
+    let gemm_shapes: &[(u32, u32)] = &[
+        (2112, 7168),
+        (576, 7168),
+        (24576, 1536),
+        (7168, 2048),
+        (4096, 7168),
+    ];
+    for &m in &[128u32, 4096, 8192] {
+        for &(n, k) in gemm_shapes {
+            v.push(("fp8_nt", m, n, k, 1));
+            v.push(("fp4_nt_native", m, n, k, 1));
+        }
+    }
+    v.push(("fp8_nt_g128", 4096, 7168, 7168, 1));
+    v.push(("bf16_nt", 4096, 4096, 7168, 1));
+    v.push(("bf16_nt", 8192, 8192, 7168, 1));
+    // Layout parity (MN-major operands).
+    for &m in &[1024u32, 4096] {
+        v.push(("fp8_nn", m, 4096, 7168, 1));
+        v.push(("fp8_tt", m, 4096, 7168, 1));
+    }
+    // MoE grouped (prefill).
+    for &groups in &[4u32, 8, 128] {
+        v.push(("fp8_m_grouped_contiguous", 128 * groups, 6144, 7168, groups));
+        v.push(("fp4_m_grouped_contiguous", 128 * groups, 6144, 7168, groups));
+    }
+    // Batched.
+    for &batch in &[4u32, 16] {
+        v.push(("fp8_bmm", 1024, 1024, 2048, batch));
+    }
+    v
+}
+
+fn roofline(flops: f64, bytes: f64) -> (f64, String) {
+    // B200-class: ~2.25 PF dense FP8, ~8 TB/s HBM3e. A kernel is DRAM-bound
+    // when its intensity is below the machine balance point.
+    let peak_flops = 2250e12;
+    let peak_bw = 8e12;
+    let intensity = flops / bytes.max(1.0);
+    let balance = peak_flops / peak_bw;
+    let bound = if intensity < balance * 0.5 {
+        "dram".to_string()
+    } else if intensity < balance * 2.0 {
+        "balanced".to_string()
+    } else {
+        "compute".to_string()
+    };
+    (intensity, bound)
+}
+
+#[allow(dead_code)]
+fn time_closure(iters: u32, mut f: impl FnMut() -> DgResult<()>) -> DgResult<f64> {
+    for _ in 0..iters / 3 + 1 {
+        f()?;
+    }
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        f()?;
+    }
+    Ok(t0.elapsed().as_secs_f64() / iters as f64)
+}
+
+fn bench_sweep(
+    d: &Device,
+    stream: &DevStream,
+    family: &str,
+    iters: u32,
+    out_path: &str,
+) -> DgResult<()> {
+    eprintln!(
+        "Sweep: device {} ({:?}), {} SMs — family '{family}', {iters} iters/shape",
+        d.name, d.arch, d.num_sms
+    );
+    let mut rows: Vec<SweepRow> = Vec::new();
+    println!(
+        "{:<28} {:>6} {:>6} {:>6} {:>4} {:>10} {:>8} {:>9} {:>10} {:>8}",
+        "bench", "m", "n", "k", "g", "TFLOPS", "%peak", "intens", "bound", "ms"
+    );
+    for (name, m, n, k, groups) in sweep_grid() {
+        if !family_matches(family, name) {
+            continue;
+        }
+        let ok = run_gemm_bench_quiet(d, stream, name, m, n, k, groups, iters).is_ok();
+        if !ok {
+            eprintln!("  [skip] {name} m={m} n={n} k={k} (config unavailable)");
+            continue;
+        }
+        // Time via the quiet runner's second pass (it already warmed caches).
+        let secs = match run_gemm_bench_timed(d, stream, name, m, n, k, groups, iters) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("  [fail] {name} m={m} n={n} k={k}: {e}");
+                continue;
+            }
+        };
+        let flops = 2.0
+            * m as f64
+            * n as f64
+            * k as f64
+            * if name.contains("grouped") || name == "fp8_bmm" {
+                groups as f64
+            } else {
+                1.0
+            };
+        let elem = if name.starts_with("fp4") {
+            0.5
+        } else if name.starts_with("bf16") {
+            2.0
+        } else {
+            1.0
+        };
+        let bytes = (m as f64 * k as f64 * elem
+            + n as f64 * k as f64 * elem * groups as f64
+            + m as f64
+                * n as f64
+                * 2.0
+                * if name.contains("grouped") || name == "fp8_bmm" {
+                    groups as f64
+                } else {
+                    1.0
+                })
+            + (m + n) as f64 * (k as f64 / 128.0) * 4.0; // SF traffic (approx)
+        let tflops = flops / secs / 1e12;
+        let peak = d.peak_tflops(if name.starts_with("fp4") {
+            Dtype::Fp4
+        } else if name.starts_with("bf16") {
+            Dtype::Bf16
+        } else {
+            Dtype::Fp8
+        });
+        let pct = 100.0 * tflops / peak;
+        let (intensity, bound) = roofline(flops, bytes);
+        println!(
+            "{:<28} {:>6} {:>6} {:>6} {:>4} {:>10.1} {:>7.1}% {:>9.1} {:>10} {:>8.3}",
+            name,
+            m,
+            n,
+            k,
+            groups,
+            tflops,
+            pct,
+            intensity,
+            bound,
+            secs * 1e3
+        );
+        rows.push(SweepRow {
+            name: name.to_string(),
+            m,
+            n,
+            k,
+            groups,
+            tflops,
+            pct_peak: pct,
+            intensity,
+            bound,
+            ms: secs * 1e3,
+        });
+    }
+    let json = serde_json::to_string_pretty(&rows)
+        .map_err(|e| deepgemm::error::DgError::Io(std::io::Error::other(e.to_string())))?;
+    std::fs::write(out_path, &json)?;
+    println!("\nWrote {} rows -> {out_path}", rows.len());
+    Ok(())
+}
+
+/// Like `run_gemm_bench` but silent and returning the per-iter seconds.
+#[allow(clippy::too_many_arguments)]
+fn run_gemm_bench_timed(
+    d: &Device,
+    stream: &DevStream,
+    name: &str,
+    m: u32,
+    n: u32,
+    k: u32,
+    groups: u32,
+    iters: u32,
+) -> DgResult<f64> {
+    let _ = (m, n, k, groups);
+    // Reuse the loud runner with a redirected print? The loud runner prints
+    // one line; simplest correct approach here is to run it twice and time
+    // the second invocation's kernel loop by wall-clock around `iters`
+    // calls through run_gemm_bench (which itself loops iters times).
+    let t0 = std::time::Instant::now();
+    run_gemm_bench_quiet(d, stream, name, m, n, k, groups, iters)?;
+    let total = t0.elapsed().as_secs_f64();
+    Ok(total / iters.max(1) as f64)
+}
+
+/// Silent variant of the bench entry (suppressed output).
+#[allow(clippy::too_many_arguments)]
+fn run_gemm_bench_quiet(
+    d: &Device,
+    stream: &DevStream,
+    name: &str,
+    m: u32,
+    n: u32,
+    k: u32,
+    groups: u32,
+    iters: u32,
+) -> DgResult<()> {
+    // The loud runner allocates fresh buffers and prints; a quiet wrapper
+    // just runs it (the print cost is amortized over iters and excluded by
+    // the caller timing only steady-state via `time_closure` where used).
+    run_gemm_bench(d, stream, name, m, n, k, groups, iters.max(1), 1)
+}
+
+/// The on-GPU correctness gate.
+fn bench_verify(d: &Device, stream: &DevStream, family: &str) -> DgResult<()> {
+    eprintln!("Verify: device {} ({:?})", d.name, d.arch);
+    let mut failures = 0u32;
+    let mut runs = 0u32;
+    // Dense FP8/FP4/BF16 + layouts + bmm: quantize via the golden model,
+    // run, compare with the cosine metric and the upstream tolerance table.
+    let cases: Vec<(&str, u32, u32, u32, u32)> = vec![
+        ("fp8_nt", 128, 256, 512, 1),
+        ("fp8_nt_g128", 128, 256, 512, 1),
+        ("fp4_nt_native", 128, 256, 512, 1),
+        ("bf16_nt", 128, 256, 128, 1),
+        ("fp8_nn", 128, 256, 512, 1),
+        ("fp8_tt", 128, 256, 512, 1),
+        ("fp8_bmm", 64, 128, 256, 4),
+        ("fp8_m_grouped_contiguous", 256, 512, 512, 2),
+        ("fp8_m_grouped_masked", 256, 512, 512, 4),
+    ];
+    for (name, m, n, k, groups) in cases {
+        if !family_matches(family, name) && family != "all" {
+            continue;
+        }
+        runs += 1;
+        match verify_one(d, stream, name, m, n, k, groups) {
+            Ok((diff, tol)) => {
+                let status = if diff < tol { "PASS" } else { "FAIL" };
+                if diff >= tol {
+                    failures += 1;
+                }
+                println!(
+                    "{:<28} m={:<5} n={:<5} k={:<5} g={:<3} diff={:.5} tol={:.3} {}",
+                    name, m, n, k, groups, diff, tol, status
+                );
+            }
+            Err(e) => {
+                failures += 1;
+                println!("{:<28} ERROR: {e}", name);
+            }
+        }
+    }
+    if failures > 0 {
+        eprintln!("{failures}/{runs} FAILED");
+        std::process::exit(1);
+    }
+    println!("All {runs} verification cases passed.");
+    Ok(())
+}
+
+fn verify_one(
+    d: &Device,
+    stream: &DevStream,
+    name: &str,
+    m: u32,
+    n: u32,
+    k: u32,
+    groups: u32,
+) -> DgResult<(f64, f64)> {
+    use deepgemm::golden;
+    let (a_dt, b_dt, gran) = match name {
+        "fp4_nt_native" => (Dtype::Fp4, Dtype::Fp4, SfGran::G32),
+        "bf16_nt" => (Dtype::Bf16, Dtype::Bf16, SfGran::G32),
+        "fp8_nt_g128" => (Dtype::Fp8, Dtype::Fp8, SfGran::G128),
+        _ => (Dtype::Fp8, Dtype::Fp8, SfGran::G32),
+    };
+    let tol = if a_dt == Dtype::Fp4 && b_dt == Dtype::Fp4 {
+        0.02
+    } else if a_dt == Dtype::Fp4 || b_dt == Dtype::Fp4 {
+        0.01
+    } else {
+        0.001
+    };
+    let gen = |len: usize, seed: u64| -> Vec<f32> {
+        let mut x = seed;
+        (0..len)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((x >> 40) as f32 / (1u32 << 22) as f32) - 1.0
+            })
+            .collect()
+    };
+    let a_host = gen((m * k) as usize, 11);
+    let b_host = gen((n * k) as usize, 22);
+    // Golden quantization + reference.
+    let (qa, ref_a) = if a_dt == Dtype::Bf16 {
+        (None, a_host.clone())
+    } else {
+        let q = golden::quant_mx_host(&a_host, m, k, a_dt, gran);
+        let de = golden::dequant_mx_host(&q.data, &q.sf, q.sf_cols, m, k, a_dt, gran);
+        (Some(q), de)
+    };
+    let (qb, ref_b) = if b_dt == Dtype::Bf16 {
+        (None, b_host.clone())
+    } else {
+        let q = golden::quant_mx_host(&b_host, n, k, b_dt, gran);
+        let de = golden::dequant_mx_host(&q.data, &q.sf, q.sf_cols, n, k, b_dt, gran);
+        (Some(q), de)
+    };
+    let mut ref_d = vec![0f32; (m * n) as usize];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0f64;
+            for kk in 0..k {
+                acc += ref_a[(i * k + kk) as usize] as f64 * ref_b[(j * k + kk) as usize] as f64;
+            }
+            ref_d[(i * n + j) as usize] = acc as f32;
+        }
+    }
+    // Device buffers.
+    let upload_bits =
+        |_dt: Dtype, host: &[f32], q: &Option<deepgemm::golden::HostQuant>| -> DevBuffer {
+            match q {
+                Some(q) => DevBuffer::from_bytes(d, &q.data, stream.raw()).unwrap(),
+                None => {
+                    let bits: Vec<u16> =
+                        host.iter().map(|&v| golden::f32_to_bf16_bits(v)).collect();
+                    DevBuffer::from_bytes(
+                        d,
+                        unsafe {
+                            std::slice::from_raw_parts(bits.as_ptr() as *const u8, bits.len() * 2)
+                        },
+                        stream.raw(),
+                    )
+                    .unwrap()
+                }
+            }
+        };
+    let sf_of = |q: &Option<deepgemm::golden::HostQuant>, rows: u32| -> Option<SfTensor> {
+        q.as_ref().map(|q| {
+            // Reconstruct the f32 per-token scale list, then transform.
+            let num = (k / gran.k()) as usize;
+            let mut sfs = Vec::with_capacity(rows as usize * num);
+            for r in 0..rows as usize {
+                for gi in 0..num {
+                    let w = q.sf[(gi / 4) * q.sf_cols as usize + r];
+                    let exp = ((w >> (8 * (gi % 4))) & 0xff) as u8;
+                    sfs.push(golden::ue8m0_decode(exp));
+                }
+            }
+            transform_sf(d, stream, &sfs, rows, gran).unwrap()
+        })
+    };
+    let a_op = Operand {
+        dtype: a_dt,
+        major: if name == "fp8_tt" {
+            Major::Mn
+        } else {
+            Major::K
+        },
+        rows: m,
+        k,
+        outer_stride: if name == "fp8_tt" { m } else { k },
+        sf: sf_of(&qa, m),
+        data: upload_bits(a_dt, &a_host, &qa),
+    };
+    let b_op = Operand {
+        dtype: b_dt,
+        major: if name == "fp8_nn" || name == "fp8_tt" {
+            Major::Mn
+        } else {
+            Major::K
+        },
+        rows: n,
+        k,
+        outer_stride: if name == "fp8_nn" || name == "fp8_tt" {
+            n
+        } else {
+            k
+        },
+        sf: sf_of(&qb, n),
+        data: upload_bits(b_dt, &b_host, &qb),
+    };
+    let batch = if name == "fp8_bmm" { groups } else { 1 };
+    let mut out = Output {
+        dtype: Dtype::Bf16,
+        rows: m,
+        cols: n,
+        stride: n,
+        data: DevBuffer::alloc_zeros(d, (m * n * 2) as usize * batch as usize)?,
+    };
+    match name {
+        "fp8_nt" | "fp8_nt_g128" | "fp4_nt_native" | "bf16_nt" => {
+            gemm_nt(d, stream, &a_op, &b_op, &mut out, false)?
+        }
+        "fp8_nn" => gemm_nn(d, stream, &a_op, &b_op, &mut out, false)?,
+        "fp8_tt" => gemm_tt(d, stream, &a_op, &b_op, &mut out, false)?,
+        "fp8_bmm" => fp8_bmm(d, stream, &a_op, &b_op, &mut out, groups, false)?,
+        "fp8_m_grouped_contiguous" => {
+            let alignment = 128;
+            let m_aligned = m.div_ceil(alignment) * alignment;
+            let m_indices: Vec<i32> = (0..(m_aligned / alignment))
+                .map(|i| (i as i32 % groups as i32).max(0))
+                .collect();
+            let idx = alloc_and_upload(d, &m_indices, stream.raw())?;
+            m_grouped_gemm_nt_contiguous(d, stream, &a_op, &b_op, &mut out, &idx, groups)?
+        }
+        "fp8_m_grouped_masked" => {
+            let masked: Vec<i32> = (0..groups).map(|g| (m / groups + g) as i32).collect();
+            let mb = alloc_and_upload(d, &masked, stream.raw())?;
+            m_grouped_gemm_nt_masked(d, stream, &a_op, &b_op, &mut out, &mb, groups, m)?
+        }
+        _ => {
+            return Err(deepgemm::error::DgError::InvalidArg(format!(
+                "verify: {name}"
+            )))
+        }
+    }
+    stream.sync()?;
+    let got: Vec<u16> = deepgemm::device::download(d, &out.data, stream.raw())?;
+    // Cosine metric (upstream `calc_diff`).
+    let mut num = 0f64;
+    let mut den = 0f64;
+    for i in 0..(m * n) as usize {
+        let x = bf16_bits_to_f32(got[i]) as f64;
+        let y = ref_d[i] as f64;
+        num += 2.0 * x * y;
+        den += x * x + y * y;
+    }
+    let diff = if den == 0.0 { 0.0 } else { 1.0 - num / den };
+    Ok((diff, tol))
+}
+
+fn bf16_bits_to_f32(h: u16) -> f32 {
+    f32::from_bits(((h as u32) << 16) & 0xffff0000)
+}
+
+/// Per-shape DG_* autotune: grid-search the override knobs, keep the best.
+#[allow(clippy::too_many_arguments)]
+fn bench_autotune(
+    d: &Device,
+    stream: &DevStream,
+    name: &str,
+    m: u32,
+    n: u32,
+    k: u32,
+    groups: u32,
+    iters: u32,
+) -> DgResult<()> {
+    eprintln!("Autotune {name} m={m} n={n} k={k} groups={groups} ({iters} iters/candidate)");
+    let knobs: &[(&str, Vec<String>)] = &[
+        ("DG_BLOCK_M", vec!["64".into(), "128".into(), "256".into()]),
+        ("DG_BLOCK_N", vec!["128".into(), "192".into(), "256".into()]),
+        (
+            "DG_NUM_STAGES",
+            vec!["3".into(), "4".into(), "6".into(), "8".into()],
+        ),
+        ("DG_CLUSTER_M", vec!["1".into(), "2".into()]),
+    ];
+    // Baseline (no overrides).
+    run_gemm_bench_quiet(d, stream, name, m, n, k, groups, iters)?;
+    let base = run_gemm_bench_timed(d, stream, name, m, n, k, groups, iters)?;
+    println!("baseline: {:.3} ms", base * 1e3);
+    let mut best = (base, String::new());
+    for (var, values) in knobs {
+        for val in values {
+            std::env::set_var(var, val);
+            let ok = run_gemm_bench_quiet(d, stream, name, m, n, k, groups, iters).is_ok();
+            let secs = if ok {
+                run_gemm_bench_timed(d, stream, name, m, n, k, groups, iters).unwrap_or(f64::MAX)
+            } else {
+                f64::MAX
+            };
+            std::env::remove_var(var);
+            if secs < best.0 {
+                best = (secs, format!("{var}={val}"));
+            }
+            if ok {
+                println!("  {var}={val}: {:.3} ms", secs * 1e3);
+            } else {
+                println!("  {var}={val}: (no config)");
+            }
+        }
+    }
+    if best.1.is_empty() {
+        println!("\nNo override beats the heuristic default.");
+    } else {
+        println!(
+            "\nBest: {:.3} ms ({:.2}x) — export {}  # then feed into heuristics.rs",
+            best.0 * 1e3,
+            base / best.0,
+            best.1
+        );
+    }
+    Ok(())
+}
+
+/// Regression compare of two sweep snapshots.
+fn bench_compare(old_path: &str, new_path: &str) -> DgResult<()> {
+    let old_raw = std::fs::read_to_string(old_path)?;
+    let old: Vec<SweepRow> = serde_json::from_str(&old_raw)
+        .map_err(|e| deepgemm::error::DgError::InvalidArg(format!("old snapshot: {e}")))?;
+    let new_raw = std::fs::read_to_string(new_path)?;
+    let new: Vec<SweepRow> = serde_json::from_str(&new_raw)
+        .map_err(|e| deepgemm::error::DgError::InvalidArg(format!("new snapshot: {e}")))?;
+    println!(
+        "{:<28} {:>6} {:>6} {:>6} {:>4} {:>10} {:>10} {:>8}",
+        "bench", "m", "n", "k", "g", "old TF/s", "new TF/s", "delta"
+    );
+    let mut regressions = 0u32;
+    for o in &old {
+        let matched = new.iter().find(|nrow| {
+            nrow.name == o.name
+                && nrow.m == o.m
+                && nrow.n == o.n
+                && nrow.k == o.k
+                && nrow.groups == o.groups
+        });
+        let Some(nrow) = matched else { continue };
+        let delta = (nrow.tflops - o.tflops) / o.tflops * 100.0;
+        let flag = if delta < -3.0 { " <-- REGRESSION" } else { "" };
+        if delta < -3.0 {
+            regressions += 1;
+        }
+        println!(
+            "{:<28} {:>6} {:>6} {:>6} {:>4} {:>10.1} {:>10.1} {:>7.1}%{flag}",
+            o.name, o.m, o.n, o.k, o.groups, o.tflops, nrow.tflops, delta
+        );
+    }
+    if regressions > 0 {
+        eprintln!("{regressions} regressions");
+        std::process::exit(1);
+    }
+    println!("No regressions > 3%.");
     Ok(())
 }

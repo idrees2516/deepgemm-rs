@@ -621,6 +621,7 @@ pub fn mega_moe_ref(
     y
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bs_dot_row(
     x: &[u8],
     x_sf: &[u32],
@@ -668,7 +669,6 @@ fn bf16_round(v: f32) -> f32 {
 }
 
 /// fp8 mega_gate reference (scores -> sqrt-softplus -> top-k -> normalize).
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub fn mega_gate_ref(
     x_fp8: &[u8],
@@ -721,7 +721,6 @@ pub fn mega_gate_ref(
 
 /// mHC reference: post/comb/pre coefficients, HC norm, sinkhorn, RMSNorm +
 /// optional FP8 outputs. Mirrors the kernel's numerics (bf16 boundaries).
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 #[allow(clippy::manual_clamp)]
 pub fn mega_mhc_ref(

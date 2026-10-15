@@ -1,0 +1,60 @@
+# DeepGEMM-RS CI — fully GPU-less: the two validation planes (host tests +
+# offline NVRTC compile of every kernel variant to PTX *and* SASS) run on a
+# plain ubuntu runner. GPU acceptance (verify/sweep) runs on your B200/B300
+# box via `deepgemm-bench verify && deepgemm-bench sweep` (docs/BENCHMARKING.md).
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features e2e -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # NVRTC for the compile-check tests (pure compiler, no GPU needed).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install nvidia-cuda-nvrtc-cu12
+      - name: Host tests (heuristics, golden, parity, mega layouts)
+        env:
+          DG_NVRTC_PATH: ${{ env.pythonLocation }}/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib/libnvrtc.so.12
+        run: cargo test --workspace
+      - name: e2e feature compiles (GPU tests build)
+        run: cargo check -p deepgemm --features e2e --tests
+
+  compile-check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ["90a", "100a", "103a"]
+    name: compile-check (${{ matrix.arch }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install nvidia-cuda-nvrtc-cu12
+      - name: Offline PTX+SASS compile of all kernel variants
+        env:
+          DG_NVRTC_PATH: ${{ env.pythonLocation }}/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib/libnvrtc.so.12
+        run: cargo run -p deepgemm-bench --release -- compile-check --arch ${{ matrix.arch }}

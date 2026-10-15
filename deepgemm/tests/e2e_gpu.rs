@@ -47,6 +47,23 @@ fn bf16_to_f32(h: u16) -> f32 {
     f32::from_bits(((h as u32) << 16) & 0xffff0000)
 }
 
+fn upload_u8(dev: &Device, stream: &DevStream, x: &[u8]) -> DevBuffer {
+    deepgemm::device::alloc_and_upload(dev, x, stream.raw()).unwrap()
+}
+
+fn upload_u16(dev: &Device, stream: &DevStream, x: &[u16]) -> DevBuffer {
+    deepgemm::device::alloc_and_upload(dev, x, stream.raw()).unwrap()
+}
+
+fn clone_sf(sf: &SfTensor) -> SfTensor {
+    SfTensor {
+        rows: sf.rows,
+        cols: sf.cols,
+        gran: sf.gran,
+        buf: sf.buf.clone_view(),
+    }
+}
+
 fn rand_data(n: usize, seed: u64) -> Vec<f32> {
     let mut x = 0x12345678u64.wrapping_add(seed);
     let mut out = Vec::with_capacity(n);
@@ -866,7 +883,7 @@ mod sm90_e2e {
         stream.sync().unwrap();
         let got: Vec<f32> = dl_f32(&dev, &out.data, &stream);
 
-        let bf16 = |h: u16| f32::from_bits(((h as u32) << 16));
+        let bf16 = |h: u16| f32::from_bits((h as u32) << 16);
         let mut max_err = 0f64;
         for i in 0..m {
             for j in 0..n {
@@ -908,7 +925,7 @@ mod sm90_e2e {
                 * bf16(b_host[(j * k + kk) as usize]) as f64;
         }
         let want = (2.0 * acc) as f32;
-        let gotv = f32::from_bits(((got2[(i * n + j) as usize] as u32) << 16));
+        let gotv = f32::from_bits((got2[(i * n + j) as usize] as u32) << 16);
         assert!(
             (gotv - want).abs() < 0.1,
             "bf16-out ({i},{j}) got {gotv} want {want}"
@@ -947,9 +964,10 @@ mod sm90_e2e {
 // ===========================================================================
 mod mega_e2e {
     use super::*;
-    use deepgemm::api::{self, MegaMoEWeights, RoutingSpec};
+    use deepgemm::api::{self, RoutingSpec};
+    use deepgemm::api_mega_moe::{mega_moe_fp8_fp4, MegaMoeWeights};
     use deepgemm::golden;
-    use deepgemm::types::{Dtype, Major, SfGran};
+    use deepgemm::types::{Dtype, SfGran};
 
     fn lcg(seed: &mut u64) -> u32 {
         *seed = seed
@@ -991,7 +1009,7 @@ mod mega_e2e {
         e: u32,
         n: u32,
         k: u32,
-    ) -> anyhow_of(MegaMoEWeights) {
+    ) -> deepgemm::error::DgResult<MegaMoeWeights<'static>> {
         let data = DevBuffer::from_bytes(dev, &quantize_host(w, k, 32, false).0, stream.raw())?;
         // SF: row-major words, then UTCCP-transposed on device.
         let sf_words = sf_row_major(w, e * n, k, 32);
@@ -1005,19 +1023,17 @@ mod mega_e2e {
         // interleave gate/up along N + transpose SF pages.
         let data = api::interleave_weights(dev, stream, &data, e, n, k)?;
         let sf = api::transpose_sf_utccp(dev, stream, &sf, e, n, k)?;
-        Ok(MegaMoEWeights {
-            data,
-            sf,
+        Ok(MegaMoeWeights {
+            data: Box::leak(Box::new(data)),
+            sf: Box::leak(Box::new(sf)),
             n,
             k,
-            is_fp4: false,
+            row_stride_bytes: k,
+            dtype: Dtype::Fp8,
         })
     }
 
     type TmResult<T> = Result<T, deepgemm::error::DgError>;
-    fn anyhow_of<T>(t: T) -> T {
-        t
-    }
 
     #[test]
     fn mega_moe_e2e_fp8() {
@@ -1044,9 +1060,9 @@ mod mega_e2e {
             deepgemm::mega_layout::mega_moe_buffer_layout(1, e, t, topk, h, i, 0, dev.num_sms)
                 .unwrap();
         let sym = DevBuffer::alloc(&dev, total as usize).unwrap();
-        let base = sym.ptr as u64;
-        let mut put = |o: u64, bytes: &[u8]| -> TmResult<()> {
-            let b = unsafe { DevBuffer::from_bytes(&dev, bytes, stream.raw())? };
+        let base = sym.ptr;
+        let mut put = |_o: u64, bytes: &[u8]| -> TmResult<()> {
+            let b = DevBuffer::from_bytes(&dev, bytes, stream.raw())?;
             // copy into the sym view via device-side memcpy? simplest: fill
             // through a staging buffer + d2d copy.
             let _ = b;
@@ -1091,24 +1107,23 @@ mod mega_e2e {
             .copy_from_host(&dev, &w_b, stream.raw())
             .unwrap();
 
-        let mut y = DevBuffer::alloc(&dev, (t * h * 2) as usize).unwrap();
-        api::mega_moe(
+        let y = DevBuffer::alloc(&dev, (t * h * 2) as usize).unwrap();
+        mega_moe_fp8_fp4(
             &dev,
             &stream,
-            &mut y,
+            &y,
+            &sym,
+            &[sym.ptr],
+            0,
+            t,
             &w13,
             &w2,
             None,
             None,
-            &sym,
-            &[sym.ptr as u64],
-            0,
+            None,
             t,
-            0,
-            t,
+            e,
             topk,
-            h,
-            i,
             Some(88.0),
             true,
             None,
@@ -1254,7 +1269,7 @@ mod mega_e2e {
         let comb = r(&mut seed, (t * 16) as usize);
         let prev = r(&mut seed, (t * 4) as usize);
         let f_n = r(&mut seed, (24 * 4 * h) as usize);
-        let scales = vec![0.5f32, 1.0, 1.5];
+        let scales = [0.5f32, 1.0, 1.5];
         let bases: Vec<f32> = (0..24).map(|i| (i as f32 - 12.0) / 24.0).collect();
         let nw: Vec<u16> = (0..h).map(|_| golden::f32_to_bf16_bits(0.9)).collect();
 
@@ -1306,14 +1321,14 @@ mod mega_e2e {
             &dev_nw,
             1e-6,
             &dev_new_res,
-            Some(&mut dev_npm),
+            Some(&dev_npm),
             &dev_npost,
             &dev_ncomb,
             Some(&mut y),
             Some(&y_fp8),
             Some(&y_psf),
             Some(&y_ssf),
-            (h / 128) as u32 * t,
+            (h / 128) * t,
             t,
             128,
             1.0,
@@ -1333,4 +1348,497 @@ mod mega_e2e {
         let nans = bits.iter().filter(|&&b| (b & 0x7f80) == 0x7f80).count();
         assert_eq!(nans, 0, "NaNs in mhc output");
     }
+}
+
+// ===========================================================================
+// Wave-4 additions: BLAS layouts, alpha, k-grouped, einsum, bmm fix,
+// determinism, cuBLASLt reference, runtime pooling.
+// ===========================================================================
+
+fn f32_matmul(a: &[f32], b: &[f32], m: u32, n: u32, k: u32) -> Vec<f32> {
+    let mut out = vec![0f32; (m * n) as usize];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0f64;
+            for kk in 0..k {
+                acc += a[(i * k + kk) as usize] as f64 * b[(j * k + kk) as usize] as f64;
+            }
+            out[(i * n + j) as usize] = acc as f32;
+        }
+    }
+    out
+}
+
+fn bf16_bits_roundtrip(x: &[f32]) -> Vec<u16> {
+    x.iter().map(|&v| golden::f32_to_bf16_bits(v)).collect()
+}
+
+/// All four BLAS layouts must agree with the FP32 reference (BF16 out).
+#[test]
+fn e2e_bf16_gemm_all_layouts() {
+    let (dev, stream) = test_dev();
+    let (m, n, k) = (128u32, 256u32, 128u32);
+    let a = rand_data((m * k) as usize, 1);
+    let b = rand_data((n * k) as usize, 2);
+    let ref_d = f32_matmul(&a, &b, m, n, k);
+
+    let mk_out = || Output {
+        dtype: Dtype::Bf16,
+        rows: m,
+        cols: n,
+        stride: n,
+        data: DevBuffer::alloc_zeros(&dev, (m * n) as usize * 2).unwrap(),
+    };
+    // Transpose the B data into a `[K, N]` column-major buffer (ld = n).
+    let mut b_t = vec![0f32; (k * n) as usize];
+    for kk in 0..k {
+        for j in 0..n {
+            b_t[(kk * n + j) as usize] = b[(j * k + kk) as usize];
+        }
+    }
+    let a_t = {
+        let mut t = vec![0f32; (k * m) as usize];
+        for kk in 0..k {
+            for i in 0..m {
+                t[(kk * m + i) as usize] = a[(i * k + kk) as usize];
+            }
+        }
+        t
+    };
+
+    let upload = |x: &[f32]| {
+        let bits: Vec<u16> = bf16_bits_roundtrip(x);
+        upload_u16(&dev, &stream, &bits)
+    };
+    let op_k = |rows: u32, data: &[f32]| Operand {
+        dtype: Dtype::Bf16,
+        major: Major::K,
+        rows,
+        k,
+        outer_stride: k,
+        sf: None,
+        data: upload(data),
+    };
+    let op_mn = |rows: u32, data: &[f32], ld: u32| Operand {
+        dtype: Dtype::Bf16,
+        major: Major::Mn,
+        rows,
+        k,
+        outer_stride: ld,
+        sf: None,
+        data: upload(data),
+    };
+
+    let check = |name: &str, out: &mut Output| {
+        let got: Vec<u16> = deepgemm::device::download(&dev, &out.data, stream.raw()).unwrap();
+        let mut worst = 0f64;
+        for i in 0..(m * n) as usize {
+            let g = bf16_to_f32(got[i]) as f64;
+            let r = ref_d[i] as f64;
+            worst = worst.max((g - r).abs() / r.abs().max(1.0));
+        }
+        assert!(worst < 0.02, "{name}: worst rel {worst:.4}");
+    };
+
+    let (a_op, b_op) = (op_k(m, &a), op_k(n, &b));
+    let mut out = mk_out();
+    gemm_nt(&dev, &stream, &a_op, &b_op, &mut out, false).unwrap();
+    check("nt", &mut out);
+
+    let b_mn = op_mn(n, &b_t, n);
+    let mut out = mk_out();
+    gemm_nn(&dev, &stream, &a_op, &b_mn, &mut out, false).unwrap();
+    check("nn", &mut out);
+
+    let a_mn = op_mn(m, &a_t, m);
+    let mut out = mk_out();
+    gemm_tn(&dev, &stream, &a_mn, &b_op, &mut out, false).unwrap();
+    check("tn", &mut out);
+
+    let mut out = mk_out();
+    gemm_tt(&dev, &stream, &a_mn, &b_mn, &mut out, false).unwrap();
+    check("tt", &mut out);
+}
+
+/// Alpha scales the product term only: `D = alpha * A@B (+ C)`.
+#[test]
+fn e2e_gemm_alpha() {
+    let (dev, stream) = test_dev();
+    let (m, n, k) = (64u32, 128u32, 256u32);
+    let a = rand_data((m * k) as usize, 3);
+    let b = rand_data((n * k) as usize, 4);
+    let alpha = 0.37f32;
+    let mut ref_d = f32_matmul(&a, &b, m, n, k);
+    for v in ref_d.iter_mut() {
+        *v *= alpha;
+    }
+    let (a8, a_sf) = quantize_host(&a, k, 128, false);
+    let (b8, b_sf) = quantize_host(&b, k, 128, false);
+    let sfa = transform_sf(&dev, &stream, &a_sf, m, SfGran::G128).unwrap();
+    let sfb = transform_sf(&dev, &stream, &b_sf, n, SfGran::G128).unwrap();
+    let a_op = Operand {
+        dtype: Dtype::Fp8,
+        major: Major::K,
+        rows: m,
+        k,
+        outer_stride: k,
+        sf: Some(sfa),
+        data: upload_u8(&dev, &stream, &a8),
+    };
+    let b_op = Operand {
+        dtype: Dtype::Fp8,
+        major: Major::K,
+        rows: n,
+        k,
+        outer_stride: k,
+        sf: Some(sfb),
+        data: upload_u8(&dev, &stream, &b8),
+    };
+    let mut out = Output {
+        dtype: Dtype::F32,
+        rows: m,
+        cols: n,
+        stride: n,
+        data: DevBuffer::alloc_zeros(&dev, (m * n) as usize * 4).unwrap(),
+    };
+    gemm_nt_alpha(&dev, &stream, &a_op, &b_op, &mut out, false, Some(alpha)).unwrap();
+    let got: Vec<f32> = deepgemm::device::download(&dev, &out.data, stream.raw()).unwrap();
+    let mut worst = 0f64;
+    for i in 0..(m * n) as usize {
+        worst = worst.max((got[i] as f64 - ref_d[i] as f64).abs() / ref_d[i].abs().max(1.0) as f64);
+    }
+    assert!(worst < 0.02, "alpha: worst rel {worst:.4}");
+}
+
+/// The Batched CD 3D map batch-stride fix: every batch slice must be
+/// independently correct (previously the stride interleaved slices).
+#[test]
+fn e2e_fp8_bmm_numeric_per_batch() {
+    let (dev, stream) = test_dev();
+    let (batch, m, n, k) = (4u32, 64u32, 128u32, 256u32);
+    let mut worst = 0f64;
+    let mut d_all = vec![0u16; (batch * m * n) as usize];
+    let a = rand_data((batch * m * k) as usize, 5);
+    let b = rand_data((batch * n * k) as usize, 6);
+    let (a8, a_sf) = quantize_host(&a, k, 128, false);
+    let (b8, b_sf) = quantize_host(&b, k, 128, false);
+    let sfa = transform_sf_batched(&dev, &stream, &a_sf, batch, m, SfGran::G128).unwrap();
+    let sfb = transform_sf_batched(&dev, &stream, &b_sf, batch, n, SfGran::G128).unwrap();
+    let a_op = Operand {
+        dtype: Dtype::Fp8,
+        major: Major::K,
+        rows: m,
+        k,
+        outer_stride: k,
+        sf: Some(sfa),
+        data: upload_u8(&dev, &stream, &a8),
+    };
+    let b_op = Operand {
+        dtype: Dtype::Fp8,
+        major: Major::K,
+        rows: n,
+        k,
+        outer_stride: k,
+        sf: Some(sfb),
+        data: upload_u8(&dev, &stream, &b8),
+    };
+    let mut out = Output {
+        dtype: Dtype::Bf16,
+        rows: m,
+        cols: n,
+        stride: n,
+        data: DevBuffer::alloc_zeros(&dev, (batch * m * n) as usize * 2).unwrap(),
+    };
+    fp8_bmm(&dev, &stream, &a_op, &b_op, &mut out, batch, false).unwrap();
+    d_all = deepgemm::device::download(&dev, &out.data, stream.raw()).unwrap();
+    for bt in 0..batch {
+        let ref_d = f32_matmul(
+            &a[(bt * m * k) as usize..],
+            &b[(bt * n * k) as usize..],
+            m,
+            n,
+            k,
+        );
+        for i in 0..(m * n) as usize {
+            let g = bf16_to_f32(d_all[(bt * m * n) as usize + i]) as f64;
+            let r = ref_d[i] as f64;
+            worst = worst.max((g - r).abs() / r.abs().max(1.0));
+        }
+    }
+    assert!(worst < 0.03, "bmm per-batch worst rel {worst:.4}");
+}
+
+/// Determinism: identical inputs + config produce bitwise-identical output.
+#[test]
+fn e2e_determinism_bitwise() {
+    let (dev, stream) = test_dev();
+    let (m, n, k) = (256u32, 512u32, 512u32);
+    let a = rand_data((m * k) as usize, 7);
+    let b = rand_data((n * k) as usize, 8);
+    let (a8, a_sf) = quantize_host(&a, k, 128, false);
+    let (b8, b_sf) = quantize_host(&b, k, 128, false);
+    let sfa = transform_sf(&dev, &stream, &a_sf, m, SfGran::G128).unwrap();
+    let sfb = transform_sf(&dev, &stream, &b_sf, n, SfGran::G128).unwrap();
+    let run = || {
+        let a_op = Operand {
+            dtype: Dtype::Fp8,
+            major: Major::K,
+            rows: m,
+            k,
+            outer_stride: k,
+            sf: Some(clone_sf(&sfa)),
+            data: upload_u8(&dev, &stream, &a8),
+        };
+        let b_op = Operand {
+            dtype: Dtype::Fp8,
+            major: Major::K,
+            rows: n,
+            k,
+            outer_stride: k,
+            sf: Some(clone_sf(&sfb)),
+            data: upload_u8(&dev, &stream, &b8),
+        };
+        let mut out = Output {
+            dtype: Dtype::Bf16,
+            rows: m,
+            cols: n,
+            stride: n,
+            data: DevBuffer::alloc_zeros(&dev, (m * n) as usize * 2).unwrap(),
+        };
+        fp8_gemm_nt(&dev, &stream, &a_op, &b_op, &mut out, false).unwrap();
+        deepgemm::device::download::<u16>(&dev, &out.data, stream.raw()).unwrap()
+    };
+    let d1 = run();
+    let d2 = run();
+    assert_eq!(d1, d2, "bitwise determinism");
+}
+
+/// K-grouped weight-grad (FP8 TN): D[g] = A_g @ B_g^T per group.
+#[test]
+fn e2e_k_grouped_fp8_tn() {
+    let (dev, stream) = test_dev();
+    let (groups, m, n) = (4u32, 64u32, 128u32);
+    let ks = [128u32, 256, 128, 384]; // multiples of k_alignment = 128
+    let sum_k: u32 = ks.iter().sum();
+    // A: [sum_k, M] MN-major; B: [sum_k, N] MN-major.
+    // Deterministic E4M3 codes (valid fp8 payload bytes).
+    let a: Vec<u8> = (0..(sum_k * m) as usize).map(|i| (i % 200) as u8).collect();
+    let b: Vec<u8> = (0..(sum_k * n) as usize)
+        .map(|i| ((i * 7) % 200) as u8)
+        .collect();
+    // Per-group scales along the group's K slice: token rows are M (per k).
+    // The k-grouped SF arena is [sum_sf_rows, mn] K-major (transposed form):
+    // sf[row * mn + midx] where row enumerates (group, k/gran).
+    let gran = SfGran::G128;
+    let mut sf_a_arena = Vec::new();
+    let mut sf_b_arena = Vec::new();
+    let mut rng = 0xABCDEFu64;
+    for &kg in &ks {
+        for _ in 0..(kg / gran.k()) {
+            for _ in 0..m {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                sf_a_arena.push(f32::from_bits((((rng >> 40) % 7 + 123) as u32) << 23));
+            }
+        }
+        for _ in 0..(kg / gran.k()) {
+            for _ in 0..n {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                sf_b_arena.push(f32::from_bits((((rng >> 40) % 7 + 123) as u32) << 23));
+            }
+        }
+    }
+    let layout_buf =
+        deepgemm::device::alloc_and_upload(&dev, &ks.map(|x| x as i32), stream.raw()).unwrap();
+    let sfa = transform_sf_k_grouped(
+        &dev,
+        &stream,
+        &sf_a_arena,
+        m,
+        gran,
+        &ks.map(|x| x as i32),
+        128,
+    )
+    .unwrap();
+    let sfb = transform_sf_k_grouped(
+        &dev,
+        &stream,
+        &sf_b_arena,
+        n,
+        gran,
+        &ks.map(|x| x as i32),
+        128,
+    )
+    .unwrap();
+    let a_op = Operand {
+        dtype: Dtype::Fp8,
+        major: Major::Mn,
+        rows: m,
+        k: sum_k,
+        outer_stride: m,
+        sf: Some(sfa),
+        data: upload_u8(&dev, &stream, &a),
+    };
+    let b_op = Operand {
+        dtype: Dtype::Fp8,
+        major: Major::Mn,
+        rows: n,
+        k: sum_k,
+        outer_stride: n,
+        sf: Some(sfb),
+        data: upload_u8(&dev, &stream, &b),
+    };
+    let mut out = Output {
+        dtype: Dtype::Bf16,
+        rows: m,
+        cols: n,
+        stride: n,
+        data: DevBuffer::alloc_zeros(&dev, (groups * m * n) as usize * 2).unwrap(),
+    };
+    k_grouped_fp8_gemm_tn_contiguous(
+        &dev,
+        &stream,
+        &a_op,
+        &b_op,
+        &mut out,
+        &layout_buf,
+        groups,
+        false,
+        gran,
+    )
+    .unwrap();
+    let got: Vec<u16> = deepgemm::device::download(&dev, &out.data, stream.raw()).unwrap();
+    // Reference per group with the SAME scales.
+    let mut worst = 0f64;
+    let mut k_off = 0u32;
+    for (g, &kg) in ks.iter().enumerate() {
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0f64;
+                for kk in 0..kg {
+                    let av = golden::e4m3_decode(a[((k_off + kk) * m + i) as usize]) as f64
+                        * sf_a_arena[((k_off / 128) * m + i) as usize] as f64;
+                    let bv = golden::e4m3_decode(b[((k_off + kk) * n + j) as usize]) as f64
+                        * sf_b_arena[((k_off / 128) * n + j) as usize] as f64;
+                    acc += av * bv;
+                }
+                let r = acc;
+                let gv = bf16_to_f32(
+                    got[(g * m as usize * n as usize) + (i as usize * n as usize) + j as usize],
+                ) as f64;
+                worst = worst.max((gv - r).abs() / r.abs().max(1.0));
+            }
+        }
+        k_off += kg;
+    }
+    assert!(worst < 0.05, "k-grouped worst rel {worst:.4}");
+}
+
+/// BF16 einsum `bhr,hdr->bhd` and `bhd,hdr->bhr` vs the FP32 reference.
+#[test]
+fn e2e_einsum_bf16() {
+    use deepgemm::api_einsum::{einsum_bhd_hdr_bhr, einsum_bhr_hdr_bhd, Tensor3};
+    let (dev, stream) = test_dev();
+    let (bt, h, r, dt) = (2u32, 4u32, 128u32, 256u32);
+    let a = rand_data((bt * h * r) as usize, 11); // [b, h, r]
+    let b = rand_data((h * dt * r) as usize, 12); // [h, d, r]
+    let upload = |x: &[f32]| {
+        let bits: Vec<u16> = bf16_bits_roundtrip(x);
+        upload_u16(&dev, &stream, &bits)
+    };
+    let ta = Tensor3::new(upload(&a), [bt, h, r]);
+    let tb = Tensor3::new(upload(&b), [h, dt, r]);
+
+    // bhr,hdr->bhd
+    let d_buf = DevBuffer::alloc_zeros(&dev, (bt * h * dt) as usize * 2).unwrap();
+    let td = Tensor3::new(d_buf.clone_view(), [bt, h, dt]);
+    einsum_bhr_hdr_bhd(&dev, &stream, &ta, &tb, &td, None).unwrap();
+    let got: Vec<u16> = deepgemm::device::download(&dev, &d_buf, stream.raw()).unwrap();
+    let mut worst = 0f64;
+    for bi in 0..bt {
+        for hi in 0..h {
+            for dj in 0..dt {
+                let mut acc = 0f64;
+                for kk in 0..r {
+                    acc += a[((bi * h + hi) * r + kk) as usize] as f64
+                        * b[((hi * dt + dj) * r + kk) as usize] as f64;
+                }
+                let g = bf16_to_f32(got[((bi * h + hi) * dt + dj) as usize]) as f64;
+                worst = worst.max((g - acc).abs() / acc.abs().max(1.0));
+            }
+        }
+    }
+    assert!(worst < 0.02, "bhr,hdr->bhd worst {worst:.4}");
+
+    // bhd,hdr->bhr
+    let a2 = rand_data((bt * h * dt) as usize, 13); // [b, h, d]
+    let ta2 = Tensor3::new(upload(&a2), [bt, h, dt]);
+    let r_buf = DevBuffer::alloc_zeros(&dev, (bt * h * r) as usize * 2).unwrap();
+    let tr = Tensor3::new(r_buf.clone_view(), [bt, h, r]);
+    einsum_bhd_hdr_bhr(&dev, &stream, &ta2, &tb, &tr, None).unwrap();
+    let got2: Vec<u16> = deepgemm::device::download(&dev, &r_buf, stream.raw()).unwrap();
+    let mut worst2 = 0f64;
+    for bi in 0..bt {
+        for hi in 0..h {
+            for rj in 0..r {
+                let mut acc = 0f64;
+                for kk in 0..dt {
+                    acc += a2[((bi * h + hi) * dt + kk) as usize] as f64
+                        * b[((hi * dt + kk) * r + rj) as usize] as f64;
+                }
+                let g = bf16_to_f32(got2[((bi * h + hi) * r + rj) as usize]) as f64;
+                worst2 = worst2.max((g - acc).abs() / acc.abs().max(1.0));
+            }
+        }
+    }
+    assert!(worst2 < 0.02, "bhd,hdr->bhr worst {worst2:.4}");
+}
+
+/// cuBLASLt BF16 reference GEMM vs the FP32 reference (the fallback path).
+#[test]
+fn e2e_cublaslt_bf16_reference() {
+    let (dev, stream) = test_dev();
+    let (m, n, k) = (128u32, 256u32, 128u32);
+    let a = rand_data((m * k) as usize, 14);
+    let b = rand_data((n * k) as usize, 15);
+    let ref_d = f32_matmul(&a, &b, m, n, k);
+    let upload = |x: &[f32]| {
+        let bits: Vec<u16> = bf16_bits_roundtrip(x);
+        upload_u16(&dev, &stream, &bits)
+    };
+    let out = DevBuffer::alloc_zeros(&dev, (m * n) as usize * 2).unwrap();
+    deepgemm::cublaslt::cublaslt_gemm_nt(
+        &dev,
+        &stream,
+        &upload(&a),
+        &upload(&b),
+        &out,
+        m,
+        n,
+        k,
+        Dtype::Bf16,
+        false,
+    )
+    .unwrap();
+    let got: Vec<u16> = deepgemm::device::download(&dev, &out, stream.raw()).unwrap();
+    let mut worst = 0f64;
+    for i in 0..(m * n) as usize {
+        let g = bf16_to_f32(got[i]) as f64;
+        let r = ref_d[i] as f64;
+        worst = worst.max((g - r).abs() / r.abs().max(1.0));
+    }
+    assert!(worst < 0.02, "cublaslt worst {worst:.4}");
+}
+
+/// Runtime pooling: scratch reuse + config memoization (production path).
+#[test]
+fn e2e_runtime_pooling() {
+    use deepgemm::runtime::Runtime;
+    let rt = Runtime::new(0).expect("runtime");
+    let s1 = rt.scratch(1 << 20).expect("scratch 1");
+    rt.release(s1);
+    let s2 = rt.scratch(1 << 20).expect("scratch 2");
+    // Same size class -> the pooled buffer comes back.
+    let (hits, _misses, _live) = rt.pool_stats();
+    assert!(hits >= 1, "pool should hit after release+alloc");
+    let _ = s2;
 }

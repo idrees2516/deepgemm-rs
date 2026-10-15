@@ -260,7 +260,11 @@ pub fn make_tma_cd_3d(
 ) -> DgResult<sys::TensorMap> {
     let elem = dtype.elem_size() as u64;
     let stride0 = row_stride as u64 * elem;
-    let stride1 = cols as u64 * elem;
+    // Batch stride: `[batch, m, n]` slices are `m` rows of `row_stride`
+    // apart — `rows * row_stride` elements (upstream passes `d.stride(0)`).
+    // (Passing `cols * elem` here interleaved batches — every batched CD
+    // store would land at the wrong slice for m > 1.)
+    let stride1 = rows as u64 * row_stride as u64 * elem;
     dev.bind()?;
     sys::tensor_map_encode_tiled(
         dtype_of(dtype, false)?,
@@ -312,6 +316,32 @@ pub fn make_tma_sf(
         block_mn,
         sf_block_k.max(1),
         outer_stride,
+        0,
+    )
+}
+
+/// K-grouped SF arena map: the packed row count comes from the per-group
+/// padded counts (each group's SF rows round up to whole packed words), so it
+/// can exceed `ceil_div(sum_k, gran_k * 4)`. Single shared arena, one MN dim.
+#[allow(clippy::too_many_arguments)]
+pub fn make_tma_sf_packed_rows(
+    dev: &Device,
+    buf: &DevBuffer,
+    aligned_mn: u32,
+    packed_rows: u32,
+    block_mn: u32,
+    sf_block_k: u32,
+) -> DgResult<sys::TensorMap> {
+    make_tma_2d(
+        dev,
+        Dtype::F32,
+        false,
+        buf.ptr,
+        aligned_mn,
+        packed_rows,
+        block_mn,
+        sf_block_k.max(1),
+        aligned_mn,
         0,
     )
 }
@@ -633,5 +663,47 @@ pub fn make_tma_mhc_coeff(
         mlayout::MHC_BLOCK_M,
         channels,
         swizzle_mode,
+    )
+}
+
+/// General strided 3D operand map for the einsum permutations: dims
+/// `(inner, outer, batch)` with EXPLICIT element strides for the outer and
+/// batch dims (e.g. upstream `bhr,hdr->bhd` maps A `[b, h, r]` to
+/// `(r, b, h)` with strides `(h*r, r)` — the batch dim is NOT the outermost
+/// memory dim). `smem_inner`/`smem_outer` are the SMEM box dims.
+#[allow(clippy::too_many_arguments)]
+pub fn make_tma_3d_strided(
+    dev: &Device,
+    dtype: Dtype,
+    buf: &DevBuffer,
+    inner: u32,
+    outer: u32,
+    batch: u32,
+    _smem_inner: u32,
+    smem_outer: u32,
+    stride_outer: u64, // elements
+    stride_batch: u64, // elements
+    swizzle_mode: u32,
+) -> DgResult<sys::TensorMap> {
+    let elem = dtype.elem_size() as u64;
+    // Swizzle constrains the SMEM box inner extent to the swizzle atom.
+    let s0 = if swizzle_mode != 0 {
+        swizzle_mode as u64 / elem
+    } else {
+        inner as u64
+    };
+    dev.bind()?;
+    sys::tensor_map_encode_tiled(
+        dtype_of(dtype, false)?,
+        3,
+        buf.ptr as *mut _,
+        &[inner as u64, outer as u64, batch as u64],
+        &[stride_outer * elem, stride_batch * elem],
+        &[s0 as u32, smem_outer, 1],
+        &[1, 1, 1],
+        sys::tm_interleave_none(),
+        sys::tm_swizzle(swizzle_mode),
+        sys::tm_l2_256b(),
+        sys::tm_oob_fill_none(),
     )
 }

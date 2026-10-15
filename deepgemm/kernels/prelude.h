@@ -906,6 +906,8 @@ template <GemmType kGemmType,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
           uint32_t kNumSMs,
           uint32_t kKAlignment = 128,
+          // K span of one packed int32 SF row = gran_k * 4 (K-grouped only).
+          uint32_t kSFKSpan = 128,
           uint32_t kNum1DBlocksPerGroup = get_num_1d_blocks_per_group<BLOCK_M, BLOCK_N, kNumMulticast, kIsMulticastOnA, kNumSMs>()>
 struct Scheduler {
     int current_iter = -1;
@@ -924,6 +926,12 @@ struct Scheduler {
     uint32_t current_shape_k;
     // K-grouped (weight-grad): physical K start of the current group.
     uint32_t current_k_start = 0;
+    // K-grouped only: prefix sum of *packed* SF rows over already-finished
+    // groups (upstream `current_sf_k_cumsum`). Each group's SF rows pack into
+    // `ceil_div(group_sf_rows, 4)` int32 rows (the pack kernel pads the
+    // group's tail words), so group g's first SF row sits at this cumsum,
+    // NOT at `current_k_start / kSFKSpan`.
+    uint32_t current_sf_k_cumsum = 0;
 
     enum class IndexType { MN, K, SF_K };
 
@@ -938,6 +946,12 @@ struct Scheduler {
         } else {  // MGroupedMasked
             num_blocks = 0;
         }
+        // Upstream loads the first K group in the constructor
+        // (`get_next_k_group()`); our SM90 port historically did this lazily
+        // (`current_shape_k == 0` checks in the kernels), which those checks
+        // now never observe.
+        if (gemm_type_is_k_grouped(kGemmType))
+            get_next_k_group();
     }
 
     // Advance to the next K group (K-grouped weight-grad). Non-psum flavor:
@@ -976,6 +990,18 @@ struct Scheduler {
         } else if (kGemmType == GemmType::MGroupedMasked) {
             const uint32_t offset = kWithGroupOffset ? current_group_idx : 0;
             return offset * shape_dim + block_idx * block_size;
+        } else if (gemm_type_is_k_grouped(kGemmType)) {
+            // K-grouped (weight-grad). MN: each group owns one D slice
+            // (the 3D CD's batch index). K: the group's physical start in
+            // the shared `[sum_k, MN]` arena. SF_K: the packed-SF-row
+            // prefix (groups pad their tail words; see the pack kernel).
+            uint32_t offset = 0;
+            if (kWithGroupOffset) {
+                if (kIndexType == IndexType::MN) offset = current_group_idx * shape_dim;
+                else if (kIndexType == IndexType::K) offset = current_k_start;
+                else if (kIndexType == IndexType::SF_K) offset = current_sf_k_cumsum;
+            }
+            return offset + block_idx * block_size;
         } else {  // Batched
             const uint32_t offset = kIndexType == IndexType::SF_K ? current_group_idx : 0;
             return offset * shape_dim + block_idx * block_size;
@@ -1021,6 +1047,10 @@ struct Scheduler {
                     if (next_block_idx < (current_group_idx + 1) * num_blocks) break;
                     current_group_idx++;
                     if (current_group_idx >= kNumGroupsRuntime) return false;
+                    // Packed SF rows of the group we just left: upstream
+                    // `ceil_div(align(shape_k, kKAlignment), kSFKSpan)` with
+                    // `kSFKSpan = gran_k * 4` (the K span of one packed row).
+                    current_sf_k_cumsum += ceil_div_u32(align_u32(current_shape_k, kKAlignment), kSFKSpan);
                     // `current_k_start` moves by the PREVIOUS group's size; the
                     // tensormap patcher reads both fields at the transition.
                     get_next_k_group();

@@ -244,11 +244,38 @@ Ported with full fidelity (this session's additions marked **new**):
   with per-row/per-32-col UE8M0 SFs written in the GEMM epilogue — bitwise
   identical to the standalone cast, per the upstream operator contract.
 
-Not yet ported (PRs welcome — the mega device machinery from the fp8xfp4
-megakernel is directly reusable for these):
+Ported with full fidelity (wave 4 — production readiness):
 
-* `bf16_mega_moe`, `mega_gate` (router megakernel), `mega_mhc`
-  (hyperconnection megakernel) — the remaining mega family.
+* **BLAS layout parity**: `gemm_nn` / `gemm_tn` / `gemm_tt` and
+  `m_grouped_gemm_nn_contiguous` (zero-copy MN-major operand views, the
+  upstream host-side transpose wrappers), plus the BLAS `alpha` epilogue
+  (`gemm_nt_alpha`, upstream `ScaleByAlpha`).
+* **SM100 K-grouped weight-grad GEMMs**: `k_grouped_fp8_gemm_tn_contiguous`
+  and `k_grouped_fp4_gemm_nt_contiguous` with the per-group-padded SF
+  packing (`transform_sf_k_grouped`).
+* **Einsum kernels** (`api_einsum`): `bmk,bnk->mn`, `bhr,hdr->bhd`,
+  `bhd,hdr->bhr`, `bhd,bhr->hdr` and the three FP8 equations — the GLM /
+  hyperconnection attention projections, via strided 3D TMA maps (zero
+  copies) or cuBLASLt where upstream delegates (small-K batch reduce).
+* **cuBLASLt layer**: reference/fallback GEMMs + the NVFP4 block-scaled
+  recipe.
+* **Serving composites** (`api_serving`): the model-facing layer for
+  DSv4.1-class (MLA scores, grouped MoE) and GLM-5.3-class (attention
+  projections) inference, with a pooled `Serving` handle and JIT warmup.
+* **Benchmark harness**: `deepgemm-bench sweep / verify / autotune /
+  compare` — the acceptance + tuning workflow in `docs/BENCHMARKING.md`.
+
+Intentionally not ported:
+
+* `bf16_mega_moe` — superseded by the FP8/FP4 `mega_moe` megakernel
+  (this port's directive is all-FP4/FP8 data planes); the BF16 variant's
+  device machinery is otherwise identical.
+* The legacy A100 Triton kernels (`deep_gemm.legacy`) and the cuBLASLt
+  `batched_syrk`/`symm` test helpers (superseded by the golden model as
+  the reference plane).
+
+See `CHANGELOG.md` for the full wave-4 list (including the batched-CD TMA
+stride fix that the B200 e2e run would have hit).
 
 ## License
 

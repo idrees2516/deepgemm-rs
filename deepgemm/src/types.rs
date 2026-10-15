@@ -117,3 +117,88 @@ pub struct Output {
     pub stride: u32,
     pub data: crate::device::DevBuffer,
 }
+
+// ---------------------------------------------------------------------------
+// Operand view helpers (BLAS layout parity)
+// ---------------------------------------------------------------------------
+//
+// An `Operand` is a *logical* view: `rows` x `k` with `major` telling which
+// dim is contiguous in the backing buffer and `outer_stride` the pitch of the
+// other dim (in elements — for FP4, logical elements, the buffer holds half
+// that many bytes).
+//
+//   K-major  `[M, K]`: element (m, k) at m * outer_stride + k   (row-major)
+//   MN-major `[K, M]`: element (m, k) at m + k * outer_stride   (col-major;
+//                      the buffer is a `[K, MN]` stack, e.g. upstream's
+//                      `.T.contiguous().T` generator form or a `[K, N]`
+//                      activation coming straight out of a transpose-producing
+//                      kernel)
+//
+// The BLAS wrappers (`gemm_nn`/`gemm_tn`/`gemm_tt`) mirror upstream's
+// host-side transpose views: they never touch data, they only require the
+// operand to already be described in the orientation that layout needs.
+impl Operand {
+    /// Validate that this operand is described as an MN-major logical view
+    /// (the form the `nn`/`tn`/`tt` entries need) and return it unchanged.
+    ///
+    /// Zero-copy by construction: upstream routes these layouts into the NT
+    /// kernel via `tensor.transpose(0, 1)` views; here the "view" IS the
+    /// `Operand` you built. This check exists so a mis-oriented operand fails
+    /// loudly at the API boundary instead of silently computing wrong
+    /// numbers (a K-major `[M, K]` buffer reinterpreted as MN-major reads
+    /// entirely different elements).
+    pub fn as_viewed_mn_major(&self, name: &str) -> crate::error::DgResult<&Operand> {
+        if self.major != Major::Mn {
+            return Err(crate::error::DgError::InvalidArg(format!(
+                "{name}: this BLAS layout needs an MN-major (column-major) operand \
+                 view: build the Operand with `major: Major::Mn`, `rows` = logical \
+                 M/N, `k` = logical K, `outer_stride` = pitch of the K slices in \
+                 the `[K, MN]` backing buffer"
+            )));
+        }
+        Ok(self)
+    }
+
+    /// Convenience constructor for the canonical K-major operand
+    /// (`[M, K]` / `[N, K]` row-major buffer, `ld` = row pitch in elements).
+    pub fn k_major(
+        dtype: Dtype,
+        rows: u32,
+        k: u32,
+        outer_stride: u32,
+        sf: Option<SfTensor>,
+        data: crate::device::DevBuffer,
+    ) -> Operand {
+        Operand {
+            dtype,
+            major: Major::K,
+            rows,
+            k,
+            outer_stride,
+            sf,
+            data,
+        }
+    }
+
+    /// Convenience constructor for the MN-major (column-major) operand view:
+    /// backing buffer is a `[K, MN]` stack, `outer_stride` = pitch of the K
+    /// slices (>= MN; in *logical* elements — half bytes for FP4).
+    pub fn mn_major(
+        dtype: Dtype,
+        rows: u32,
+        k: u32,
+        outer_stride: u32,
+        sf: Option<SfTensor>,
+        data: crate::device::DevBuffer,
+    ) -> Operand {
+        Operand {
+            dtype,
+            major: Major::Mn,
+            rows,
+            k,
+            outer_stride,
+            sf,
+            data,
+        }
+    }
+}

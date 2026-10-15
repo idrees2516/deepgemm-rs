@@ -9,6 +9,8 @@ pub enum DgError {
     InvalidArg(String),
     Unsupported(String),
     Mismatch(String),
+    /// A runtime library call failed (cuBLASLt, etc.).
+    Runtime(String),
     Io(std::io::Error),
 }
 
@@ -20,6 +22,7 @@ impl fmt::Display for DgError {
             DgError::InvalidArg(s) => write!(f, "invalid argument: {s}"),
             DgError::Unsupported(s) => write!(f, "unsupported operation: {s}"),
             DgError::Mismatch(s) => write!(f, "data mismatch: {s}"),
+            DgError::Runtime(s) => write!(f, "runtime library error: {s}"),
             DgError::Io(e) => write!(f, "I/O error: {e}"),
         }
     }

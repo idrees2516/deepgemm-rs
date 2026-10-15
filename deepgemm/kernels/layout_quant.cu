@@ -360,4 +360,151 @@ void quantize_output_fp8_impl(const float* in, uint8_t* out,
     }
 }
 
+// ---------------------------------------------------------------------------
+// K-grouped SF packing (port of upstream `pack_fp32_into_ue8m0`, the
+// k-grouped flavor of `transform_sf`): FP32 per-token scales
+// `sf[sf_k_total][mn]` (K-major rows) into the packed UE8M0 arena
+// `out[packed_sf_k][tma_aligned_mn]`, where EVERY GROUP starts at a fresh
+// packed int32 row and pads its tail words with zero.
+//
+// Why per-group padding: the GEMM scheduler addresses group g's SF rows at
+// `current_sf_k_cumsum` = sum of `ceil_div(group_sf_rows, 4)` over the
+// previous groups — a group's SF bytes may never straddle a packed word that
+// a previous group shares, or the TMA box for the next group's first rows
+// would fetch foreign exponent bytes.
+//
+// Layout (`kUsePsumLayout`):
+//   false: `grouped_layout[g]` = padded K size of group g (multiple of
+//          `k_alignment`); the group's SF rows are `k / gran_k`.
+//   true : `grouped_layout[g]` = the *logical K end* of group g; the group
+//          starts at `align(prev_end, k_alignment)` and its rows are
+//          `align(k_g, k_alignment) / gran_k` (gaps skipped, never packed).
+//
+// Warp specialization: one warp per packed output row (16 warps = 512
+// threads); the owner group is found with a 4-registers-per-lane cache of
+// the (<=128-entry) grouped layout + warp shuffle.
+//
+// `sf` here is the *transposed* SF arena `[sf_k_total][mn]` (K-major along
+// mn!) matching upstream's `kTransposed = true` — i.e. the host uploads the
+// per-group concatenated `[sum_sf_rows, mn]` FP32 arena, NOT the
+// `[mn, sf_k]` per-token form `transform_sf_impl` takes. The upstream
+// generators produce exactly this via `get_mn_major_tma_aligned_tensor` on
+// the concatenated SF; we mirror the contract.
+// ---------------------------------------------------------------------------
+template <uint32_t kNumGroups, uint32_t kNumThreads, uint32_t BLOCK_MN, uint32_t BLOCK_PACKED_SF_K,
+          bool kUsePsumLayout>
+DG_GLOBAL __launch_bounds__(kNumThreads, 1)
+void pack_k_grouped_sf_impl(const float* sf, uint32_t* out, const int* grouped_layout,
+                            const uint32_t mn, const uint32_t sf_k,
+                            const uint32_t packed_sf_k,
+                            const uint32_t gran_k, const uint32_t k_alignment) {
+    static_assert(BLOCK_MN % 4 == 0, "Invalid block sizes");
+    static_assert(BLOCK_PACKED_SF_K == kNumThreads / 32, "Invalid block sizes");
+
+    const uint32_t in_block_mn = dg_min(BLOCK_MN, mn - blockIdx.x * BLOCK_MN);
+    const uint32_t in_block_mn_uint4 = in_block_mn / 4;
+    const uint32_t in_block_packed_sf_k =
+        dg_min(BLOCK_PACKED_SF_K, packed_sf_k - blockIdx.y * BLOCK_PACKED_SF_K);
+
+    // Shift into the right block along MN. `sf` rows are `mn`-wide (the
+    // K-major transposed arena), `out` rows are `tma_aligned_mn`-wide.
+    const uint32_t tma_aligned_mn = align_u32(mn, 4);
+    sf += (uint64_t)blockIdx.x * BLOCK_MN;
+    out += (uint64_t)blockIdx.x * BLOCK_MN;
+
+    const uint32_t warp_idx = get_warp_idx();
+    const uint32_t lane_idx = get_lane_idx();
+    const uint32_t packed_sf_k_idx = blockIdx.y * BLOCK_PACKED_SF_K + warp_idx;
+    if (warp_idx >= in_block_packed_sf_k)
+        return;
+
+    griddepcontrol_wait();
+
+    // Find the owner group of this warp's packed row and its input row range.
+    uint32_t num_padding_sf_rows = 0;
+    uint32_t group_sf_row_start = 0, group_sf_row_end = sf_k;
+    if (kNumGroups > 1 || kUsePsumLayout) {
+        static_assert(kNumGroups <= 128, "Too many groups");
+        uint32_t layout_cache[4];
+        #pragma unroll
+        for (uint32_t i = 0; i < 4; ++i) {
+            const uint32_t group_idx = lane_idx * 4 + i;
+            layout_cache[i] = group_idx < kNumGroups ? (uint32_t)grouped_layout[group_idx] : 0;
+        }
+        __syncwarp();
+
+        uint32_t num_prefix_sf_rows = 0;
+        uint32_t num_prefix_packed_rows = 0;
+        uint32_t prev_group_end = 0;
+        bool owner_group_found = false;
+        #pragma unroll 1
+        for (uint32_t group_idx = 0; group_idx < kNumGroups; ++group_idx) {
+            const uint32_t layout_value =
+                __shfl_sync(0xffffffff, layout_cache[group_idx % 4], group_idx / 4);
+            uint32_t group_k;
+            if (kUsePsumLayout) {
+                group_k = layout_value - align_u32(prev_group_end, k_alignment);
+            } else {
+                group_k = layout_value;
+            }
+            const uint32_t aligned_group_k = kUsePsumLayout ? align_u32(group_k, k_alignment) : group_k;
+            const uint32_t num_group_sf_rows = aligned_group_k / gran_k;
+            group_sf_row_start = num_prefix_sf_rows;
+            group_sf_row_end = group_sf_row_start + num_group_sf_rows;
+            num_prefix_sf_rows += num_group_sf_rows;
+            num_prefix_packed_rows += ceil_div_u32(num_group_sf_rows, 4u);
+            if (packed_sf_k_idx < num_prefix_packed_rows) {
+                owner_group_found = true;
+                break;
+            }
+            if (const uint32_t remainder = num_group_sf_rows % 4; remainder > 0)
+                num_padding_sf_rows += 4 - remainder;
+            if (kUsePsumLayout)
+                prev_group_end = layout_value;
+        }
+        if (!owner_group_found)
+            return;
+    }
+
+    for (uint32_t mn_idx = lane_idx; mn_idx < in_block_mn_uint4; mn_idx += 32) {
+        // Load 4 consecutive SF rows of this column group (uint4 = 4 columns).
+        uint4 values[4];
+        #pragma unroll
+        for (uint32_t j = 0; j < 4; ++j) {
+            values[j] = make_uint4(0, 0, 0, 0);
+            const uint32_t sf_row_idx = packed_sf_k_idx * 4 + j - num_padding_sf_rows;
+            if (sf_row_idx >= group_sf_row_start && sf_row_idx < group_sf_row_end)
+                values[j] = *(const uint4*)(sf + (uint64_t)sf_row_idx * mn + mn_idx * 4);
+        }
+
+        // Pack 4 UE8M0 exponents per int32 (bit layout as transform_sf_impl).
+        uint4 packed;
+        packed.x = (values[0].x >> 23u) | (values[1].x >> 15u) | (values[2].x >> 7u) | (values[3].x << 1u);
+        packed.y = (values[0].y >> 23u) | (values[1].y >> 15u) | (values[2].y >> 7u) | (values[3].y << 1u);
+        packed.z = (values[0].z >> 23u) | (values[1].z >> 15u) | (values[2].z >> 7u) | (values[3].z << 1u);
+        packed.w = (values[0].w >> 23u) | (values[1].w >> 15u) | (values[2].w >> 7u) | (values[3].w << 1u);
+        *(uint4*)(out + (uint64_t)packed_sf_k_idx * tma_aligned_mn + mn_idx * 4) = packed;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FP32 -> BF16 elementwise cast (the `bmk,bnk->mn` einsum BF16 output path:
+// upstream runs the FP32-accumulating kernel into a workspace then
+// `d.copy_(workspace)`, an implicit RNE cast; this kernel is that cast).
+// ---------------------------------------------------------------------------
+template <uint32_t kNumThreads>
+DG_GLOBAL __launch_bounds__(kNumThreads, 4)
+void cast_f32_to_bf16_impl(const float* in, unsigned short* out, const uint32_t n) {
+    const uint32_t i = blockIdx.x * kNumThreads + threadIdx.x;
+    const uint32_t stride = gridDim.x * kNumThreads;
+    for (uint32_t idx = i; idx < n; idx += stride) {
+        const uint32_t bits = __float_as_uint(in[idx]);
+        // Round-to-nearest-even into bf16 (matches the host helper).
+        const uint32_t lsb = (bits >> 16) & 1;
+        const uint32_t rounding = 0x7fff + lsb;
+        const uint32_t packed = ((bits + rounding) >> 16) & 0x7fffu | (bits >> 31) << 16;
+        out[idx] = (unsigned short)packed;
+    }
+}
+
 } // namespace dg

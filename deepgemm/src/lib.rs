@@ -31,10 +31,14 @@
 
 pub mod api;
 pub mod api_1d2d;
+pub mod api_bmk;
+pub mod api_einsum;
 pub mod api_hc_prenorm;
 pub mod api_mega_moe;
+pub mod api_serving;
 pub mod api_sm90_mqa;
 pub mod api_sparse_mqa;
+pub mod cublaslt;
 pub mod device;
 pub mod error;
 pub mod golden;

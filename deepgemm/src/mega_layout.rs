@@ -140,6 +140,7 @@ impl Slicer {
 
 /// Port of `get_symm_buffer_size_for_mega_moe`: iterate all candidate
 /// BLOCK_M for the worst-case ring, then slice the full buffer.
+#[allow(clippy::too_many_arguments)] // upstream-mirroring signature
 pub fn mega_moe_buffer_layout(
     num_ranks: u32,
     num_experts: u32,
@@ -205,7 +206,10 @@ pub fn mega_moe_buffer_layout(
         cursor: workspace_bytes,
     };
     let mut off = MegaMoeBufferOffsets::default();
-    off.workspace_end = workspace_bytes;
+    #[allow(clippy::field_reassign_with_default)]
+    {
+        off.workspace_end = workspace_bytes;
+    }
 
     let r_input_token = Region(hidden, num_max_tokens_per_rank, true); // fp8 1B
     let r_input_sf = Region(hidden / 32, num_max_tokens_per_rank, false);

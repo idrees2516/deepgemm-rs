@@ -79,13 +79,20 @@ impl Runtime {
         Self::new_ordinal(dev_idx)
     }
 
-    /// A stream from the pool (created on demand; round-robin per lane).
+    /// A stream from the pool (created on demand). Panics only if the
+    /// driver refuses stream creation — use [`Runtime::try_stream`] for the
+    /// fallible form in hardened serving stacks.
     pub fn stream(&self) -> DevStream {
-        let mut ss = self.streams.lock().unwrap();
-        if ss.is_empty() {
-            ss.push(DevStream::new(&self.device).expect("stream"));
+        self.try_stream().expect("pooled stream creation")
+    }
+
+    /// The fallible [`Runtime::stream`].
+    pub fn try_stream(&self) -> DgResult<DevStream> {
+        let mut ss = self.streams.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = ss.pop() {
+            return Ok(s);
         }
-        ss.pop().expect("stream")
+        DevStream::new(&self.device)
     }
 
     /// Zero-copy upload: one HtoD memcpy, no staging buffers.

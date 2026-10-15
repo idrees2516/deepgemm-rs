@@ -35,6 +35,8 @@ fn gemm_body(
     accumulate: bool,
     num_sms: u32,
     with_output_sf: bool,
+    with_alpha: bool,
+    k_grouped: Option<(u32, u32)>, // (k_alignment, sfk_span)
 ) -> String {
     let has_sf = !(a.dtype == Dtype::Bf16 && b.dtype == Dtype::Bf16);
     let is_mxf4 = a.dtype == Dtype::Fp4 && b.dtype == Dtype::Fp4;
@@ -69,7 +71,7 @@ fn gemm_body(
     const __grid_constant__ dg::TmaMap tma_b,
     const __grid_constant__ dg::TmaMap tma_sfa,
     const __grid_constant__ dg::TmaMap tma_sfb,
-    const __grid_constant__ dg::TmaMap tma_cd{sf_params}) {{
+    const __grid_constant__ dg::TmaMap tma_cd{sf_params}{alpha_params}) {{
     dg::gemm_sm100_impl<
         {major_a}, {major_b},
         {gran_a}, {gran_b}, {has_sf}, {is_mxf4},
@@ -82,9 +84,9 @@ fn gemm_body(
         {cluster}, {mc_on_a},
         {swap_ab}, (dg::GemmType){gt}, {accum},
         {cd_float}, {cd_elem},
-        {num_sms}, {with_sf}
+        {num_sms}, {with_alpha}, {with_sf}{kg_params}
     >(grouped_layout, num_groups, shape_m, shape_n, shape_k,
-      tma_a, tma_b, tma_sfa, tma_sfb, tma_cd{sf_args});
+      tma_a, tma_b, tma_sfa, tma_sfb, tma_cd{sf_args}{alpha_args});
 }}"#,
         sf_params = if with_output_sf {
             String::from(",\n    unsigned* sfd, unsigned sfd_stride")
@@ -96,6 +98,20 @@ fn gemm_body(
         } else {
             String::new()
         },
+        alpha_params = if with_alpha { ",\n    float alpha" } else { "" },
+        // Kernel ABI: `(.., tma_cd, sfd, sfd_stride, alpha)` — when only
+        // alpha is present, the two defaulted sfd slots must be occupied
+        // explicitly (defaults resolve positionally).
+        alpha_args = if !with_alpha {
+            String::new()
+        } else if with_output_sf {
+            String::from(", sfd, sfd_stride, alpha")
+        } else {
+            String::from(", (unsigned*)0, 0, alpha")
+        },
+        kg_params = k_grouped
+            .map(|(align, span)| format!(", {align}, {span}"))
+            .unwrap_or_default(),
         major_a = a.major as u32,
         major_b = b.major as u32,
         gran_a = if has_sf { gran_a } else { 32 },
@@ -124,12 +140,13 @@ fn gemm_body(
         cd_elem = cd_elem,
         num_sms = num_sms,
         with_sf = with_output_sf as u32,
+        with_alpha = with_alpha as u32,
     )
 }
 
-struct LaunchCtx<'a> {
-    dev: &'a Device,
-    stream: sys::Stream,
+pub(crate) struct LaunchCtx<'a> {
+    pub(crate) dev: &'a Device,
+    pub(crate) stream: sys::Stream,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -144,6 +161,8 @@ fn run_gemm(
     expected_m: u32,
     accumulate: bool,
     output_sf: Option<(&DevBuffer, u32)>,
+    alpha: Option<f32>,
+    k_alignment: u32,
 ) -> DgResult<()> {
     let dev = ctx.dev;
     if !matches!(dev.arch, crate::device::Arch::Sm100) {
@@ -189,6 +208,25 @@ fn run_gemm(
                     .into(),
             ));
         }
+        if alpha.is_some() {
+            return Err(DgError::InvalidArg(
+                "alpha and the fused FP8 output are exclusive (upstream contract)".into(),
+            ));
+        }
+    }
+    let is_k_grouped = gemm_type == GemmType::KGroupedContiguous;
+    if is_k_grouped {
+        if let Some(layout) = grouped_layout {
+            if (layout.len / 4) as u32 != num_groups {
+                return Err(DgError::InvalidArg(
+                    "k-grouped layout must hold exactly num_groups entries".into(),
+                ));
+            }
+        } else {
+            return Err(DgError::InvalidArg(
+                "k-grouped GEMM requires a grouped_layout buffer".into(),
+            ));
+        }
     }
 
     // Heuristics
@@ -231,16 +269,20 @@ fn run_gemm(
         _ => 1,
     };
     let data_groups_b = match gemm_type {
-        GemmType::Normal => 1,
-        _ => num_groups,
+        // K-grouped B is a single shared `[sum_k, N]` arena (the scheduler
+        // offsets K by `current_k_start`), NOT per-group stacked.
+        GemmType::MGroupedMasked | GemmType::MGroupedContiguous => num_groups,
+        GemmType::Normal | GemmType::KGroupedContiguous => 1,
+        GemmType::Batched => num_groups,
     };
     // SF maps: groups (or batches) stack along the packed-K outer dim.
+    // K-grouped SFs share one packed arena (per-group padded rows).
     let sf_groups_a = match gemm_type {
-        GemmType::Normal | GemmType::MGroupedContiguous => 1,
+        GemmType::Normal | GemmType::MGroupedContiguous | GemmType::KGroupedContiguous => 1,
         _ => num_groups,
     };
     let sf_groups_b = match gemm_type {
-        GemmType::Normal => 1,
+        GemmType::Normal | GemmType::KGroupedContiguous => 1,
         _ => num_groups,
     };
     let tm_a = if gemm_type == GemmType::Batched {
@@ -308,40 +350,59 @@ fn run_gemm(
 
     let (sf_block_m, sf_block_n) = heuristics::get_sf_block_sizes(l.block_m, l.block_n, has_sf);
     let sf_block_k = l.block_k / 128;
+    // K-grouped: the layout's K padding unit must be a whole number of
+    // BLOCK_K tiles (upstream `k_alignment % block_k == 0`), and the packed
+    // SF arena's rows are the per-group padded counts (SfTensor.rows), not
+    // `ceil_div(sum_k, gran*4)`.
+    if is_k_grouped && k_alignment % l.block_k != 0 {
+        return Err(DgError::InvalidArg(format!(
+            "k-grouped k_alignment ({k_alignment}) must be a multiple of BLOCK_K ({})",
+            l.block_k
+        )));
+    }
     let tm_sfa = if has_sf {
         let sf = a.sf.as_ref().unwrap();
-        tma::make_tma_sf(
-            dev,
-            &sf.buf,
-            sf.cols,
-            a.k,
-            sf.gran.k(),
-            sf_block_m,
-            sf_block_k,
-            sf_groups_a,
-            0,
-        )?
+        if is_k_grouped {
+            tma::make_tma_sf_packed_rows(dev, &sf.buf, sf.cols, sf.rows, sf_block_m, sf_block_k)?
+        } else {
+            tma::make_tma_sf(
+                dev,
+                &sf.buf,
+                sf.cols,
+                a.k,
+                sf.gran.k(),
+                sf_block_m,
+                sf_block_k,
+                sf_groups_a,
+                0,
+            )?
+        }
     } else {
         tma::make_tma_sf(dev, &DevBuffer::alloc(dev, 128)?, 32, 128, 32, 32, 1, 1, 0)?
     };
     let tm_sfb = if has_sf {
         let sf = b.sf.as_ref().unwrap();
-        tma::make_tma_sf(
-            dev,
-            &sf.buf,
-            sf.cols,
-            b.k,
-            sf.gran.k(),
-            sf_block_n,
-            sf_block_k,
-            sf_groups_b,
-            0,
-        )?
+        if is_k_grouped {
+            tma::make_tma_sf_packed_rows(dev, &sf.buf, sf.cols, sf.rows, sf_block_n, sf_block_k)?
+        } else {
+            tma::make_tma_sf(
+                dev,
+                &sf.buf,
+                sf.cols,
+                b.k,
+                sf.gran.k(),
+                sf_block_n,
+                sf_block_k,
+                sf_groups_b,
+                0,
+            )?
+        }
     } else {
         tma::make_tma_sf(dev, &DevBuffer::alloc(dev, 128)?, 32, 128, 32, 32, 1, 1, 0)?
     };
     let cd_atom_n = s.swizzle_cd_mode / out.dtype.elem_size() as u32;
-    let tm_cd = if gemm_type == GemmType::Batched {
+    // K-grouped D is a 3D `[groups, m, n]` stack like Batched.
+    let tm_cd = if gemm_type == GemmType::Batched || is_k_grouped {
         tma::make_tma_cd_3d(
             dev,
             out.dtype,
@@ -385,6 +446,12 @@ fn run_gemm(
         accumulate,
         dev.num_sms,
         output_sf.is_some(),
+        alpha.is_some(),
+        if is_k_grouped {
+            Some((k_alignment, gran_a.max(gran_b) * 4))
+        } else {
+            None
+        },
     );
     let sig = format!(
         "{:?}",
@@ -397,7 +464,9 @@ fn run_gemm(
             gran_a,
             gran_b,
             accumulate,
-            output_sf.is_some()
+            output_sf.is_some(),
+            alpha.is_some(),
+            k_alignment
         )
     );
     let func = jit::get_kernel(dev, jit::kernel_src::GEMM_SM100, "gemm_sm100", &sig, &body)?;
@@ -417,6 +486,129 @@ fn run_gemm(
     if let Some((sfd, sfd_stride)) = output_sf {
         args = args.devptr(sfd.ptr).u32(sfd_stride);
     }
+    if let Some(alpha) = alpha {
+        args = args.f32(alpha);
+    }
+
+    let launch_cfg = sys::LaunchEx {
+        grid: (dev.num_sms, 1, 1),
+        block: (256, 1, 1),
+        smem: cfg.pipeline.smem_size,
+        cluster: Some((l.cluster_size(), 1, 1)),
+        pdl: true,
+    };
+    jit::launch(dev, func, ctx.stream, &launch_cfg, args)
+}
+
+/// The post-map launch core of [`run_gemm`], exposed for callers that build
+/// their own TMA descriptors (the einsum equations permute operand dims and
+/// therefore need custom 3D strides). All semantic parameters mirror
+/// `run_gemm`; `maps` = (a, b, sfa, sfb, cd).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_gemm_with_maps(
+    ctx: &LaunchCtx,
+    a: &Operand,
+    b: &Operand,
+    out: &Output,
+    gemm_type: GemmType,
+    grouped_layout: Option<&DevBuffer>,
+    num_groups: u32,
+    accumulate: bool,
+    output_sf: Option<(&DevBuffer, u32)>,
+    alpha: Option<f32>,
+    k_alignment: u32,
+    maps: (
+        sys::TensorMap,
+        sys::TensorMap,
+        sys::TensorMap,
+        sys::TensorMap,
+        sys::TensorMap,
+    ),
+) -> DgResult<()> {
+    let dev = ctx.dev;
+    let desc = GemmDesc {
+        gemm_type,
+        m: out.rows,
+        n: out.cols,
+        k: a.k,
+        num_groups,
+        a_dtype: a.dtype,
+        b_dtype: b.dtype,
+        cd_dtype: out.dtype,
+        major_a: a.major,
+        major_b: b.major,
+        num_sms: dev.num_sms,
+        smem_capacity: dev.smem_capacity,
+        expected_m: out.rows,
+        expected_num_groups: if gemm_type == GemmType::MGroupedMasked {
+            num_groups
+        } else {
+            1
+        },
+        expected_k: 0,
+        with_accumulation: accumulate,
+    };
+    let cfg = heuristics::get_best_config(&desc)?;
+    let l = &cfg.layout;
+    let gran_a = a.sf.as_ref().map(|sf| sf.gran.k()).unwrap_or(32);
+    let gran_b = b.sf.as_ref().map(|sf| sf.gran.k()).unwrap_or(32);
+    let is_k_grouped = gemm_type == GemmType::KGroupedContiguous;
+    let (tm_a, tm_b, tm_sfa, tm_sfb, tm_cd) = maps;
+
+    let body = gemm_body(
+        a,
+        b,
+        out,
+        &cfg,
+        gemm_type,
+        gran_a,
+        gran_b,
+        accumulate,
+        dev.num_sms,
+        output_sf.is_some(),
+        alpha.is_some(),
+        if is_k_grouped {
+            Some((k_alignment, gran_a.max(gran_b) * 4))
+        } else {
+            None
+        },
+    );
+    let sig = format!(
+        "{:?}",
+        (
+            cfg,
+            gemm_type,
+            a.dtype,
+            b.dtype,
+            out.dtype,
+            gran_a,
+            gran_b,
+            accumulate,
+            output_sf.is_some(),
+            alpha.is_some(),
+            k_alignment
+        )
+    );
+    let func = jit::get_kernel(dev, jit::kernel_src::GEMM_SM100, "gemm_sm100", &sig, &body)?;
+
+    let gl_ptr = grouped_layout.map(|b| b.ptr).unwrap_or(0);
+    let mut args = Args::new()
+        .devptr(gl_ptr)
+        .u32(num_groups)
+        .u32(out.rows)
+        .u32(out.cols)
+        .u32(a.k)
+        .tensormap(&tm_a)
+        .tensormap(&tm_b)
+        .tensormap(&tm_sfa)
+        .tensormap(&tm_sfb)
+        .tensormap(&tm_cd);
+    if let Some((sfd, sfd_stride)) = output_sf {
+        args = args.devptr(sfd.ptr).u32(sfd_stride);
+    }
+    if let Some(alpha) = alpha {
+        args = args.f32(alpha);
+    }
 
     let launch_cfg = sys::LaunchEx {
         grid: (dev.num_sms, 1, 1),
@@ -431,6 +623,26 @@ fn run_gemm(
 // ---------------------------------------------------------------------------
 // Public GEMM entry points
 // ---------------------------------------------------------------------------
+//
+// Layout naming follows BLAS/upstream (`gemm_xy` = (A layout, B layout) of the
+// two *logical* `[M, K]` / `[N, K]` matrices):
+//
+//   nt: A K-major `[M, K]`,  B K-major `[N, K]`   (the canonical path)
+//   nn: A K-major `[M, K]`,  B MN-major `[K, N]`  (B column-major)
+//   tn: A MN-major `[K, M]`, B K-major `[N, K]`   (A column-major)
+//   tt: A MN-major `[K, M]`, B MN-major `[K, N]`
+//
+// Upstream implements nn/tn/tt as host-side transpose *views* routed into the
+// NT kernel (`fp8_fp4_gemm_nn(a, b) == fp8_fp4_gemm_nt(a, b^T)`); the kernel
+// itself takes the majorness as a template parameter, so the same is true
+// here: [`Operand`] carries `major` + `outer_stride`, and the wrappers below
+// merely construct the view and call [`gemm_nt_layout`]. The SF layout is
+// independent of data majorness (always the packed MN-major form produced by
+// [`transform_sf`]), so no SF transformation differs between layouts.
+//
+// Constraints (upstream-faithful): FP4 x FP4 requires K-major operands
+// (`fp8_fp4_requires_k_major`); K-major SF *views* are not accepted — the
+// packed UE8M0 tensor must already be MN-major TMA-aligned.
 
 /// Dense GEMM: `D (+)= A @ B^T` with NT layout (K-major A/B).
 pub fn gemm_nt(
@@ -440,6 +652,36 @@ pub fn gemm_nt(
     b: &Operand,
     out: &mut Output,
     accumulate: bool,
+) -> DgResult<()> {
+    gemm_nt_layout(dev, stream, a, b, out, accumulate, None)
+}
+
+/// [`gemm_nt`] with an optional BLAS-style `alpha` on the product term:
+/// `D = alpha * (A @ B^T) (+ C)`. The scale multiplies the FP32 accumulator
+/// before the output cast (upstream `epilogue::operators::ScaleByAlpha`);
+/// the accumulated C is never scaled. Exclusive with the fused FP8 output.
+pub fn gemm_nt_alpha(
+    dev: &Device,
+    stream: &DevStream,
+    a: &Operand,
+    b: &Operand,
+    out: &mut Output,
+    accumulate: bool,
+    alpha: Option<f32>,
+) -> DgResult<()> {
+    gemm_nt_layout(dev, stream, a, b, out, accumulate, alpha)
+}
+
+/// The general dense entry: operands may individually be K- or MN-major
+/// (covering the nn/tn/tt BLAS layouts); `alpha` as in [`gemm_nt_alpha`].
+pub fn gemm_nt_layout(
+    dev: &Device,
+    stream: &DevStream,
+    a: &Operand,
+    b: &Operand,
+    out: &mut Output,
+    accumulate: bool,
+    alpha: Option<f32>,
 ) -> DgResult<()> {
     validate_operand(a, "A")?;
     validate_operand(b, "B")?;
@@ -467,7 +709,53 @@ pub fn gemm_nt(
         a.rows,
         accumulate,
         None,
+        alpha,
+        128,
     )
+}
+
+/// `D (+)= A @ B` with A K-major `[M, K]` and B MN-major `[K, N]`
+/// (upstream `fp8_fp4_gemm_nn` / `bf16_gemm_nn`). Zero-copy: constructs the
+/// `[N, K]`-viewed MN-major operand over the same device memory.
+pub fn gemm_nn(
+    dev: &Device,
+    stream: &DevStream,
+    a: &Operand,
+    b: &Operand,
+    out: &mut Output,
+    accumulate: bool,
+) -> DgResult<()> {
+    let b = b.as_viewed_mn_major("B")?;
+    gemm_nt_layout(dev, stream, a, b, out, accumulate, None)
+}
+
+/// `D (+)= A^T @ B^T` with A MN-major `[K, M]` and B K-major `[N, K]`
+/// (upstream `*_gemm_tn`).
+pub fn gemm_tn(
+    dev: &Device,
+    stream: &DevStream,
+    a: &Operand,
+    b: &Operand,
+    out: &mut Output,
+    accumulate: bool,
+) -> DgResult<()> {
+    let a = a.as_viewed_mn_major("A")?;
+    gemm_nt_layout(dev, stream, a, b, out, accumulate, None)
+}
+
+/// `D (+)= A^T @ B` with A and B MN-major (`[K, M]`, `[K, N]`)
+/// (upstream `*_gemm_tt`).
+pub fn gemm_tt(
+    dev: &Device,
+    stream: &DevStream,
+    a: &Operand,
+    b: &Operand,
+    out: &mut Output,
+    accumulate: bool,
+) -> DgResult<()> {
+    let a = a.as_viewed_mn_major("A")?;
+    let b = b.as_viewed_mn_major("B")?;
+    gemm_nt_layout(dev, stream, a, b, out, accumulate, None)
 }
 
 /// Alias of [`gemm_nt`] for FP8 operands (MXFP8, UE8M0 block scales).
@@ -531,6 +819,8 @@ pub fn fp8_gemm_nt_quant_out(
         a.rows,
         false,
         Some((sfd, stride)),
+        None,
+        128,
     )
 }
 
@@ -561,6 +851,11 @@ pub fn bf16_gemm_nt(
 
 /// MoE m-grouped contiguous GEMM (prefill): `m_indices[block]` holds the
 /// expert id of each BLOCK_M-aligned token block (negative = padding).
+///
+/// B may be K-major (`[G, N, K]`, the common case) or MN-major
+/// (`[G, K, N]`, upstream's `m_grouped_*_nn_contiguous`); for MN-major B the
+/// expert groups stack along the K dim of the shared `[K, G*N]`-shaped view
+/// (scheduler `kBWithGroupKOffset`).
 pub fn m_grouped_gemm_nt_contiguous(
     dev: &Device,
     stream: &DevStream,
@@ -577,9 +872,14 @@ pub fn m_grouped_gemm_nt_contiguous(
             a.rows
         )));
     }
-    if a.major != Major::K || b.major != Major::K {
+    if a.major != Major::K {
         return Err(DgError::InvalidArg(
-            "m-grouped contiguous requires K-major A/B".into(),
+            "m-grouped contiguous requires K-major A".into(),
+        ));
+    }
+    if is_mxf4_pair(a, b) && b.major != Major::K {
+        return Err(DgError::InvalidArg(
+            "MXF4 MMA requires K-major operands".into(),
         ));
     }
     let ctx = LaunchCtx {
@@ -597,7 +897,31 @@ pub fn m_grouped_gemm_nt_contiguous(
         a.rows,
         false,
         None,
+        None,
+        128,
     )
+}
+
+/// MoE m-grouped contiguous GEMM with an MN-major B view: the weights come
+/// as a `[G, K, N]` N-contiguous stack (upstream
+/// `m_grouped_fp8_fp4_gemm_nn_contiguous` / `m_grouped_bf16_gemm_nn_*`).
+/// Pure view routing into [`m_grouped_gemm_nt_contiguous`].
+pub fn m_grouped_gemm_nn_contiguous(
+    dev: &Device,
+    stream: &DevStream,
+    a: &Operand,
+    b: &Operand,
+    out: &mut Output,
+    m_indices: &DevBuffer,
+    num_groups: u32,
+) -> DgResult<()> {
+    b.as_viewed_mn_major("B")?;
+    m_grouped_gemm_nt_contiguous(dev, stream, a, b, out, m_indices, num_groups)
+}
+
+/// True when both operands are FP4 (the `mxf4` block-scaled MMA path).
+fn is_mxf4_pair(a: &Operand, b: &Operand) -> bool {
+    a.dtype == Dtype::Fp4 && b.dtype == Dtype::Fp4
 }
 
 /// MoE m-grouped masked GEMM (decode): `masked_m[g]` is the valid M of group g;
@@ -633,6 +957,8 @@ pub fn m_grouped_gemm_nt_masked(
         expected_m,
         false,
         None,
+        None,
+        128,
     )
 }
 
@@ -661,6 +987,8 @@ pub fn fp8_bmm(
         a.rows,
         accumulate,
         None,
+        None,
+        128,
     )
 }
 
@@ -715,7 +1043,41 @@ pub fn transform_sf(
     let packed_rows = ceil_div(sf_k, 4);
     let out = DevBuffer::alloc_zeros(dev, (packed_rows * tma_aligned * 4) as usize)?;
     let in_buf = crate::device::alloc_and_upload(dev, sf, stream.raw())?;
+    transform_sf_launch(
+        dev,
+        stream,
+        &in_buf,
+        &out,
+        0,
+        mn,
+        sf_k,
+        packed_rows,
+        tma_aligned,
+    )?;
 
+    Ok(SfTensor {
+        rows: packed_rows,
+        cols: tma_aligned,
+        gran,
+        buf: out,
+    })
+}
+
+/// Launch the single-batch `transform_sf` pack kernel writing into `out` at
+/// `packed-row offset` (the batched arena builder reuses this per batch).
+#[allow(clippy::too_many_arguments)]
+fn transform_sf_launch(
+    dev: &Device,
+    stream: &DevStream,
+    in_buf: &DevBuffer,
+    out: &DevBuffer,
+    row_offset: u32,
+    mn: u32,
+    sf_k: u32,
+    packed_rows: u32,
+    tma_aligned: u32,
+) -> DgResult<()> {
+    let _ = packed_rows;
     // Kernel: SF_K < 16 uses the small single-pass path; else 16-wide blocks.
     const BLOCK_SF_K: u32 = 16;
     let num_threads = 128u32;
@@ -752,9 +1114,10 @@ pub fn transform_sf(
         })
         * 4;
     let grid = (num_mn_blocks * num_k_blocks, 1, 1);
+    let out_base = out.ptr + (row_offset * tma_aligned * 4) as u64;
     let args = Args::new()
         .ptr(in_buf.ptr as *const u8 as *const u32)
-        .ptr(out.ptr as *const u8 as *const u32)
+        .ptr(out_base as *const u8 as *const u32)
         .u32(mn);
     jit::launch(
         dev,
@@ -768,6 +1131,119 @@ pub fn transform_sf(
             pdl: false,
         },
         args,
+    )
+}
+
+/// K-grouped SF packing (upstream `transform_k_grouped_sf_into_required_layout`
+/// -> `pack_fp32_into_ue8m0`): per-group FP32 scales into the packed UE8M0
+/// arena where EVERY group starts at a fresh packed row.
+///
+/// * `sf` — the concatenated transposed arena `[sum_sf_rows, mn]`, K-major
+///   along `mn` (each row = one K-group of scales for all MN lanes; this is
+///   the `sf.T` of the per-token `[mn, sf_k]` form, i.e. `sf[row * mn + m]`).
+/// * `grouped_layout` — non-psum flavor: `grouped_layout[g]` = padded K size
+///   of group g (each a multiple of `k_alignment` and of the granularity).
+/// * `gran` — SF granularity along K (G32 or G128).
+///
+/// The returned [`SfTensor::rows`] is the *padded* packed-row count
+/// (`sum_g ceil_div(k_g / gran, 4)`), which can exceed
+/// `ceil_div(sum_k / gran, 4)` — exactly what the k-grouped GEMM scheduler's
+/// `current_sf_k_cumsum` addressing expects.
+#[allow(clippy::too_many_arguments)]
+pub fn transform_sf_k_grouped(
+    dev: &Device,
+    stream: &DevStream,
+    sf: &[f32],
+    mn: u32,
+    gran: SfGran,
+    grouped_layout: &[i32],
+    k_alignment: u32,
+) -> DgResult<SfTensor> {
+    let num_groups = grouped_layout.len() as u32;
+    if num_groups == 0 || num_groups > 128 {
+        return Err(DgError::InvalidArg(
+            "k-grouped layout must hold 1..=128 group entries".into(),
+        ));
+    }
+    if mn % 4 != 0 {
+        return Err(DgError::InvalidArg(
+            "k-grouped SF requires mn % 4 == 0".into(),
+        ));
+    }
+    let gran_k = gran.k();
+    let mut sum_sf_rows = 0u32;
+    let mut packed_rows = 0u32;
+    for &k in grouped_layout {
+        let k = if k < 0 { 0 } else { k as u32 };
+        if k % k_alignment != 0 || k % gran_k != 0 {
+            return Err(DgError::InvalidArg(format!(
+                "k-grouped K sizes must be multiples of k_alignment ({k_alignment}) and the SF granularity ({gran_k})"
+            )));
+        }
+        let rows = k / gran_k;
+        sum_sf_rows += rows;
+        packed_rows += ceil_div(rows, 4);
+    }
+    if sf.len() as u32 != sum_sf_rows * mn {
+        return Err(DgError::InvalidArg(format!(
+            "k-grouped SF arena must hold sum_k/gran * mn = {} f32 values (got {})",
+            sum_sf_rows * mn,
+            sf.len()
+        )));
+    }
+    let tma_aligned = heuristics::tma_aligned_size(mn, 4);
+    let out = DevBuffer::alloc_zeros(dev, (packed_rows * tma_aligned * 4) as usize)?;
+    let in_buf = crate::device::alloc_and_upload(dev, sf, stream.raw())?;
+    let layout_buf = crate::device::alloc_and_upload(dev, grouped_layout, stream.raw())?;
+
+    const NUM_THREADS: u32 = 512;
+    const BLOCK_MN: u32 = 128;
+    const BLOCK_PACKED_SF_K: u32 = NUM_THREADS / 32; // 16 = one warp per row
+    let body = format!(
+        r#"extern "C" __global__ void __dg_kernel(const float* sf, unsigned* out, const int* grouped_layout,
+    unsigned mn, unsigned sf_k, unsigned packed_sf_k, unsigned gran_k, unsigned k_alignment) {{
+    dg::pack_k_grouped_sf_impl<{num_groups}, {threads}, {block_mn}, {block_packed_sf_k}, false>(
+        sf, out, grouped_layout, mn, sf_k, packed_sf_k, gran_k, k_alignment);
+}}"#,
+        num_groups = num_groups,
+        threads = NUM_THREADS,
+        block_mn = BLOCK_MN,
+        block_packed_sf_k = BLOCK_PACKED_SF_K,
+    );
+    let sig = format!("pack_k_grouped_sf_{num_groups}_{gran_k}");
+    let func = jit::get_kernel(
+        dev,
+        jit::kernel_src::LAYOUT_QUANT,
+        "pack_k_grouped_sf",
+        &sig,
+        &body,
+    )?;
+    let grid = (
+        ceil_div(mn, BLOCK_MN) * ceil_div(packed_rows, BLOCK_PACKED_SF_K),
+        1,
+        1,
+    );
+    let args = Args::new()
+        .ptr(in_buf.ptr as *const u8 as *const u32)
+        .ptr(out.ptr as *const u8 as *const u32)
+        .ptr(layout_buf.ptr as *const u8 as *const i32)
+        .u32(mn)
+        .u32(sum_sf_rows)
+        .u32(packed_rows)
+        .u32(gran_k)
+        .u32(k_alignment);
+    jit::launch(
+        dev,
+        func,
+        stream.raw(),
+        &sys::LaunchEx {
+            grid,
+            block: (NUM_THREADS, 1, 1),
+            smem: 0,
+            cluster: None,
+            pdl: false,
+        },
+        args,
     )?;
 
     Ok(SfTensor {
@@ -776,6 +1252,223 @@ pub fn transform_sf(
         gran,
         buf: out,
     })
+}
+
+/// Batched (BMM) SF packing: `sf` is the per-batch per-token scales
+/// `[batch, mn, sf_k]` (batch-major), packed into the concatenated arena
+/// `[batch * packed_sf_k, tma_aligned_mn]` the Batched GEMM scheduler
+/// addresses (`sfa_k_idx = batch_idx * packed_rows + block`). Each batch's
+/// rows are packed independently, exactly like `batch * transform_sf` calls
+/// but in one allocation.
+pub fn transform_sf_batched(
+    dev: &Device,
+    stream: &DevStream,
+    sf: &[f32],
+    batch: u32,
+    mn: u32,
+    gran: SfGran,
+) -> DgResult<SfTensor> {
+    if batch == 0 {
+        return Err(DgError::InvalidArg("batch must be nonzero".into()));
+    }
+    let per_batch = (sf.len() / batch as usize) as u32;
+    if per_batch == 0 || sf.len() as u32 != per_batch * batch || per_batch % mn != 0 {
+        return Err(DgError::InvalidArg(
+            "batched SF must hold batch * mn * sf_k values".into(),
+        ));
+    }
+    let sf_k = per_batch / mn;
+    let tma_aligned = heuristics::tma_aligned_size(mn, 4);
+    let packed_rows = ceil_div(sf_k, 4);
+    // ONE contiguous arena; each batch's rows land at batch_idx *
+    // packed_rows (the layout the Batched scheduler's SF_K offset and the
+    // `packed_rows * batch` TMA outer dim expect).
+    let arena = DevBuffer::alloc_zeros(dev, (packed_rows * batch * tma_aligned * 4) as usize)?;
+    for g in 0..batch as usize {
+        let in_buf = crate::device::alloc_and_upload(
+            dev,
+            &sf[g * per_batch as usize..(g + 1) * per_batch as usize],
+            stream.raw(),
+        )?;
+        transform_sf_launch(
+            dev,
+            stream,
+            &in_buf,
+            &arena,
+            g as u32 * packed_rows,
+            mn,
+            sf_k,
+            packed_rows,
+            tma_aligned,
+        )?;
+    }
+    Ok(SfTensor {
+        rows: packed_rows * batch,
+        cols: tma_aligned,
+        gran,
+        buf: arena,
+    })
+}
+
+/// Elementwise FP32 -> BF16 (RNE) cast kernel — the tail of the
+/// `bmk,bnk->mn` BF16 einsum path (upstream's implicit `d.copy_(workspace)`).
+pub fn cast_to_bf16(
+    dev: &Device,
+    stream: &DevStream,
+    src: &DevBuffer,
+    dst: &DevBuffer,
+    n: u32,
+) -> DgResult<()> {
+    if src.len < n as usize * 4 || dst.len < n as usize * 2 {
+        return Err(DgError::InvalidArg(
+            "cast_to_bf16: buffer smaller than n elements".into(),
+        ));
+    }
+    let body = r#"extern "C" __global__ void __dg_kernel(const float* in, unsigned short* out, unsigned n) {
+    dg::cast_f32_to_bf16_impl<256>(in, out, n);
+}"#;
+    let func = jit::get_kernel(
+        dev,
+        jit::kernel_src::LAYOUT_QUANT,
+        "cast_f32_bf16",
+        "c",
+        body,
+    )?;
+    let grid = (ceil_div(n, 2048).max(1), 1, 1);
+    let args = Args::new()
+        .ptr(src.ptr as *const u8 as *const f32)
+        .ptr(dst.ptr as *const u8 as *const u16)
+        .u32(n);
+    jit::launch(
+        dev,
+        func,
+        stream.raw(),
+        &sys::LaunchEx {
+            grid,
+            block: (256, 1, 1),
+            smem: 0,
+            cluster: None,
+            pdl: false,
+        },
+        args,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// K-grouped (weight-grad) GEMMs
+// ---------------------------------------------------------------------------
+//
+// D[g] (+)= A_g @ B_g^T where the per-group K-slices of A/B live in one
+// shared arena: FP8-TN stacks them MN-major (`[sum_k, M]` / `[sum_k, N]`,
+// upstream `k_grouped_fp8_gemm_tn_contiguous`, the gradient-gather layout),
+// FP4-NT keeps the canonical K-major packing (`[M, sum_k/2]`, upstream
+// `k_grouped_fp4_gemm_nt_contiguous`). `grouped_layout[g]` is group g's
+// padded K size (multiple of `k_alignment`); SFs come from
+// [`transform_sf_k_grouped`]. D is `[groups, m, n]`.
+//
+// The scheduler walks every (m, n) block once per group (`current_k_start`
+// hops the arena); each group's partial products accumulate into that
+// group's own D slice via the 3D CD map.
+
+/// FP8 K-grouped weight-grad GEMM, TN layout (A/B MN-major).
+/// `gran` selects the SF granularity (G32 = MX recipe, G128 = DeepSeek
+/// recipe); both operands must use the same one (upstream asserts this too).
+#[allow(clippy::too_many_arguments)]
+pub fn k_grouped_fp8_gemm_tn_contiguous(
+    dev: &Device,
+    stream: &DevStream,
+    a: &Operand,
+    b: &Operand,
+    out: &mut Output,
+    grouped_layout: &DevBuffer,
+    num_groups: u32,
+    accumulate: bool,
+    gran: SfGran,
+) -> DgResult<()> {
+    let _ = gran; // both operands must share the granularity (checked below)
+    a.as_viewed_mn_major("A")?;
+    b.as_viewed_mn_major("B")?;
+    if a.dtype != Dtype::Fp8 || b.dtype != Dtype::Fp8 {
+        return Err(DgError::InvalidArg(
+            "the k-grouped TN path is the FP8 weight-grad GEMM".into(),
+        ));
+    }
+    if let (Some(sfa), Some(sfb)) = (a.sf.as_ref(), b.sf.as_ref()) {
+        if sfa.gran != sfb.gran {
+            return Err(DgError::InvalidArg(
+                "k-grouped operands must share the SF granularity".into(),
+            ));
+        }
+    }
+    if a.k != b.k {
+        return Err(DgError::InvalidArg("A/B K mismatch".into()));
+    }
+    let k_alignment = 128u32;
+    let ctx = LaunchCtx {
+        dev,
+        stream: stream.raw(),
+    };
+    run_gemm(
+        &ctx,
+        a,
+        b,
+        out,
+        GemmType::KGroupedContiguous,
+        Some(grouped_layout),
+        num_groups,
+        a.rows,
+        accumulate,
+        None,
+        None,
+        k_alignment,
+    )
+}
+
+/// FP4 K-grouped weight-grad GEMM, NT layout (A/B K-major, packed bytes).
+#[allow(clippy::too_many_arguments)]
+pub fn k_grouped_fp4_gemm_nt_contiguous(
+    dev: &Device,
+    stream: &DevStream,
+    a: &Operand,
+    b: &Operand,
+    out: &mut Output,
+    grouped_layout: &DevBuffer,
+    num_groups: u32,
+    accumulate: bool,
+) -> DgResult<()> {
+    if a.major != Major::K || b.major != Major::K {
+        return Err(DgError::InvalidArg(
+            "k-grouped FP4 requires K-major operands".into(),
+        ));
+    }
+    if a.dtype != Dtype::Fp4 || b.dtype != Dtype::Fp4 {
+        return Err(DgError::InvalidArg(
+            "the k-grouped NT FP4 path expects MXF4 operands".into(),
+        ));
+    }
+    if a.k != b.k {
+        return Err(DgError::InvalidArg("A/B K mismatch".into()));
+    }
+    // MXF4 runs BLOCK_K = 256, so the layout's K padding unit must match.
+    let k_alignment = 256u32;
+    let ctx = LaunchCtx {
+        dev,
+        stream: stream.raw(),
+    };
+    run_gemm(
+        &ctx,
+        a,
+        b,
+        out,
+        GemmType::KGroupedContiguous,
+        Some(grouped_layout),
+        num_groups,
+        a.rows,
+        accumulate,
+        None,
+        None,
+        k_alignment,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1324,6 +2017,7 @@ use crate::mega_layout as mlayout;
 
 /// Build the 592-byte by-value SymBuffer param:
 /// base (local slice) + per-rank offsets + rank_idx + num_ranks.
+#[allow(dead_code)] // used by the multi-rank mega_moe path (SymBuffer ABI)
 fn encode_sym_buffer(base: u64, rank_ptrs: &[u64], rank_idx: u32) -> Vec<u8> {
     let mut b = Vec::with_capacity(592);
     b.extend_from_slice(&base.to_ne_bytes());
